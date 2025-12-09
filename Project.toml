@@ -1,3 +1,22 @@
-name = "MPILinearAlgebra"
+name = "LinearAlgebraMPI"
 uuid = "5bdd2be4-ae34-42ef-8b36-f4c85d48f377"
 version = "0.1.0"
+
+[deps]
+Blake3Hash = "8f478455-a32d-4928-b0e4-72b19a7d5574"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
+[compat]
+Blake3Hash = "0.3.0"
+LinearAlgebra = "1.12.0"
+MPI = "0.20.23"
+SparseArrays = "1.12.0"
+
+[extras]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Random", "Test"]
