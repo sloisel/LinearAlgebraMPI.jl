@@ -289,26 +289,47 @@ end
 end
 
 @testset "Vector Operations with Different Partitions" begin
+    # Skip this test if running with fewer than 2 ranks (need different partitions)
+    if nranks < 2
+        @test true  # Pass trivially
+        if rank == 0
+            println("  ✓ Different partition ops: skipped (need >= 2 ranks)")
+        end
+        return
+    end
+
     # Clear cache to avoid interference from previous tests
     LinearAlgebraMPI.clear_plan_cache!()
 
-    n = 12
+    # Use a size that works well with nranks
+    n = 3 * nranks  # Each rank gets at least 3 elements in default partition
     u_global = collect(1.0:n)
-    v_global = collect(n:-1.0:1)
+    v_global = collect(Float64(n):-1.0:1)
 
     # Create u with default partition
     udist = VectorMPI(u_global)
 
     # Create v with a different (custom) partition
-    # Default partition for 4 ranks on 12 elements: [1, 4, 7, 10, 13]
-    # Use a shifted partition: [1, 3, 6, 9, 13] (different sizes)
-    custom_partition = [1, 3, 6, 9, 13]
+    # Build a partition with different sizes per rank
+    custom_partition = Vector{Int}(undef, nranks + 1)
+    custom_partition[1] = 1
+    for r in 1:nranks
+        # Give ranks different amounts: rank 0 gets 2, others get 3 or 4
+        extra = r == 1 ? 2 : (r <= nranks÷2 ? 3 : 4)
+        remaining = n - custom_partition[r] + 1
+        remaining_ranks = nranks - r + 1
+        # Ensure we don't exceed n
+        alloc = min(extra, remaining - (remaining_ranks - 1))
+        custom_partition[r+1] = custom_partition[r] + max(1, alloc)
+    end
+    custom_partition[end] = n + 1  # Ensure last boundary is correct
+
     v_hash = LinearAlgebraMPI.compute_partition_hash(custom_partition)
     local_v_range = custom_partition[rank+1]:(custom_partition[rank+2]-1)
     vdist = VectorMPI{Float64}(v_hash, copy(custom_partition), v_global[local_v_range])
 
     # Debug output
-    println("Rank $rank: udist.partition=$(udist.partition), vdist.partition=$(vdist.partition)")
+    println("Rank $rank (nranks=$nranks): udist.partition=$(udist.partition), vdist.partition=$(vdist.partition)")
     println("Rank $rank: udist.v length=$(length(udist.v)), vdist.v length=$(length(vdist.v))")
     flush(stdout)
 
