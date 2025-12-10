@@ -49,4 +49,7 @@ end
     @testset "MPI Vector Multiplication" begin
         run_mpi_test(joinpath(@__DIR__, "test_vector_multiplication.jl"); nprocs=4, expect_success=true)
     end
+    @testset "MPI Dense Matrix" begin
+        run_mpi_test(joinpath(@__DIR__, "test_dense_matrix.jl"); nprocs=4, expect_success=true)
+    end
 end
