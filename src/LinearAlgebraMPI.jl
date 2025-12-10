@@ -6,14 +6,20 @@ using SparseArrays
 import LinearAlgebra
 using LinearAlgebra: Transpose, Adjoint
 
-export SparseMatrixMPI, MatrixPlan, TransposePlan, clear_plan_cache!, execute_plan!
+export SparseMatrixMPI, VectorMPI, MatrixPlan, TransposePlan, VectorPlan, clear_plan_cache!, execute_plan!
 
 # Type alias for 256-bit Blake3 hash
 const Blake3Hash = NTuple{32,UInt8}
 
 # Cache for memoized MatrixPlans
 # Key: (A_hash, B_hash, T) - use full 256-bit hashes
-const _plan_cache = Dict{Tuple{Blake3Hash, Blake3Hash, DataType}, Any}()
+const _plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
+
+# Cache for memoized VectorPlans (for A * x)
+const _vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
+
+# Cache for memoized Vector Alignment Plans (for u +/- v with different partitions)
+const _vector_align_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
 
 """
     clear_plan_cache!()
@@ -22,6 +28,8 @@ Clear all memoized plan caches.
 """
 function clear_plan_cache!()
     empty!(_plan_cache)
+    empty!(_vector_plan_cache)
+    empty!(_vector_align_plan_cache)
     if isdefined(@__MODULE__, :_addition_plan_cache)
         empty!(_addition_plan_cache)
     end
@@ -37,7 +45,7 @@ Compute a structural hash that is identical across all ranks.
 3. Hash the gathered hashes to produce a global hash
 """
 function compute_structural_hash(row_partition::Vector{Int}, col_indices::Vector{Int},
-                                  AT::SparseMatrixCSC, comm::MPI.Comm)::Blake3Hash
+    AT::SparseMatrixCSC, comm::MPI.Comm)::Blake3Hash
     # Step 1: Compute rank-local hash
     ctx = Blake3Ctx()
     update!(ctx, reinterpret(UInt8, row_partition))
@@ -53,6 +61,18 @@ function compute_structural_hash(row_partition::Vector{Int}, col_indices::Vector
     ctx2 = Blake3Ctx()
     update!(ctx2, all_hashes)
     return Blake3Hash(digest(ctx2))
+end
+
+"""
+    compute_partition_hash(partition::Vector{Int}) -> Blake3Hash
+
+Compute a hash of a partition vector. Since partition vectors are identical
+across all ranks, no MPI communication is needed.
+"""
+function compute_partition_hash(partition::Vector{Int})::Blake3Hash
+    ctx = Blake3Ctx()
+    update!(ctx, reinterpret(UInt8, partition))
+    return Blake3Hash(digest(ctx))
 end
 
 """
@@ -79,6 +99,41 @@ struct SparseMatrixMPI{T}
     col_partition::Vector{Int}
     col_indices::Vector{Int}
     AT::SparseMatrixCSC{T,Int}
+end
+
+struct VectorMPI{T}
+    structural_hash::Blake3Hash
+    partition::Vector{Int}
+    v::Vector{T}
+end
+
+"""
+    VectorMPI(v_global::Vector{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+
+Create a VectorMPI from a global vector, partitioning it across MPI ranks.
+Assumes v_global is identical on all ranks.
+"""
+function VectorMPI(v_global::Vector{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+    nranks = MPI.Comm_size(comm)
+    n = length(v_global)
+
+    # Compute partition (same logic as SparseMatrixMPI)
+    rows_per_rank = div(n, nranks)
+    remainder = mod(n, nranks)
+
+    partition = Vector{Int}(undef, nranks + 1)
+    partition[1] = 1
+    for r in 1:nranks
+        extra = r <= remainder ? 1 : 0
+        partition[r+1] = partition[r] + rows_per_rank + extra
+    end
+
+    rank = MPI.Comm_rank(comm)
+    local_range = partition[rank + 1]:(partition[rank + 2] - 1)
+    local_v = v_global[local_range]
+
+    hash = compute_partition_hash(partition)
+    return VectorMPI{T}(hash, partition, local_v)
 end
 
 """
@@ -164,7 +219,7 @@ mutable struct MatrixPlan{T}
     recv_bufs::Vector{Vector{T}}
     recv_reqs::Vector{MPI.Request}
     recv_offsets::Vector{Int}
-    local_ranges::Vector{Tuple{UnitRange{Int}, Int}}
+    local_ranges::Vector{Tuple{UnitRange{Int},Int}}
     AT::SparseMatrixCSC{T,Int}
 end
 
@@ -207,7 +262,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
     # Step 2: Receive requests from other ranks
     # First, probe to find out who is sending to us
     rank_ids = Int[]  # ranks that requested data from us (0-indexed)
-    rows_requested_by = Dict{Int, Vector{Int}}()  # rank => rows requested
+    rows_requested_by = Dict{Int,Vector{Int}}()  # rank => rows requested
 
     # We need to receive from any rank that has rows_needed_from us
     # Use Iprobe to check for incoming messages
@@ -226,7 +281,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
 
     # Now receive the actual row requests
     recv_reqs = MPI.Request[]
-    recv_bufs = Dict{Int, Vector{Int}}()
+    recv_bufs = Dict{Int,Vector{Int}}()
     for r in 0:(nranks-1)
         if r != rank && recv_counts[r+1] > 0
             buf = Vector{Int}(undef, recv_counts[r+1] + 1)  # +1 for count
@@ -250,7 +305,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
     # Prepare structure responses and send them
     # For each requesting rank, send: [ncols, colptr..., nrowvals, rowvals...]
     struct_send_reqs = MPI.Request[]
-    struct_send_bufs = Dict{Int, Vector{Int}}()  # keep buffers alive
+    struct_send_bufs = Dict{Int,Vector{Int}}()  # keep buffers alive
 
     for r in rank_ids
         requested = rows_requested_by[r]
@@ -277,7 +332,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
 
     # Step 3: Receive structure info from ranks we requested from
     recv_rank_ids = Int[]  # ranks we receive from (0-indexed)
-    struct_recv_bufs = Dict{Int, Vector{Int}}()
+    struct_recv_bufs = Dict{Int,Vector{Int}}()
 
     # First exchange structure message sizes
     struct_send_sizes = zeros(Int, nranks)
@@ -334,10 +389,10 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
 
     # Track local copy info and recv offsets
     # Track local copy ranges: (src_range, dst_offset)
-    local_ranges = Tuple{UnitRange{Int}, Int}[]
+    local_ranges = Tuple{UnitRange{Int},Int}[]
 
     # Track receive offsets per rank (consecutive values from each rank)
-    recv_val_counts = Dict{Int, Int}()
+    recv_val_counts = Dict{Int,Int}()
 
     # Initialize recv tracking
     for r in recv_rank_ids
@@ -541,7 +596,7 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
 end
 
 # Cache for addition MatrixPlans (keyed by A's row_partition hash and B's structural hash)
-const _addition_plan_cache = Dict{Tuple{Blake3Hash, Blake3Hash, DataType}, Any}()
+const _addition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
 
 """
     get_addition_plan(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
@@ -589,7 +644,7 @@ function Base.:+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, A.row_partition, A.col_partition,
-                              result_col_indices, result_AT)
+        result_col_indices, result_AT)
 end
 
 """
@@ -612,7 +667,7 @@ function Base.:-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, A.row_partition, A.col_partition,
-                              result_col_indices, result_AT)
+        result_col_indices, result_AT)
 end
 
 """
@@ -655,6 +710,38 @@ mutable struct TransposePlan{T}
     row_partition::Vector{Int}
     col_partition::Vector{Int}
     col_indices::Vector{Int}
+end
+
+"""
+    VectorPlan{T}
+
+A communication plan for gathering vector elements needed for A * x.
+
+# Fields
+- `send_rank_ids::Vector{Int}`: Ranks we send elements to (0-indexed)
+- `send_indices::Vector{Vector{Int}}`: For each rank, local indices to send
+- `send_bufs::Vector{Vector{T}}`: Pre-allocated send buffers
+- `send_reqs::Vector{MPI.Request}`: Pre-allocated send request handles
+- `recv_rank_ids::Vector{Int}`: Ranks we receive elements from (0-indexed)
+- `recv_bufs::Vector{Vector{T}}`: Pre-allocated receive buffers
+- `recv_reqs::Vector{MPI.Request}`: Pre-allocated receive request handles
+- `recv_perm::Vector{Vector{Int}}`: For each recv rank, indices into gathered
+- `local_src_indices::Vector{Int}`: Source indices for local copy (into x.v)
+- `local_dst_indices::Vector{Int}`: Destination indices for local copy (into gathered)
+- `gathered::Vector{T}`: Pre-allocated buffer for gathered elements
+"""
+mutable struct VectorPlan{T}
+    send_rank_ids::Vector{Int}
+    send_indices::Vector{Vector{Int}}
+    send_bufs::Vector{Vector{T}}
+    send_reqs::Vector{MPI.Request}
+    recv_rank_ids::Vector{Int}
+    recv_bufs::Vector{Vector{T}}
+    recv_reqs::Vector{MPI.Request}
+    recv_perm::Vector{Vector{Int}}
+    local_src_indices::Vector{Int}
+    local_dst_indices::Vector{Int}
+    gathered::Vector{T}
 end
 
 """
@@ -703,8 +790,8 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
     # Step 3: Send structure (row, col pairs) to each destination rank
     # Build rank_ids and send_indices in order of rank
     rank_ids = Int[]
-    send_indices_map = Dict{Int, Vector{Int}}()
-    struct_send_bufs = Dict{Int, Vector{Int}}()
+    send_indices_map = Dict{Int,Vector{Int}}()
+    struct_send_bufs = Dict{Int,Vector{Int}}()
     struct_send_reqs = MPI.Request[]
 
     for r in 0:(nranks-1)
@@ -726,7 +813,7 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
 
     # Step 4: Receive structure from other ranks
     recv_rank_ids = Int[]
-    struct_recv_bufs = Dict{Int, Vector{Int}}()
+    struct_recv_bufs = Dict{Int,Vector{Int}}()
     struct_recv_reqs = MPI.Request[]
 
     for r in 0:(nranks-1)
@@ -771,7 +858,7 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
     end
 
     # Sort entries by (local_col_in_result_AT, row_in_result_AT) for CSC format
-    sort!(entries, by = e -> (e[1] - my_AT_row_start + 1, e[2]))
+    sort!(entries, by=e -> (e[1] - my_AT_row_start + 1, e[2]))
 
     # Build CSC structure for result.AT
     # result.AT has dimensions (nrows_A, local_ncols)
@@ -782,12 +869,12 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
     # Count entries per column (store in colptr[col+1] for cumsum)
     for (j, _, _, _) in entries
         local_col = j - my_AT_row_start + 1
-        colptr[local_col + 1] += 1
+        colptr[local_col+1] += 1
     end
 
     # Cumsum to convert counts to pointers, starting from 1
     colptr[1] = 1
-    for c in 2:(local_ncols + 1)
+    for c in 2:(local_ncols+1)
         colptr[c] += colptr[c-1]
     end
 
@@ -902,8 +989,607 @@ function execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(plan.row_partition, plan.col_indices, result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, plan.row_partition, plan.col_partition,
-                              plan.col_indices, result_AT)
+        plan.col_indices, result_AT)
 end
+
+"""
+    VectorPlan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+
+Create a communication plan to gather x[A.col_indices] for matrix-vector multiplication.
+"""
+function VectorPlan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    col_indices = A.col_indices
+    n_gathered = length(col_indices)
+
+    my_x_start = x.partition[rank+1]
+
+    # Step 1: Group col_indices by owner rank in x's partition
+    # Track (global_idx, dst_idx_in_gathered) per owner
+    needed_from = [Tuple{Int,Int}[] for _ in 1:nranks]
+    for (dst_idx, global_idx) in enumerate(col_indices)
+        owner = searchsortedlast(x.partition, global_idx) - 1
+        push!(needed_from[owner+1], (global_idx, dst_idx))
+    end
+
+    # Step 2: Exchange counts via Alltoall
+    send_counts = [length(needed_from[r+1]) for r in 0:(nranks-1)]
+    recv_counts = MPI.Alltoall(MPI.UBuffer(send_counts, 1), comm)
+
+    # Step 3: Send requested indices to each owner rank
+    struct_send_bufs = Dict{Int,Vector{Int}}()
+    struct_send_reqs = MPI.Request[]
+    recv_rank_ids = Int[]
+    recv_perm_map = Dict{Int,Vector{Int}}()  # rank => dst indices in gathered
+
+    for r in 0:(nranks-1)
+        if send_counts[r+1] > 0 && r != rank
+            push!(recv_rank_ids, r)
+            indices = [t[1] for t in needed_from[r+1]]
+            dst_indices = [t[2] for t in needed_from[r+1]]
+            recv_perm_map[r] = dst_indices
+            struct_send_bufs[r] = indices
+            req = MPI.Isend(indices, comm; dest=r, tag=20)
+            push!(struct_send_reqs, req)
+        end
+    end
+
+    # Step 4: Receive requests from other ranks
+    send_rank_ids = Int[]
+    struct_recv_bufs = Dict{Int,Vector{Int}}()
+    struct_recv_reqs = MPI.Request[]
+
+    for r in 0:(nranks-1)
+        if recv_counts[r+1] > 0 && r != rank
+            push!(send_rank_ids, r)
+            buf = Vector{Int}(undef, recv_counts[r+1])
+            req = MPI.Irecv!(buf, comm; source=r, tag=20)
+            push!(struct_recv_reqs, req)
+            struct_recv_bufs[r] = buf
+        end
+    end
+
+    MPI.Waitall(struct_recv_reqs)
+    MPI.Waitall(struct_send_reqs)
+
+    # Step 5: Convert received global indices to local indices for sending
+    send_indices_map = Dict{Int,Vector{Int}}()
+    for r in send_rank_ids
+        global_indices = struct_recv_bufs[r]
+        local_indices = [idx - my_x_start + 1 for idx in global_indices]
+        send_indices_map[r] = local_indices
+    end
+
+    # Step 6: Handle local elements (elements we own)
+    local_src_indices = Int[]
+    local_dst_indices = Int[]
+    for (global_idx, dst_idx) in needed_from[rank+1]
+        local_idx = global_idx - my_x_start + 1
+        push!(local_src_indices, local_idx)
+        push!(local_dst_indices, dst_idx)
+    end
+
+    # Step 7: Build final arrays and buffers
+    sort!(send_rank_ids)
+    sort!(recv_rank_ids)
+
+    send_indices_final = [send_indices_map[r] for r in send_rank_ids]
+    recv_perm_final = [recv_perm_map[r] for r in recv_rank_ids]
+
+    send_bufs = [Vector{T}(undef, length(inds)) for inds in send_indices_final]
+    recv_bufs = [Vector{T}(undef, send_counts[r+1]) for r in recv_rank_ids]
+    send_reqs = Vector{MPI.Request}(undef, length(send_rank_ids))
+    recv_reqs = Vector{MPI.Request}(undef, length(recv_rank_ids))
+    gathered = Vector{T}(undef, n_gathered)
+
+    return VectorPlan{T}(
+        send_rank_ids, send_indices_final, send_bufs, send_reqs,
+        recv_rank_ids, recv_bufs, recv_reqs, recv_perm_final,
+        local_src_indices, local_dst_indices, gathered
+    )
+end
+
+"""
+    VectorPlan(target_partition::Vector{Int}, source::VectorMPI{T}) where T
+
+Create a communication plan to gather elements from `source` according to `target_partition`.
+This allows binary operations between vectors with different partitions.
+
+After executing, `plan.gathered` contains `source[target_partition[rank+1]:target_partition[rank+2]-1]`.
+"""
+function VectorPlan(target_partition::Vector{Int}, source::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    # Indices this rank needs from source (contiguous range)
+    my_start = target_partition[rank+1]
+    my_end = target_partition[rank+2] - 1
+    col_indices = collect(my_start:my_end)
+    n_gathered = length(col_indices)
+
+    my_x_start = source.partition[rank+1]
+
+    # Step 1: Group col_indices by owner rank in source's partition
+    needed_from = [Tuple{Int,Int}[] for _ in 1:nranks]
+    for (dst_idx, global_idx) in enumerate(col_indices)
+        owner = searchsortedlast(source.partition, global_idx) - 1
+        push!(needed_from[owner+1], (global_idx, dst_idx))
+    end
+
+    # Step 2: Exchange counts via Alltoall
+    send_counts = [length(needed_from[r+1]) for r in 0:(nranks-1)]
+    recv_counts = MPI.Alltoall(MPI.UBuffer(send_counts, 1), comm)
+
+    # Step 3: Send requested indices to each owner rank
+    struct_send_bufs = Dict{Int,Vector{Int}}()
+    struct_send_reqs = MPI.Request[]
+    recv_rank_ids = Int[]
+    recv_perm_map = Dict{Int,Vector{Int}}()
+
+    for r in 0:(nranks-1)
+        if send_counts[r+1] > 0 && r != rank
+            push!(recv_rank_ids, r)
+            indices = [t[1] for t in needed_from[r+1]]
+            dst_indices = [t[2] for t in needed_from[r+1]]
+            recv_perm_map[r] = dst_indices
+            struct_send_bufs[r] = indices
+            req = MPI.Isend(indices, comm; dest=r, tag=22)
+            push!(struct_send_reqs, req)
+        end
+    end
+
+    # Step 4: Receive requests from other ranks
+    send_rank_ids = Int[]
+    struct_recv_bufs = Dict{Int,Vector{Int}}()
+    struct_recv_reqs = MPI.Request[]
+
+    for r in 0:(nranks-1)
+        if recv_counts[r+1] > 0 && r != rank
+            push!(send_rank_ids, r)
+            buf = Vector{Int}(undef, recv_counts[r+1])
+            req = MPI.Irecv!(buf, comm; source=r, tag=22)
+            push!(struct_recv_reqs, req)
+            struct_recv_bufs[r] = buf
+        end
+    end
+
+    MPI.Waitall(struct_recv_reqs)
+    MPI.Waitall(struct_send_reqs)
+
+    # Step 5: Convert received global indices to local indices for sending
+    send_indices_map = Dict{Int,Vector{Int}}()
+    for r in send_rank_ids
+        global_indices = struct_recv_bufs[r]
+        local_indices = [idx - my_x_start + 1 for idx in global_indices]
+        send_indices_map[r] = local_indices
+    end
+
+    # Step 6: Handle local elements (elements we own in source)
+    local_src_indices = Int[]
+    local_dst_indices = Int[]
+    for (global_idx, dst_idx) in needed_from[rank+1]
+        local_idx = global_idx - my_x_start + 1
+        push!(local_src_indices, local_idx)
+        push!(local_dst_indices, dst_idx)
+    end
+
+    # Step 7: Build final arrays and buffers
+    sort!(send_rank_ids)
+    sort!(recv_rank_ids)
+
+    send_indices_final = [send_indices_map[r] for r in send_rank_ids]
+    recv_perm_final = [recv_perm_map[r] for r in recv_rank_ids]
+
+    send_bufs = [Vector{T}(undef, length(inds)) for inds in send_indices_final]
+    recv_bufs = [Vector{T}(undef, send_counts[r+1]) for r in recv_rank_ids]
+    send_reqs = Vector{MPI.Request}(undef, length(send_rank_ids))
+    recv_reqs = Vector{MPI.Request}(undef, length(recv_rank_ids))
+    gathered = Vector{T}(undef, n_gathered)
+
+    return VectorPlan{T}(
+        send_rank_ids, send_indices_final, send_bufs, send_reqs,
+        recv_rank_ids, recv_bufs, recv_reqs, recv_perm_final,
+        local_src_indices, local_dst_indices, gathered
+    )
+end
+
+"""
+    execute_plan!(plan::VectorPlan{T}, x::VectorMPI{T}) where T
+
+Execute a vector communication plan to gather elements from x.
+Returns plan.gathered containing x[A.col_indices] for the associated matrix A.
+"""
+function execute_plan!(plan::VectorPlan{T}, x::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+
+    # Step 1: Copy local values (allocation-free loop)
+    @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
+        plan.gathered[plan.local_dst_indices[i]] = x.v[plan.local_src_indices[i]]
+    end
+
+    # Step 2: Fill send buffers and send (allocation-free loops)
+    @inbounds for i in eachindex(plan.send_rank_ids)
+        r = plan.send_rank_ids[i]
+        send_idx = plan.send_indices[i]
+        buf = plan.send_bufs[i]
+        for k in eachindex(send_idx)
+            buf[k] = x.v[send_idx[k]]
+        end
+        plan.send_reqs[i] = MPI.Isend(buf, comm; dest=r, tag=21)
+    end
+
+    # Step 3: Receive values
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=21)
+    end
+
+    MPI.Waitall(plan.recv_reqs)
+
+    # Step 4: Scatter received values into gathered (allocation-free loops)
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        perm = plan.recv_perm[i]
+        buf = plan.recv_bufs[i]
+        for k in eachindex(perm)
+            plan.gathered[perm[k]] = buf[k]
+        end
+    end
+
+    MPI.Waitall(plan.send_reqs)
+
+    return plan.gathered
+end
+
+"""
+    get_vector_plan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+
+Get a memoized VectorPlan for A * x.
+The plan is cached based on the structural hashes of A and x.
+"""
+function get_vector_plan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    key = (A.structural_hash, x.structural_hash, T)
+    if haskey(_vector_plan_cache, key)
+        return _vector_plan_cache[key]::VectorPlan{T}
+    end
+    plan = VectorPlan(A, x)
+    _vector_plan_cache[key] = plan
+    return plan
+end
+
+"""
+    get_vector_align_plan(target::VectorMPI{T}, source::VectorMPI{T}) where T
+
+Get a memoized VectorPlan for aligning `source` to `target`'s partition.
+The plan is cached based on the structural hashes of both vectors.
+Uses a separate cache from get_vector_plan to avoid key collisions.
+"""
+function get_vector_align_plan(target::VectorMPI{T}, source::VectorMPI{T}) where T
+    key = (target.structural_hash, source.structural_hash, T)
+    if haskey(_vector_align_plan_cache, key)
+        return _vector_align_plan_cache[key]::VectorPlan{T}
+    end
+    plan = VectorPlan(target.partition, source)
+    _vector_align_plan_cache[key] = plan
+    return plan
+end
+
+# Matrix-vector multiplication
+
+"""
+    LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+
+In-place matrix-vector multiplication: y = A * x.
+"""
+function LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    plan = get_vector_plan(A, x)
+    gathered = execute_plan!(plan, x)
+
+    # Local computation: A.AT is the transpose of local rows
+    # A.AT has shape (ncols_A, local_nrows) where rowval contains global column indices
+    # gathered has shape (n_gathered,) where n_gathered = length(A.col_indices)
+    # We need to reindex A.AT's rowval from global column indices to local indices in gathered
+    col_indices = A.col_indices
+    n_gathered = length(col_indices)
+    col_map = Dict(col => i for (i, col) in enumerate(col_indices))
+
+    # Create reindexed A.AT with local column indices
+    reindexed_rowval = [col_map[r] for r in A.AT.rowval]
+    A_AT_reindexed = SparseMatrixCSC(n_gathered, size(A.AT, 2), A.AT.colptr, reindexed_rowval, A.AT.nzval)
+
+    # Now transpose(A_AT_reindexed) * gathered gives the correct result
+    # Note: use transpose(), not ' (adjoint), to avoid conjugating complex values
+    # A_AT_reindexed is (n_gathered, local_nrows), transpose is (local_nrows, n_gathered)
+    LinearAlgebra.mul!(y.v, transpose(A_AT_reindexed), gathered)
+    return y
+end
+
+"""
+    Base.:*(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+
+Matrix-vector multiplication returning a new VectorMPI.
+The result has the same row partition as A.
+"""
+function Base.:*(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    # Create result vector with A's row_partition
+    rank = MPI.Comm_rank(MPI.COMM_WORLD)
+    local_rows = A.row_partition[rank + 2] - A.row_partition[rank + 1]
+    y = VectorMPI{T}(
+        compute_partition_hash(A.row_partition),
+        copy(A.row_partition),
+        Vector{T}(undef, local_rows)
+    )
+    return LinearAlgebra.mul!(y, A, x)
+end
+
+# Vector operations: conj, transpose, adjoint
+
+"""
+    Base.conj(v::VectorMPI{T}) where T
+
+Return a new VectorMPI with conjugated values.
+"""
+function Base.conj(v::VectorMPI{T}) where T
+    return VectorMPI{T}(v.structural_hash, v.partition, conj.(v.v))
+end
+
+"""
+    Base.transpose(v::VectorMPI{T}) where T
+
+Return a lazy transpose wrapper around v.
+"""
+Base.transpose(v::VectorMPI{T}) where T = Transpose(v)
+
+"""
+    Base.adjoint(v::VectorMPI{T}) where T
+
+Return transpose(conj(v)), i.e., the conjugate transpose.
+The conj(v) is materialized.
+"""
+Base.adjoint(v::VectorMPI{T}) where T = transpose(conj(v))
+
+"""
+    *(vt::Transpose{<:Any, VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
+
+Compute transpose(v) * A as transpose(transpose(A) * v).
+Returns a transposed VectorMPI.
+"""
+function Base.:*(vt::Transpose{<:Any, VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
+    v = vt.parent
+    # transpose(v) * A = transpose(transpose(A) * v)
+    # First compute transpose(A) * v
+    plan = TransposePlan(A)
+    A_transposed = execute_plan!(plan, A)
+    result = A_transposed * v
+    return transpose(result)
+end
+
+# Vector norms and reductions
+
+"""
+    LinearAlgebra.norm(v::VectorMPI{T}, p::Real=2) where T
+
+Compute the p-norm of the distributed vector v.
+- `p=2` (default): Euclidean norm (sqrt of sum of squared absolute values)
+- `p=1`: Sum of absolute values
+- `p=Inf`: Maximum absolute value
+"""
+function LinearAlgebra.norm(v::VectorMPI{T}, p::Real=2) where T
+    comm = MPI.COMM_WORLD
+
+    if p == 2
+        local_sum = sum(abs2, v.v; init=zero(real(T)))
+        global_sum = MPI.Allreduce(local_sum, MPI.SUM, comm)
+        return sqrt(global_sum)
+    elseif p == 1
+        local_sum = sum(abs, v.v; init=zero(real(T)))
+        return MPI.Allreduce(local_sum, MPI.SUM, comm)
+    elseif p == Inf
+        local_max = isempty(v.v) ? zero(real(T)) : maximum(abs, v.v)
+        return MPI.Allreduce(local_max, MPI.MAX, comm)
+    else
+        # General p-norm
+        local_sum = sum(x -> abs(x)^p, v.v; init=zero(real(T)))
+        global_sum = MPI.Allreduce(local_sum, MPI.SUM, comm)
+        return global_sum^(1 / p)
+    end
+end
+
+"""
+    Base.maximum(v::VectorMPI{T}) where T
+
+Compute the maximum element of the distributed vector.
+"""
+function Base.maximum(v::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    local_max = isempty(v.v) ? typemin(real(T)) : maximum(real, v.v)
+    return MPI.Allreduce(local_max, MPI.MAX, comm)
+end
+
+"""
+    Base.minimum(v::VectorMPI{T}) where T
+
+Compute the minimum element of the distributed vector.
+"""
+function Base.minimum(v::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    local_min = isempty(v.v) ? typemax(real(T)) : minimum(real, v.v)
+    return MPI.Allreduce(local_min, MPI.MIN, comm)
+end
+
+"""
+    Base.sum(v::VectorMPI{T}) where T
+
+Compute the sum of all elements in the distributed vector.
+"""
+function Base.sum(v::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    local_sum = sum(v.v; init=zero(T))
+    return MPI.Allreduce(local_sum, MPI.SUM, comm)
+end
+
+"""
+    Base.prod(v::VectorMPI{T}) where T
+
+Compute the product of all elements in the distributed vector.
+"""
+function Base.prod(v::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    local_prod = prod(v.v; init=one(T))
+    return MPI.Allreduce(local_prod, MPI.PROD, comm)
+end
+
+# Vector addition and subtraction
+
+"""
+    Base.:+(u::VectorMPI{T}, v::VectorMPI{T}) where T
+
+Add two distributed vectors. If partitions differ, v is aligned to u's partition.
+The result has u's partition.
+"""
+function Base.:+(u::VectorMPI{T}, v::VectorMPI{T}) where T
+    if u.partition == v.partition
+        return VectorMPI{T}(u.structural_hash, u.partition, u.v .+ v.v)
+    else
+        # Align v to u's partition
+        plan = get_vector_align_plan(u, v)
+        v_aligned = execute_plan!(plan, v)
+        return VectorMPI{T}(u.structural_hash, copy(u.partition), u.v .+ v_aligned)
+    end
+end
+
+"""
+    Base.:-(u::VectorMPI{T}, v::VectorMPI{T}) where T
+
+Subtract two distributed vectors. If partitions differ, v is aligned to u's partition.
+The result has u's partition.
+"""
+function Base.:-(u::VectorMPI{T}, v::VectorMPI{T}) where T
+    if u.partition == v.partition
+        return VectorMPI{T}(u.structural_hash, u.partition, u.v .- v.v)
+    else
+        # Align v to u's partition
+        plan = get_vector_align_plan(u, v)
+        v_aligned = execute_plan!(plan, v)
+        return VectorMPI{T}(u.structural_hash, copy(u.partition), u.v .- v_aligned)
+    end
+end
+
+"""
+    Base.:-(v::VectorMPI{T}) where T
+
+Negate a distributed vector.
+"""
+function Base.:-(v::VectorMPI{T}) where T
+    return VectorMPI{T}(v.structural_hash, v.partition, .-v.v)
+end
+
+# Mixed transpose addition/subtraction
+# transpose(u) +/- transpose(v) works, aligning v to u's partition if needed
+
+"""
+    Base.:+(ut::Transpose{<:Any, VectorMPI{T}}, vt::Transpose{<:Any, VectorMPI{T}}) where T
+
+Add two transposed vectors. If partitions differ, vt is aligned to ut's partition.
+Returns a transposed VectorMPI.
+"""
+function Base.:+(ut::Transpose{<:Any, VectorMPI{T}}, vt::Transpose{<:Any, VectorMPI{T}}) where T
+    return transpose(ut.parent + vt.parent)
+end
+
+"""
+    Base.:-(ut::Transpose{<:Any, VectorMPI{T}}, vt::Transpose{<:Any, VectorMPI{T}}) where T
+
+Subtract two transposed vectors. If partitions differ, vt is aligned to ut's partition.
+Returns a transposed VectorMPI.
+"""
+function Base.:-(ut::Transpose{<:Any, VectorMPI{T}}, vt::Transpose{<:Any, VectorMPI{T}}) where T
+    return transpose(ut.parent - vt.parent)
+end
+
+"""
+    Base.:-(vt::Transpose{<:Any, VectorMPI{T}}) where T
+
+Negate a transposed vector. Returns a transposed VectorMPI.
+"""
+function Base.:-(vt::Transpose{<:Any, VectorMPI{T}}) where T
+    return transpose(-vt.parent)
+end
+
+# Scalar multiplication for VectorMPI
+
+"""
+    Base.:*(a::Number, v::VectorMPI{T}) where T
+
+Scalar times vector.
+"""
+function Base.:*(a::Number, v::VectorMPI{T}) where T
+    RT = promote_type(typeof(a), T)
+    return VectorMPI{RT}(v.structural_hash, v.partition, RT.(a .* v.v))
+end
+
+"""
+    Base.:*(v::VectorMPI{T}, a::Number) where T
+
+Vector times scalar.
+"""
+Base.:*(v::VectorMPI{T}, a::Number) where T = a * v
+
+"""
+    Base.:/(v::VectorMPI{T}, a::Number) where T
+
+Vector divided by scalar.
+"""
+function Base.:/(v::VectorMPI{T}, a::Number) where T
+    RT = promote_type(typeof(a), T)
+    return VectorMPI{RT}(v.structural_hash, v.partition, RT.(v.v ./ a))
+end
+
+# Scalar multiplication for transposed VectorMPI
+
+"""
+    Base.:*(a::Number, vt::Transpose{<:Any, VectorMPI{T}}) where T
+
+Scalar times transposed vector.
+"""
+Base.:*(a::Number, vt::Transpose{<:Any, VectorMPI{T}}) where T = transpose(a * vt.parent)
+
+"""
+    Base.:*(vt::Transpose{<:Any, VectorMPI{T}}, a::Number) where T
+
+Transposed vector times scalar.
+"""
+Base.:*(vt::Transpose{<:Any, VectorMPI{T}}, a::Number) where T = transpose(vt.parent * a)
+
+"""
+    Base.:/(vt::Transpose{<:Any, VectorMPI{T}}, a::Number) where T
+
+Transposed vector divided by scalar.
+"""
+Base.:/(vt::Transpose{<:Any, VectorMPI{T}}, a::Number) where T = transpose(vt.parent / a)
+
+# Vector size and eltype
+
+"""
+    Base.length(v::VectorMPI)
+
+Return the total length of the distributed vector.
+"""
+Base.length(v::VectorMPI) = v.partition[end] - 1
+
+"""
+    Base.size(v::VectorMPI)
+
+Return the size of the distributed vector as a tuple.
+"""
+Base.size(v::VectorMPI) = (length(v),)
+
+Base.size(v::VectorMPI, d::Integer) = d == 1 ? length(v) : 1
+
+Base.eltype(::VectorMPI{T}) where T = T
+Base.eltype(::Type{VectorMPI{T}}) where T = T
 
 # AbstractMatrix interface for SparseMatrixMPI
 
@@ -951,7 +1637,7 @@ function LinearAlgebra.norm(A::SparseMatrixMPI{T}, p::Real=2) where T
         # General p-norm
         local_sum = sum(x -> abs(x)^p, local_vals; init=zero(real(T)))
         global_sum = MPI.Allreduce(local_sum, MPI.SUM, comm)
-        return global_sum^(1/p)
+        return global_sum^(1 / p)
     end
 end
 
@@ -1028,7 +1714,7 @@ function Base.conj(A::SparseMatrixMPI{T}) where T
     )
     # Structural hash is the same since structure didn't change
     return SparseMatrixMPI{T}(A.structural_hash, A.row_partition, A.col_partition,
-                              A.col_indices, conj_AT)
+        A.col_indices, conj_AT)
 end
 
 """
@@ -1055,7 +1741,7 @@ function Base.:*(a::Number, A::SparseMatrixMPI{T}) where T
         RT.(a .* A.AT.nzval)
     )
     return SparseMatrixMPI{RT}(A.structural_hash, A.row_partition, A.col_partition,
-                               A.col_indices, scaled_AT)
+        A.col_indices, scaled_AT)
 end
 
 """
@@ -1066,7 +1752,7 @@ Matrix times scalar.
 Base.:*(A::SparseMatrixMPI{T}, a::Number) where T = a * A
 
 # Type alias for transpose of SparseMatrixMPI
-const TransposedSparseMatrixMPI{T} = Transpose{T, SparseMatrixMPI{T}}
+const TransposedSparseMatrixMPI{T} = Transpose{T,SparseMatrixMPI{T}}
 
 """
     *(a::Number, At::TransposedSparseMatrixMPI{T}) where T

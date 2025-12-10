@@ -9,3 +9,7 @@ Plots/
 
 # Julia
 Manifest.toml
+
+# Documentation build
+docs/build/
+docs/Manifest.toml

@@ -46,4 +46,7 @@ end
     @testset "MPI Lazy Transpose" begin
         run_mpi_test(joinpath(@__DIR__, "test_lazy_transpose.jl"); nprocs=4, expect_success=true)
     end
+    @testset "MPI Vector Multiplication" begin
+        run_mpi_test(joinpath(@__DIR__, "test_vector_multiplication.jl"); nprocs=4, expect_success=true)
+    end
 end

@@ -1,0 +1,10 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+LinearAlgebraMPI = "5bdd2be4-ae34-42ef-8b36-f4c85d48f377"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
+[sources]
+LinearAlgebraMPI = {path = ".."}
+
+[compat]
+Documenter = "1"
