@@ -264,6 +264,31 @@ size(v)        # Returns (length,)
 eltype(v)      # Element type
 ```
 
+## Utility Functions
+
+### Rank-Selective Output
+
+```@docs
+io0
+```
+
+### Gathering Distributed Data
+
+Convert distributed MPI types to standard Julia types (gathers data to all ranks):
+
+```julia
+Vector(v::VectorMPI)              # Gather to Vector
+Matrix(A::MatrixMPI)              # Gather to Matrix
+SparseMatrixCSC(A::SparseMatrixMPI) # Gather to SparseMatrixCSC
+```
+
+These conversions enable `show` and string interpolation:
+
+```julia
+println(io0(), "Result: $v")      # Works with VectorMPI
+println(io0(), "Matrix: $A")      # Works with MatrixMPI/SparseMatrixMPI
+```
+
 ## Cache Management
 
 ```@docs
