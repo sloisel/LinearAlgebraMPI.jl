@@ -53,6 +53,63 @@ struct MatrixMPI{T}
 end
 
 """
+    MatrixMPI_local(A_local::Matrix{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+
+Create a MatrixMPI from a local matrix on each rank.
+
+Unlike `MatrixMPI(M_global)` which takes a global matrix and partitions it,
+this constructor takes only the local rows of the matrix that each rank owns.
+The row partition is computed by gathering the local row counts from all ranks.
+
+All ranks must have local matrices with the same number of columns.
+A collective error is raised if the column counts don't match.
+
+# Example
+```julia
+# Rank 0 has 2×3 matrix, Rank 1 has 3×3 matrix
+A = MatrixMPI_local(randn(2, 3))  # on rank 0
+A = MatrixMPI_local(randn(3, 3))  # on rank 1
+# Result: 5×3 distributed matrix with row_partition [1, 3, 6]
+```
+"""
+function MatrixMPI_local(A_local::Matrix{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    local_nrows, local_ncols = size(A_local)
+
+    # Gather local row counts and column counts from all ranks
+    local_info = Int32[local_nrows, local_ncols]
+    all_info = MPI.Allgather(local_info, comm)
+
+    # Extract row counts and verify column counts match
+    all_row_counts = [all_info[2*(r-1)+1] for r in 1:nranks]
+    all_col_counts = [all_info[2*(r-1)+2] for r in 1:nranks]
+
+    # Check that all column counts are the same
+    if !all(c == all_col_counts[1] for c in all_col_counts)
+        error("MatrixMPI_local: All ranks must have the same number of columns. " *
+              "Got column counts: $all_col_counts")
+    end
+    ncols = Int(all_col_counts[1])
+
+    # Build row_partition from row counts
+    row_partition = Vector{Int}(undef, nranks + 1)
+    row_partition[1] = 1
+    for r in 1:nranks
+        row_partition[r+1] = row_partition[r] + all_row_counts[r]
+    end
+
+    # Build col_partition (standard even distribution)
+    col_partition = _compute_partition(ncols, nranks)
+
+    # Compute structural hash
+    structural_hash = compute_dense_structural_hash(row_partition, col_partition, size(A_local), comm)
+
+    return MatrixMPI{T}(structural_hash, row_partition, col_partition, copy(A_local))
+end
+
+"""
     MatrixMPI(M::Matrix{T}; row_partition=nothing, col_partition=nothing) where T
 
 Create a MatrixMPI from a global matrix M, partitioning it by rows across MPI ranks.

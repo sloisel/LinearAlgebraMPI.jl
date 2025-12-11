@@ -17,6 +17,41 @@ struct VectorMPI{T}
 end
 
 """
+    VectorMPI_local(v_local::Vector{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+
+Create a VectorMPI from a local vector on each rank.
+
+Unlike `VectorMPI(v_global)` which takes a global vector and partitions it,
+this constructor takes only the local portion of the vector that each rank owns.
+The partition is computed by gathering the local sizes from all ranks.
+
+# Example
+```julia
+# Rank 0 has [1.0, 2.0], Rank 1 has [3.0, 4.0, 5.0]
+v = VectorMPI_local([1.0, 2.0])  # on rank 0
+v = VectorMPI_local([3.0, 4.0, 5.0])  # on rank 1
+# Result: distributed vector [1.0, 2.0, 3.0, 4.0, 5.0] with partition [1, 3, 6]
+```
+"""
+function VectorMPI_local(v_local::Vector{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+    nranks = MPI.Comm_size(comm)
+
+    # Gather local sizes from all ranks
+    local_size = Int32(length(v_local))
+    all_sizes = MPI.Allgather(local_size, comm)
+
+    # Build partition from sizes
+    partition = Vector{Int}(undef, nranks + 1)
+    partition[1] = 1
+    for r in 1:nranks
+        partition[r+1] = partition[r] + all_sizes[r]
+    end
+
+    hash = compute_partition_hash(partition)
+    return VectorMPI{T}(hash, partition, copy(v_local))
+end
+
+"""
     VectorMPI(v_global::Vector{T}, comm::MPI.Comm=MPI.COMM_WORLD) where T
 
 Create a VectorMPI from a global vector, partitioning it across MPI ranks.

@@ -8,6 +8,7 @@ import LinearAlgebra
 import LinearAlgebra: tr, diag, triu, tril, Transpose, Adjoint, norm, opnorm, mul!
 
 export SparseMatrixMPI, MatrixMPI, VectorMPI, clear_plan_cache!
+export VectorMPI_local, MatrixMPI_local, SparseMatrixMPI_local  # Local constructors
 export mean  # Our mean function for SparseMatrixMPI and VectorMPI
 export io0   # Utility for rank-selective output
 

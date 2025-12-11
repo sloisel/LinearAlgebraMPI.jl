@@ -193,6 +193,98 @@ function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int}) where T
 end
 
 """
+    SparseMatrixMPI_local(A_local::Transpose{T,SparseMatrixCSC{T,Int}}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+    SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Int}}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+
+Create a SparseMatrixMPI from a local sparse matrix on each rank.
+
+Unlike `SparseMatrixMPI{T}(A_global)` which takes a global matrix and partitions it,
+this constructor takes only the local rows of the matrix that each rank owns.
+The row partition is computed by gathering the local row counts from all ranks.
+
+The input `A_local` must be a `Transpose` (or `Adjoint`) of a `SparseMatrixCSC{T,Int}` where:
+- `A_local.parent.n` = number of local rows on this rank
+- `A_local.parent.m` = global number of columns (must match on all ranks)
+- `A_local.parent.rowval` = global column indices
+
+All ranks must have local matrices with the same number of columns (block widths must match).
+A collective error is raised if the column counts don't match.
+
+Note: For `Adjoint` inputs, the values are conjugated to match the adjoint semantics.
+
+# Example
+```julia
+# Create local rows as transpose of CSC storage
+# Rank 0 owns rows 1-2 of a 5×3 matrix, Rank 1 owns rows 3-5
+local_AT = sparse([1, 2, 3], [1, 1, 2], [1.0, 2.0, 3.0], 3, 2)  # 3 cols, 2 local rows
+A = SparseMatrixMPI_local(transpose(local_AT))
+```
+"""
+function SparseMatrixMPI_local(A_local::Transpose{T,SparseMatrixCSC{T,Int}}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    AT_local = A_local.parent  # The underlying CSC storage
+    local_nrows = AT_local.n   # Columns in CSC = rows in matrix
+    ncols_global = AT_local.m  # Rows in CSC = columns in matrix (global)
+
+    # Gather local row counts and column counts from all ranks
+    local_info = Int32[local_nrows, ncols_global]
+    all_info = MPI.Allgather(local_info, comm)
+
+    # Extract row counts and verify column counts match
+    all_row_counts = [all_info[2*(r-1)+1] for r in 1:nranks]
+    all_col_counts = [all_info[2*(r-1)+2] for r in 1:nranks]
+
+    # Check that all column counts are the same
+    if !all(c == all_col_counts[1] for c in all_col_counts)
+        error("SparseMatrixMPI_local: All ranks must have the same number of columns. " *
+              "Got column counts: $all_col_counts")
+    end
+    ncols = Int(all_col_counts[1])
+
+    # Build row_partition from row counts
+    row_partition = Vector{Int}(undef, nranks + 1)
+    row_partition[1] = 1
+    for r in 1:nranks
+        row_partition[r+1] = row_partition[r] + all_row_counts[r]
+    end
+
+    # Build col_partition (standard even distribution)
+    cols_per_rank = div(ncols, nranks)
+    col_remainder = mod(ncols, nranks)
+    col_partition = Vector{Int}(undef, nranks + 1)
+    col_partition[1] = 1
+    for r in 1:nranks
+        extra = r <= col_remainder ? 1 : 0
+        col_partition[r+1] = col_partition[r] + cols_per_rank + extra
+    end
+
+    # Identify which columns have nonzeros in our local part
+    # AT_local.rowval contains global column indices
+    col_indices = isempty(AT_local.rowval) ? Int[] : unique(sort(AT_local.rowval))
+
+    # Compress AT_local: convert global column indices to local indices 1:length(col_indices)
+    compressed_AT = compress_AT(AT_local, col_indices)
+    A_compressed = transpose(compressed_AT)  # Transpose wrapper for type clarity
+
+    # Compute structural hash (identical across all ranks)
+    structural_hash = compute_structural_hash(row_partition, col_indices, compressed_AT, comm)
+
+    return SparseMatrixMPI{T}(structural_hash, row_partition, col_partition, col_indices, A_compressed,
+        Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+end
+
+# Adjoint version: conjugate values during construction
+function SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Int}}, comm::MPI.Comm=MPI.COMM_WORLD) where T
+    # Convert adjoint to transpose with conjugated values
+    AT_parent = A_local.parent
+    AT_conj = SparseMatrixCSC(AT_parent.m, AT_parent.n, copy(AT_parent.colptr),
+                               copy(AT_parent.rowval), conj.(AT_parent.nzval))
+    return SparseMatrixMPI_local(transpose(AT_conj), comm)
+end
+
+"""
     MatrixPlan{T}
 
 A communication plan for gathering rows from an SparseMatrixMPI.
