@@ -58,6 +58,7 @@ struct SparseMatrixMPI{T}
     col_partition::Vector{Int}
     col_indices::Vector{Int}
     A::Transpose{T,SparseMatrixCSC{T,Int}}
+    cached_transpose::Ref{Union{Nothing, SparseMatrixMPI{T}}}
 end
 
 """
@@ -119,7 +120,8 @@ function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int}) where T
     # Compute structural hash (identical across all ranks)
     structural_hash = compute_structural_hash(row_partition, col_indices, AT_storage, comm)
 
-    return SparseMatrixMPI{T}(structural_hash, row_partition, col_partition, col_indices, A_local)
+    return SparseMatrixMPI{T}(structural_hash, row_partition, col_partition, col_indices, A_local,
+        Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -521,7 +523,8 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     result_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
 
     # C = A * B has rows from A and columns from B
-    return SparseMatrixMPI{T}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(result_AT))
+    return SparseMatrixMPI{T}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(result_AT),
+        Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 # Cache for addition MatrixPlans (keyed by A's row_partition hash and B's structural hash)
@@ -573,7 +576,7 @@ function Base.:+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, A.row_partition, A.col_partition,
-        result_col_indices, transpose(result_AT))
+        result_col_indices, transpose(result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -596,7 +599,7 @@ function Base.:-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, A.row_partition, A.col_partition,
-        result_col_indices, transpose(result_AT))
+        result_col_indices, transpose(result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -886,7 +889,32 @@ function execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(plan.row_partition, plan.col_indices, result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, plan.row_partition, plan.col_partition,
-        plan.col_indices, transpose(result_AT))
+        plan.col_indices, transpose(result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+end
+
+"""
+    materialize_transpose(A::SparseMatrixMPI{T}) where T
+
+Materialize the transpose of A, using cached result if available.
+If the transpose has been computed before, returns the cached result.
+Otherwise, computes the transpose via TransposePlan and caches it bidirectionally
+(A.cached_transpose[] = Y and Y.cached_transpose[] = A).
+"""
+function materialize_transpose(A::SparseMatrixMPI{T}) where T
+    # Check if already cached
+    if A.cached_transpose[] !== nothing
+        return A.cached_transpose[]
+    end
+
+    # Compute the transpose
+    plan = TransposePlan(A)
+    Y = execute_plan!(plan, A)
+
+    # Cache bidirectionally
+    A.cached_transpose[] = Y
+    Y.cached_transpose[] = A
+
+    return Y
 end
 
 # VectorPlan constructor for sparse A * x (adds method to VectorPlan from vectors.jl)
@@ -1070,9 +1098,7 @@ Returns a transposed VectorMPI.
 function Base.:*(vt::Transpose{<:Any, VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
     v = vt.parent
     # transpose(v) * A = transpose(transpose(A) * v)
-    # First compute transpose(A) * v
-    plan = TransposePlan(A)
-    A_transposed = execute_plan!(plan, A)
+    A_transposed = materialize_transpose(A)
     result = A_transposed * v
     return transpose(result)
 end
@@ -1200,7 +1226,7 @@ function Base.conj(A::SparseMatrixMPI{T}) where T
     )
     # Structural hash is the same since structure didn't change
     return SparseMatrixMPI{T}(A.structural_hash, A.row_partition, A.col_partition,
-        A.col_indices, transpose(conj_AT))
+        A.col_indices, transpose(conj_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -1227,7 +1253,7 @@ function Base.:*(a::Number, A::SparseMatrixMPI{T}) where T
         RT.(a .* A.A.parent.nzval)
     )
     return SparseMatrixMPI{RT}(A.structural_hash, A.row_partition, A.col_partition,
-        A.col_indices, transpose(scaled_AT))
+        A.col_indices, transpose(scaled_AT), Ref{Union{Nothing, SparseMatrixMPI{RT}}}(nothing))
 end
 
 """
@@ -1275,8 +1301,7 @@ Compute transpose(A) * B by materializing the transpose of A first.
 """
 function Base.:*(At::TransposedSparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     A = At.parent
-    plan = TransposePlan(A)
-    A_transposed = execute_plan!(plan, A)
+    A_transposed = materialize_transpose(A)
     return A_transposed * B
 end
 
@@ -1287,8 +1312,7 @@ Compute A * transpose(B) by materializing the transpose of B first.
 """
 function Base.:*(A::SparseMatrixMPI{T}, Bt::TransposedSparseMatrixMPI{T}) where T
     B = Bt.parent
-    plan = TransposePlan(B)
-    B_transposed = execute_plan!(plan, B)
+    B_transposed = materialize_transpose(B)
     return A * B_transposed
 end
 
@@ -1336,7 +1360,8 @@ function Base.copy(A::SparseMatrixMPI{T}) where T
         copy(A.row_partition),
         copy(A.col_partition),
         copy(A.col_indices),
-        transpose(new_AT)
+        transpose(new_AT),
+        Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing)
     )
 end
 
@@ -1350,7 +1375,7 @@ function _map_nzval(f, A::SparseMatrixMPI{T}) where T
     RT = eltype(new_nzval)
     new_AT = SparseMatrixCSC(A.A.parent.m, A.A.parent.n, A.A.parent.colptr, A.A.parent.rowval, new_nzval)
     return SparseMatrixMPI{RT}(A.structural_hash, A.row_partition, A.col_partition,
-        A.col_indices, transpose(new_AT))
+        A.col_indices, transpose(new_AT), Ref{Union{Nothing, SparseMatrixMPI{RT}}}(nothing))
 end
 
 """
@@ -1554,7 +1579,7 @@ function dropzeros(A::SparseMatrixMPI{T}) where T
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
-        new_col_indices, transpose(new_AT))
+        new_col_indices, transpose(new_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 # ============================================================================
@@ -1687,7 +1712,7 @@ function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
-        new_col_indices, transpose(new_AT))
+        new_col_indices, transpose(new_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -1747,7 +1772,7 @@ function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
-        new_col_indices, transpose(new_AT))
+        new_col_indices, transpose(new_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 # ============================================================================
