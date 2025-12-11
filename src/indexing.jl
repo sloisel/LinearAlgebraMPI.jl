@@ -290,3 +290,100 @@ function Base.setindex!(A::SparseMatrixMPI{T}, val, i::Integer, j::Integer) wher
 
     return val
 end
+
+# ============================================================================
+# MatrixMPI Indexing
+# ============================================================================
+
+"""
+    Base.getindex(A::MatrixMPI{T}, i::Integer, j::Integer) where T
+
+Get element `A[i, j]` from a distributed dense matrix.
+
+This is a collective operation - all ranks must call it with the same indices.
+The owning rank (owner of row i) broadcasts the value to all others.
+
+# Example
+```julia
+A = MatrixMPI([1.0 2.0; 3.0 4.0; 5.0 6.0])
+x = A[2, 1]  # All ranks get 3.0
+```
+"""
+function Base.getindex(A::MatrixMPI{T}, i::Integer, j::Integer) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    m, n = size(A)
+    if i < 1 || i > m
+        _mpi_abort_with_stacktrace("MatrixMPI row index out of bounds: i=$i, nrows=$m")
+    end
+    if j < 1 || j > n
+        _mpi_abort_with_stacktrace("MatrixMPI column index out of bounds: j=$j, ncols=$n")
+    end
+
+    # Find owner of row i using binary search on row_partition
+    owner = searchsortedlast(A.row_partition, i) - 1
+    if owner >= nranks
+        owner = nranks - 1
+    end
+
+    # Use a 1-element buffer for broadcast (MPI.Bcast! requires arrays)
+    buf = Vector{T}(undef, 1)
+
+    # Owner extracts the value into the buffer
+    if rank == owner
+        local_row = i - A.row_partition[owner + 1] + 1
+        buf[1] = A.A[local_row, j]
+    end
+
+    # Broadcast from owner to all ranks
+    MPI.Bcast!(buf, owner, comm)
+
+    return buf[1]
+end
+
+"""
+    Base.setindex!(A::MatrixMPI{T}, val, i::Integer, j::Integer) where T
+
+Set element `A[i, j] = val` in a distributed dense matrix.
+
+This is a collective operation - all ranks must call it with the same indices and value.
+Only the owning rank (owner of row i) actually modifies the data.
+
+# Example
+```julia
+A = MatrixMPI([1.0 2.0; 3.0 4.0; 5.0 6.0])
+A[2, 1] = 10.0  # All ranks must call this
+```
+"""
+function Base.setindex!(A::MatrixMPI{T}, val, i::Integer, j::Integer) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    m, n = size(A)
+    if i < 1 || i > m
+        _mpi_abort_with_stacktrace("MatrixMPI row index out of bounds: i=$i, nrows=$m")
+    end
+    if j < 1 || j > n
+        _mpi_abort_with_stacktrace("MatrixMPI column index out of bounds: j=$j, ncols=$n")
+    end
+
+    # Find owner of row i using binary search on row_partition
+    owner = searchsortedlast(A.row_partition, i) - 1
+    if owner >= nranks
+        owner = nranks - 1
+    end
+
+    # Only owner modifies the value
+    if rank == owner
+        local_row = i - A.row_partition[owner + 1] + 1
+        A.A[local_row, j] = convert(T, val)
+    end
+
+    # Barrier to ensure all ranks stay synchronized
+    MPI.Barrier(comm)
+
+    return val
+end

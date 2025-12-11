@@ -40,6 +40,14 @@ V_complex = ComplexF64[v + v*0.5im for v in V_vals]
 A_complex_global = sparse(I_vals, J_vals, V_complex, n, n)
 A_complex = SparseMatrixMPI{ComplexF64}(A_complex_global)
 
+# MatrixMPI test data - dense matrix
+M_global = Float64[i + j * 0.1 for i in 1:n, j in 1:n]
+M = MatrixMPI(M_global)
+
+# Complex MatrixMPI
+M_complex_global = ComplexF64[i + j * 0.1 + (i - j) * 0.05im for i in 1:n, j in 1:n]
+M_complex = MatrixMPI(M_complex_global)
+
 ts = @testset QuietTestSet "Indexing" begin
 
 if rank == 0
@@ -191,6 +199,83 @@ end
 MPI.Barrier(comm)
 
 if rank == 0
+    println("[test] MatrixMPI getindex")
+    flush(stdout)
+end
+
+# Test MatrixMPI getindex - various positions
+for i in 1:n
+    for j in [1, div(n, 2), n]
+        result = M[i, j]
+        @test result ≈ M_global[i, j] atol=TOL
+    end
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] MatrixMPI getindex (complex)")
+    flush(stdout)
+end
+
+# Test complex MatrixMPI getindex
+for i in [1, div(n, 2), n]
+    for j in [1, div(n, 2), n]
+        result = M_complex[i, j]
+        @test result ≈ M_complex_global[i, j] atol=TOL
+    end
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] MatrixMPI setindex!")
+    flush(stdout)
+end
+
+# Test MatrixMPI setindex!
+M_modify_global = copy(M_global)
+M_modify = MatrixMPI(M_modify_global)
+
+# Modify several entries
+test_positions = [(1, 1), (3, 5), (n, n), (div(n, 2), div(n, 2))]
+for (i, j) in test_positions
+    new_val = Float64(i * 100 + j)
+    M_modify[i, j] = new_val
+end
+
+# Verify all modifications
+for (i, j) in test_positions
+    result = M_modify[i, j]
+    expected = Float64(i * 100 + j)
+    @test result ≈ expected atol=TOL
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] MatrixMPI setindex! (complex)")
+    flush(stdout)
+end
+
+# Test complex MatrixMPI setindex!
+M_complex_modify_global = copy(M_complex_global)
+M_complex_modify = MatrixMPI(M_complex_modify_global)
+
+for (i, j) in test_positions
+    new_val = ComplexF64(i * 100 + j, i - j)
+    M_complex_modify[i, j] = new_val
+end
+
+for (i, j) in test_positions
+    result = M_complex_modify[i, j]
+    expected = ComplexF64(i * 100 + j, i - j)
+    @test result ≈ expected atol=TOL
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
     println("[test] Edge cases - boundary indices")
     flush(stdout)
 end
@@ -203,6 +288,12 @@ end
 # SparseMatrixMPI - first and last rows/cols
 @test A[1, 1] ≈ A_global[1, 1] atol=TOL
 @test A[8, 8] ≈ A_global[8, 8] atol=TOL  # Last nonzero diagonal entry
+
+# MatrixMPI - corners
+@test M[1, 1] ≈ M_global[1, 1] atol=TOL
+@test M[1, n] ≈ M_global[1, n] atol=TOL
+@test M[n, 1] ≈ M_global[n, 1] atol=TOL
+@test M[n, n] ≈ M_global[n, n] atol=TOL
 
 MPI.Barrier(comm)
 
