@@ -291,6 +291,16 @@ println(io0(), "Result: $v")      # Works with VectorMPI
 println(io0(), "Matrix: $A")      # Works with MatrixMPI/SparseMatrixMPI
 ```
 
+### Local Constructors
+
+Create distributed types from local data (each rank provides only its portion):
+
+```@docs
+VectorMPI_local
+MatrixMPI_local
+SparseMatrixMPI_local
+```
+
 ## Cache Management
 
 ```@docs
