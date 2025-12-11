@@ -29,6 +29,56 @@ function compute_structural_hash(row_partition::Vector{Int}, col_indices::Vector
 end
 
 """
+    compress_AT(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int}) where T
+
+Compress AT from global column indices to local indices 1:length(col_indices).
+Returns a new SparseMatrixCSC with m = length(col_indices).
+
+The col_indices array provides the local→global mapping: col_indices[local_idx] = global_col.
+"""
+function compress_AT(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int}) where T
+    if isempty(col_indices)
+        return SparseMatrixCSC(0, AT.n, AT.colptr, Int[], T[])
+    end
+    global_to_local = Dict(g => l for (l, g) in enumerate(col_indices))
+    compressed_rowval = [global_to_local[r] for r in AT.rowval]
+    return SparseMatrixCSC(length(col_indices), AT.n, AT.colptr, compressed_rowval, AT.nzval)
+end
+
+"""
+    reindex_to_union(AT, old_col_indices, union_indices)
+
+Reindex AT's rowval from old_col_indices space to union_indices space.
+AT.rowval contains local indices into old_col_indices; converts to local indices into union_indices.
+"""
+function reindex_to_union(AT::SparseMatrixCSC{T,Int},
+                          old_col_indices::Vector{Int},
+                          union_indices::Vector{Int}) where T
+    if isempty(AT.rowval)
+        return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, Int[], T[])
+    end
+    # Map global indices to union indices
+    global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
+    # Convert: local in old → global → local in union
+    new_rowval = [global_to_union[old_col_indices[r]] for r in AT.rowval]
+    return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, new_rowval, AT.nzval)
+end
+
+"""
+    reindex_global_to_union(AT, union_indices)
+
+Reindex AT's rowval from global indices to union_indices space.
+"""
+function reindex_global_to_union(AT::SparseMatrixCSC{T,Int}, union_indices::Vector{Int}) where T
+    if isempty(AT.rowval)
+        return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, Int[], T[])
+    end
+    global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
+    new_rowval = [global_to_union[r] for r in AT.rowval]
+    return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, new_rowval, AT.nzval)
+end
+
+"""
     SparseMatrixMPI{T}
 
 A distributed sparse matrix partitioned by rows across MPI ranks.
@@ -37,19 +87,27 @@ A distributed sparse matrix partitioned by rows across MPI ranks.
 - `structural_hash::Blake3Hash`: 256-bit Blake3 hash of the structural pattern
 - `row_partition::Vector{Int}`: Row partition boundaries, length = nranks + 1
 - `col_partition::Vector{Int}`: Column partition boundaries, length = nranks + 1 (placeholder for transpose)
-- `col_indices::Vector{Int}`: Column indices that appear in the local part
-- `A::Transpose{T,SparseMatrixCSC{T,Int}}`: Local rows as a lazy transpose wrapper around CSC storage
+- `col_indices::Vector{Int}`: Global column indices that appear in the local part (local→global mapping)
+- `A::Transpose{T,SparseMatrixCSC{T,Int}}`: Local rows as a lazy transpose wrapper around compressed CSC storage
 
 # Invariants
 - `col_indices`, `row_partition`, and `col_partition` are sorted
 - `row_partition[nranks+1]` = total number of rows
 - `col_partition[nranks+1]` = total number of columns
 - `size(A, 1) == row_partition[rank+1] - row_partition[rank]` (number of local rows)
+- `size(A.parent, 1) == length(col_indices)` (compressed column dimension)
+- `A.parent.rowval` contains local indices in `1:length(col_indices)`
 
 # Storage Details
-The local rows are stored as `A = transpose(A_csc)` where `A_csc::SparseMatrixCSC` has:
-- columns corresponding to global column indices (via rowval)
-- rows corresponding to local row indices
+The local rows are stored in compressed form as `A = transpose(AT)` where `AT::SparseMatrixCSC` has:
+- `AT.m = length(col_indices)` (compressed, not global ncols)
+- `AT.n` = number of local rows
+- `AT.rowval` contains LOCAL column indices (1:length(col_indices))
+- `col_indices[local_idx]` maps local→global column indices
+
+This compression avoids "hypersparse" storage where `AT.m >> length(unique(AT.rowval))`,
+which would cause excessive allocations in matrix operations.
+
 Access the underlying CSC via `A.parent` when needed for low-level operations.
 """
 struct SparseMatrixMPI{T}
@@ -105,20 +163,22 @@ function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int}) where T
     # A[local_rows, :] gives us the local rows as CSC with shape (local_nrows, ncols).
     # We materialize the transpose to get a CSC with shape (ncols, local_nrows) where
     # columns correspond to local rows - this makes row iteration efficient.
-    # Then wrap in transpose() so the type documents the relationship:
-    #   - A_local.parent is CSC (ncols, local_nrows), columns = local rows
-    #   - A_local = transpose(A_local.parent) conceptually represents local rows
     # Note: Use transpose(), not ' (adjoint), to avoid conjugating complex values.
     local_A = A[local_rows, :]
     AT_storage = sparse(transpose(local_A))  # CSC (ncols, local_nrows), columns = local rows
-    A_local = transpose(AT_storage)          # Transpose wrapper for type clarity
 
     # Identify which columns have nonzeros in our local part
-    # AT_storage has columns = local rows, rowval contains global column indices
+    # AT_storage.rowval contains global column indices
     col_indices = isempty(AT_storage.rowval) ? Int[] : unique(sort(AT_storage.rowval))
 
+    # Compress AT_storage: convert global column indices to local indices 1:length(col_indices)
+    # This avoids "hypersparse" storage where AT.m >> length(unique(AT.rowval))
+    # After compression: AT.m = length(col_indices), rowval uses local indices
+    compressed_AT = compress_AT(AT_storage, col_indices)
+    A_local = transpose(compressed_AT)  # Transpose wrapper for type clarity
+
     # Compute structural hash (identical across all ranks)
-    structural_hash = compute_structural_hash(row_partition, col_indices, AT_storage, comm)
+    structural_hash = compute_structural_hash(row_partition, col_indices, compressed_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, row_partition, col_partition, col_indices, A_local,
         Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
@@ -252,7 +312,10 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
             end_idx = B.A.parent.colptr[col+1] - 1
             col_nnz = end_idx - start_idx + 1
             new_colptr[i+1] = new_colptr[i] + col_nnz
-            append!(rowvals, B.A.parent.rowval[start_idx:end_idx])
+            # B.A.parent.rowval contains LOCAL indices, convert to global using B.col_indices
+            for idx in start_idx:end_idx
+                push!(rowvals, B.col_indices[B.A.parent.rowval[idx]])
+            end
         end
 
         msg = vcat([ncols], new_colptr, [length(rowvals)], rowvals)
@@ -290,7 +353,8 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
 
     # Build plan.AT structure
     # Process row_indices in order, combining local and remote structure
-    nrows_AT = size(B.A.parent, 1)
+    # nrows_AT is global ncols of B (not compressed size)
+    nrows_AT = B.col_partition[end] - 1
     n_total_cols = length(row_indices)
 
     # First pass: count total nnz
@@ -342,7 +406,10 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
             col_nnz = end_idx - start_idx + 1
 
             combined_colptr[out_col+1] = combined_colptr[out_col] + col_nnz
-            combined_rowval[nnz_idx:nnz_idx+col_nnz-1] = B.A.parent.rowval[start_idx:end_idx]
+            # B.A.parent.rowval contains LOCAL indices, convert to global using B.col_indices
+            for (i, idx) in enumerate(start_idx:end_idx)
+                combined_rowval[nnz_idx + i - 1] = B.col_indices[B.A.parent.rowval[idx]]
+            end
             # Track for local copy
             if col_nnz > 0
                 push!(local_ranges, (start_idx:end_idx, nnz_idx))
@@ -495,35 +562,30 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     plan = MatrixPlan(A, B)
     execute_plan!(plan, B)
 
-    # Compute local product using: C^T = B^T * A^T, i.e., result_AT = plan.AT * A_AT_reindexed
+    # Compute local product using: C^T = B^T * A^T = plan.AT * A.A.parent
     #
-    # A.A.parent has shape (ncols_A, local_nrows_A) with rowval containing global column indices
+    # A.A.parent has shape (n_gathered, local_nrows_A) with local column indices (compressed)
     # plan.AT has shape (ncols_B, n_gathered) where n_gathered = length(A.col_indices)
     #
-    # We need to reindex A.A.parent's rowval from global column indices to local indices 1:n_gathered
-    # so that plan.AT * A_AT_reindexed gives us the correct result.
+    # A.A.parent is already compressed with local indices 1:length(A.col_indices),
+    # so we can use it directly without reindexing.
 
-    col_indices = A.col_indices
-    n_gathered = length(col_indices)
-    col_map = Dict(col => i for (i, col) in enumerate(col_indices))
-
-    # Reindex A.A.parent: change rowval from global column indices to local indices
-    reindexed_rowval = [col_map[r] for r in A.A.parent.rowval]
-    A_AT_reindexed = SparseMatrixCSC(n_gathered, size(A.A.parent, 2), A.A.parent.colptr, reindexed_rowval, A.A.parent.nzval)
-
-    # C^T = B^T * A^T = (plan.AT) * (A_AT_reindexed)
-    # plan.AT is (ncols_B, n_gathered), A_AT_reindexed is (n_gathered, local_nrows_A)
+    # C^T = B^T * A^T = (plan.AT) * (A.A.parent)
+    # plan.AT is (ncols_B, n_gathered), A.A.parent is (n_gathered, local_nrows_A)
     # result is (ncols_B, local_nrows_A) = shape of C.AT
-    result_AT = plan.AT * A_AT_reindexed
+    result_AT = plan.AT * A.A.parent
 
-    # col_indices are the columns of C that have nonzeros in our local rows
+    # col_indices are the columns of C that have nonzeros in our local rows (global indices from plan.AT)
     result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
 
+    # Compress result_AT: convert global column indices to local indices
+    compressed_result_AT = compress_AT(result_AT, result_col_indices)
+
     # Compute structural hash (identical across all ranks)
-    result_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
+    result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result_AT, comm)
 
     # C = A * B has rows from A and columns from B
-    return SparseMatrixMPI{T}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(result_AT),
+    return SparseMatrixMPI{T}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(compressed_result_AT),
         Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
@@ -568,15 +630,32 @@ function Base.:+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     plan = get_addition_plan(A, B)
     execute_plan!(plan, B)
 
-    # Local addition: (A + B)^T = A^T + B^T, so we can add AT matrices directly
-    result_AT = A.A.parent + plan.AT
+    # A.A.parent has compressed local indices (m = length(A.col_indices))
+    # plan.AT has global indices (m = ncols_B)
+    # We need to reindex both to a common "union" space before adding
 
-    # Compute col_indices and hash
-    result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
-    structural_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
+    # Compute union of column indices
+    plan_col_indices = isempty(plan.AT.rowval) ? Int[] : unique(sort(plan.AT.rowval))
+    union_indices = sort(unique(vcat(A.col_indices, plan_col_indices)))
+
+    # Reindex both to union space
+    A_union = reindex_to_union(A.A.parent, A.col_indices, union_indices)
+    plan_union = reindex_global_to_union(plan.AT, union_indices)
+
+    # Add in union space
+    result_union = A_union + plan_union
+
+    # Convert result back to global col_indices
+    result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
+    result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
+
+    # Compress result
+    compressed_result = compress_AT(result_union, result_col_indices_local)
+
+    structural_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
 
     return SparseMatrixMPI{T}(structural_hash, A.row_partition, A.col_partition,
-        result_col_indices, transpose(result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+        result_col_indices, transpose(compressed_result), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -591,15 +670,32 @@ function Base.:-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     plan = get_addition_plan(A, B)
     execute_plan!(plan, B)
 
-    # Local subtraction: (A - B)^T = A^T - B^T, so we can subtract AT matrices directly
-    result_AT = A.A.parent - plan.AT
+    # A.A.parent has compressed local indices (m = length(A.col_indices))
+    # plan.AT has global indices (m = ncols_B)
+    # We need to reindex both to a common "union" space before subtracting
 
-    # Compute col_indices and hash
-    result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
-    structural_hash = compute_structural_hash(A.row_partition, result_col_indices, result_AT, comm)
+    # Compute union of column indices
+    plan_col_indices = isempty(plan.AT.rowval) ? Int[] : unique(sort(plan.AT.rowval))
+    union_indices = sort(unique(vcat(A.col_indices, plan_col_indices)))
+
+    # Reindex both to union space
+    A_union = reindex_to_union(A.A.parent, A.col_indices, union_indices)
+    plan_union = reindex_global_to_union(plan.AT, union_indices)
+
+    # Subtract in union space
+    result_union = A_union - plan_union
+
+    # Convert result back to global col_indices
+    result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
+    result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
+
+    # Compress result
+    compressed_result = compress_AT(result_union, result_col_indices_local)
+
+    structural_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
 
     return SparseMatrixMPI{T}(structural_hash, A.row_partition, A.col_partition,
-        result_col_indices, transpose(result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+        result_col_indices, transpose(compressed_result), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -677,7 +773,8 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
     for local_col in 1:size(A.A.parent, 2)
         global_row = my_row_start + local_col - 1
         for idx in A.A.parent.colptr[local_col]:(A.A.parent.colptr[local_col+1]-1)
-            j = A.A.parent.rowval[idx]  # column index in A, becomes row index in A^T
+            local_j = A.A.parent.rowval[idx]  # LOCAL column index in A (compressed)
+            j = A.col_indices[local_j]  # Convert to GLOBAL column index
             dest_rank = searchsortedlast(A.col_partition, j) - 1
             push!(send_to[dest_rank+1], (global_row, j, idx))
         end
@@ -878,6 +975,7 @@ function execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
     MPI.Waitall(plan.send_reqs)
 
     # Create a copy of AT so the plan can be reused
+    # plan.AT has global column indices in rowval, compress to local indices
     result_AT = SparseMatrixCSC(
         plan.AT.m, plan.AT.n,
         copy(plan.AT.colptr),
@@ -885,11 +983,14 @@ function execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
         copy(plan.AT.nzval)
     )
 
+    # Compress result_AT: convert global column indices to local indices
+    compressed_result_AT = compress_AT(result_AT, plan.col_indices)
+
     # Compute structural hash
-    structural_hash = compute_structural_hash(plan.row_partition, plan.col_indices, result_AT, comm)
+    structural_hash = compute_structural_hash(plan.row_partition, plan.col_indices, compressed_result_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, plan.row_partition, plan.col_partition,
-        plan.col_indices, transpose(result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+        plan.col_indices, transpose(compressed_result_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -1048,8 +1149,10 @@ In-place sparse matrix-vector multiplication: y = A * x.
 
 The algorithm:
 1. Gather x[A.col_indices] from all ranks using VectorPlan
-2. Reindex A.A.parent to use local indices
-3. Compute y.v = transpose(A_AT_reindexed) * gathered
+2. Compute y.v = transpose(A.A.parent) * gathered
+
+A.A.parent is already compressed with local indices 1:length(A.col_indices),
+so gathered has length matching A.A.parent.m and can be used directly.
 """
 function LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
     comm = MPI.COMM_WORLD
@@ -1058,17 +1161,11 @@ function LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI
     plan = get_vector_plan(A, x)
     gathered = execute_plan!(plan, x)
 
-    # Reindex A.A.parent for local computation
-    col_indices = A.col_indices
-    n_gathered = length(col_indices)
-    col_map = Dict(col => i for (i, col) in enumerate(col_indices))
-
-    reindexed_rowval = [col_map[r] for r in A.A.parent.rowval]
-    A_AT_reindexed = SparseMatrixCSC(n_gathered, size(A.A.parent, 2), A.A.parent.colptr, reindexed_rowval, A.A.parent.nzval)
-
-    # y = A * x => y^T = x^T * A^T => y.v = transpose(A_AT_reindexed) * gathered
+    # A.A.parent is already compressed with local indices 1:length(A.col_indices)
+    # gathered has length length(A.col_indices), matching A.A.parent.m
+    # y = A * x => y^T = x^T * A^T => y.v = transpose(A.A.parent) * gathered
     # Use transpose() not ' to avoid conjugation for complex types
-    LinearAlgebra.mul!(y.v, transpose(A_AT_reindexed), gathered)
+    LinearAlgebra.mul!(y.v, transpose(A.A.parent), gathered)
     return y
 end
 
@@ -1188,10 +1285,13 @@ function LinearAlgebra.opnorm(A::SparseMatrixMPI{T}, p::Real=1) where T
         ncols = A.col_partition[end] - 1
 
         # Compute local contribution to each column sum
-        # A.A.parent.rowval contains column indices of A
+        # A.A.parent.rowval contains LOCAL column indices (compressed)
+        # Map local→global using A.col_indices
         local_col_sums = zeros(real(T), ncols)
-        for (idx, col) in enumerate(A.A.parent.rowval)
-            local_col_sums[col] += abs(A.A.parent.nzval[idx])
+        col_indices = A.col_indices
+        for (idx, local_col) in enumerate(A.A.parent.rowval)
+            global_col = col_indices[local_col]
+            local_col_sums[global_col] += abs(A.A.parent.nzval[idx])
         end
 
         # Sum across all ranks
@@ -1464,9 +1564,13 @@ function Base.sum(A::SparseMatrixMPI{T}; dims=nothing) where T
         return MPI.Allreduce(local_sum, MPI.SUM, comm)
     elseif dims == 1
         # Sum over rows: result is length-n vector (column sums)
+        # A.A.parent.rowval contains LOCAL column indices (compressed)
+        # Map local→global using A.col_indices
         local_col_sums = zeros(T, n)
-        for (idx, col) in enumerate(A.A.parent.rowval)
-            local_col_sums[col] += A.A.parent.nzval[idx]
+        col_indices = A.col_indices
+        for (idx, local_col) in enumerate(A.A.parent.rowval)
+            global_col = col_indices[local_col]
+            local_col_sums[global_col] += A.A.parent.nzval[idx]
         end
         global_col_sums = MPI.Allreduce(local_col_sums, MPI.SUM, comm)
         return VectorMPI(global_col_sums, comm)
@@ -1540,13 +1644,16 @@ function tr(A::SparseMatrixMPI{T}) where T
     my_row_end = A.row_partition[rank+2] - 1
 
     local_trace = zero(T)
+    col_indices = A.col_indices
     for local_row in 1:(my_row_end - my_row_start + 1)
         global_row = my_row_start + local_row - 1
         # Diagonal element is at (global_row, global_row) if within bounds
         if global_row <= n
             # Search for column global_row in A.A.parent[:, local_row]
+            # A.A.parent.rowval contains LOCAL indices, convert to global using col_indices
             for nz_idx in A.A.parent.colptr[local_row]:(A.A.parent.colptr[local_row+1]-1)
-                if A.A.parent.rowval[nz_idx] == global_row
+                global_col = col_indices[A.A.parent.rowval[nz_idx]]
+                if global_col == global_row
                     local_trace += A.A.parent.nzval[nz_idx]
                     break
                 end
@@ -1624,6 +1731,7 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
     # Each rank extracts diagonal elements from its rows
     my_row_start = A.row_partition[rank+1]
     my_row_end = A.row_partition[rank+2] - 1
+    col_indices = A.col_indices
 
     # Build full diagonal using Allreduce (each rank contributes its portion)
     full_diag = zeros(T, diag_len)
@@ -1634,8 +1742,10 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
         if global_row >= my_row_start && global_row <= my_row_end
             local_row = global_row - my_row_start + 1
             # Search for column global_col in A.A.parent[:, local_row]
+            # A.A.parent.rowval contains LOCAL indices, convert to global using col_indices
             for nz_idx in A.A.parent.colptr[local_row]:(A.A.parent.colptr[local_row+1]-1)
-                if A.A.parent.rowval[nz_idx] == global_col
+                local_col = A.A.parent.rowval[nz_idx]
+                if col_indices[local_col] == global_col
                     full_diag[d] = A.A.parent.nzval[nz_idx]
                     break
                 end
@@ -1663,6 +1773,7 @@ function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
     rank = MPI.Comm_rank(comm)
 
     my_row_start = A.row_partition[rank+1]
+    col_indices = A.col_indices
 
     # Build new sparse structure keeping only upper triangular entries
     # Entry (i, j) is kept if j >= i + k, i.e., j - i >= k
@@ -1675,7 +1786,8 @@ function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
     for local_col in 1:size(A.A.parent, 2)
         global_row = my_row_start + local_col - 1
         for nz_idx in A.A.parent.colptr[local_col]:(A.A.parent.colptr[local_col+1]-1)
-            j = A.A.parent.rowval[nz_idx]  # column in original A
+            local_j = A.A.parent.rowval[nz_idx]
+            j = col_indices[local_j]  # convert to global column index
             # Keep if j >= global_row + k
             if j >= global_row + k
                 nnz_per_col[local_col] += 1
@@ -1692,27 +1804,39 @@ function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
     new_rowval = Vector{Int}(undef, total_nnz)
     new_nzval = Vector{T}(undef, total_nnz)
 
-    # Second pass: fill entries
+    # Second pass: fill entries (keep local indices in new_rowval)
     idx = 1
     for local_col in 1:size(A.A.parent, 2)
         global_row = my_row_start + local_col - 1
         for nz_idx in A.A.parent.colptr[local_col]:(A.A.parent.colptr[local_col+1]-1)
-            j = A.A.parent.rowval[nz_idx]
+            local_j = A.A.parent.rowval[nz_idx]
+            j = col_indices[local_j]  # convert to global column index
             if j >= global_row + k
-                new_rowval[idx] = j
+                new_rowval[idx] = local_j  # keep local index
                 new_nzval[idx] = A.A.parent.nzval[nz_idx]
                 idx += 1
             end
         end
     end
 
-    new_AT = SparseMatrixCSC(A.A.parent.m, A.A.parent.n, new_colptr, new_rowval, new_nzval)
-    new_col_indices = isempty(new_rowval) ? Int[] : unique(sort(new_rowval))
+    # new_rowval contains local indices from A. Convert to global col_indices and compress.
+    if isempty(new_rowval)
+        new_col_indices = Int[]
+        compressed_AT = SparseMatrixCSC(0, size(A.A.parent, 2), new_colptr, Int[], T[])
+    else
+        local_used = unique(sort(new_rowval))
+        new_col_indices = col_indices[local_used]  # convert to global
+        # Compress: map old local indices to new compressed indices
+        local_to_compressed = Dict(old => new for (new, old) in enumerate(local_used))
+        compressed_rowval = [local_to_compressed[r] for r in new_rowval]
+        compressed_AT = SparseMatrixCSC(length(new_col_indices), size(A.A.parent, 2),
+                                        new_colptr, compressed_rowval, new_nzval)
+    end
 
-    structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_AT, comm)
+    structural_hash = compute_structural_hash(A.row_partition, new_col_indices, compressed_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
-        new_col_indices, transpose(new_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+        new_col_indices, transpose(compressed_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 """
@@ -1728,6 +1852,7 @@ function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
     rank = MPI.Comm_rank(comm)
 
     my_row_start = A.row_partition[rank+1]
+    col_indices = A.col_indices
 
     # Keep entry (i, j) if j <= i + k
 
@@ -1738,7 +1863,8 @@ function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
     for local_col in 1:size(A.A.parent, 2)
         global_row = my_row_start + local_col - 1
         for nz_idx in A.A.parent.colptr[local_col]:(A.A.parent.colptr[local_col+1]-1)
-            j = A.A.parent.rowval[nz_idx]
+            local_j = A.A.parent.rowval[nz_idx]
+            j = col_indices[local_j]  # convert to global column index
             if j <= global_row + k
                 nnz_per_col[local_col] += 1
             end
@@ -1757,22 +1883,34 @@ function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
     for local_col in 1:size(A.A.parent, 2)
         global_row = my_row_start + local_col - 1
         for nz_idx in A.A.parent.colptr[local_col]:(A.A.parent.colptr[local_col+1]-1)
-            j = A.A.parent.rowval[nz_idx]
+            local_j = A.A.parent.rowval[nz_idx]
+            j = col_indices[local_j]  # convert to global column index
             if j <= global_row + k
-                new_rowval[idx] = j
+                new_rowval[idx] = local_j  # keep local index
                 new_nzval[idx] = A.A.parent.nzval[nz_idx]
                 idx += 1
             end
         end
     end
 
-    new_AT = SparseMatrixCSC(A.A.parent.m, A.A.parent.n, new_colptr, new_rowval, new_nzval)
-    new_col_indices = isempty(new_rowval) ? Int[] : unique(sort(new_rowval))
+    # new_rowval contains local indices from A. Convert to global col_indices and compress.
+    if isempty(new_rowval)
+        new_col_indices = Int[]
+        compressed_AT = SparseMatrixCSC(0, size(A.A.parent, 2), new_colptr, Int[], T[])
+    else
+        local_used = unique(sort(new_rowval))
+        new_col_indices = col_indices[local_used]  # convert to global
+        # Compress: map old local indices to new compressed indices
+        local_to_compressed = Dict(old => new for (new, old) in enumerate(local_used))
+        compressed_rowval = [local_to_compressed[r] for r in new_rowval]
+        compressed_AT = SparseMatrixCSC(length(new_col_indices), size(A.A.parent, 2),
+                                        new_colptr, compressed_rowval, new_nzval)
+    end
 
-    structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_AT, comm)
+    structural_hash = compute_structural_hash(A.row_partition, new_col_indices, compressed_AT, comm)
 
     return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
-        new_col_indices, transpose(new_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
+        new_col_indices, transpose(compressed_AT), Ref{Union{Nothing, SparseMatrixMPI{T}}}(nothing))
 end
 
 # ============================================================================
