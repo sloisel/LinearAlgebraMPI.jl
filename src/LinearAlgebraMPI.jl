@@ -51,6 +51,61 @@ function clear_plan_cache!()
 end
 
 """
+    _invalidate_plans_for_hash!(old_hash::Blake3Hash)
+
+Remove all cached plans that reference the given structural hash.
+Called after structural modifications change a matrix's hash.
+
+This is a local operation since plan caches are local to each rank.
+Plans with old hashes become unreachable after structural modification.
+"""
+function _invalidate_plans_for_hash!(old_hash::Blake3Hash)
+    # Clean _plan_cache (keys are (hash1, hash2, Type))
+    for key in collect(keys(_plan_cache))
+        if key[1] == old_hash || key[2] == old_hash
+            delete!(_plan_cache, key)
+        end
+    end
+
+    # Clean _vector_plan_cache
+    for key in collect(keys(_vector_plan_cache))
+        if key[1] == old_hash || key[2] == old_hash
+            delete!(_vector_plan_cache, key)
+        end
+    end
+
+    # Clean _vector_align_plan_cache
+    for key in collect(keys(_vector_align_plan_cache))
+        if key[1] == old_hash || key[2] == old_hash
+            delete!(_vector_align_plan_cache, key)
+        end
+    end
+
+    # Clean _dense_vector_plan_cache
+    for key in collect(keys(_dense_vector_plan_cache))
+        if key[1] == old_hash || key[2] == old_hash
+            delete!(_dense_vector_plan_cache, key)
+        end
+    end
+
+    # Clean _dense_transpose_plan_cache (keys are (hash, Type))
+    for key in collect(keys(_dense_transpose_plan_cache))
+        if key[1] == old_hash
+            delete!(_dense_transpose_plan_cache, key)
+        end
+    end
+
+    # Clean _addition_plan_cache (defined in sparse.jl)
+    if isdefined(@__MODULE__, :_addition_plan_cache)
+        for key in collect(keys(_addition_plan_cache))
+            if key[1] == old_hash || key[2] == old_hash
+                delete!(_addition_plan_cache, key)
+            end
+        end
+    end
+end
+
+"""
     compute_partition_hash(partition::Vector{Int}) -> Blake3Hash
 
 Compute a hash of a partition vector. Since partition vectors are identical

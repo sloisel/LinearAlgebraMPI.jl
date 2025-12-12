@@ -16,6 +16,118 @@ comm = MPI.COMM_WORLD
 rank = MPI.Comm_rank(comm)
 nranks = MPI.Comm_size(comm)
 
+# Helper function to gather VectorMPI to root (all ranks must call)
+function gather_to_root(v::VectorMPI{T}) where T
+    local_data = v.v
+    local_len = Int32(length(local_data))
+
+    # Gather lengths from all ranks
+    all_lens = MPI.Gather(local_len, 0, comm)
+
+    if rank == 0
+        # Allocate receive buffer
+        total_len = sum(all_lens)
+        recv_buf = Vector{T}(undef, total_len)
+        counts = Vector{Int32}(all_lens)
+        disps = Int32[0; cumsum(counts[1:end-1])]
+
+        # Gather data
+        MPI.Gatherv!(local_data, MPI.VBuffer(recv_buf, counts, disps), 0, comm)
+        return recv_buf
+    else
+        MPI.Gatherv!(local_data, nothing, 0, comm)
+        return T[]
+    end
+end
+
+# Helper function to gather MatrixMPI to root
+function gather_to_root(A::MatrixMPI{T}) where T
+    m, ncols = size(A)
+    # Flatten in row-major order for consistent reconstruction
+    local_data = vec(permutedims(A.A))  # Row-major flattening
+    local_len = Int32(length(local_data))
+
+    all_lens = MPI.Gather(local_len, 0, comm)
+
+    if rank == 0
+        total_len = sum(all_lens)
+        recv_buf = Vector{T}(undef, total_len)
+        counts = Vector{Int32}(all_lens)
+        disps = Int32[0; cumsum(counts[1:end-1])]
+
+        MPI.Gatherv!(local_data, MPI.VBuffer(recv_buf, counts, disps), 0, comm)
+
+        # Reconstruct matrix row by row
+        result = Matrix{T}(undef, m, ncols)
+        offset = 0
+        for r in 0:nranks-1
+            local_nrows = A.row_partition[r+2] - A.row_partition[r+1]
+            for i in 1:local_nrows
+                global_row = A.row_partition[r+1] + i - 1
+                for j in 1:ncols
+                    result[global_row, j] = recv_buf[offset + (i-1)*ncols + j]
+                end
+            end
+            offset += counts[r+1]
+        end
+        return result
+    else
+        MPI.Gatherv!(local_data, nothing, 0, comm)
+        return Matrix{T}(undef, 0, 0)
+    end
+end
+
+# Helper function to gather SparseMatrixMPI to root (returns dense matrix)
+function gather_to_root(A::SparseMatrixMPI{T}) where T
+    m, ncols = size(A)
+    # Convert local sparse to dense, send rows
+    # Note: local_A has shape (length(col_indices), local_nrows) with compressed columns
+    local_nrows = A.row_partition[rank+2] - A.row_partition[rank+1]
+    local_dense = zeros(T, local_nrows, ncols)  # Start with zeros
+    local_A = A.A.parent  # CSC with shape (length(col_indices), local_nrows)
+    col_indices = A.col_indices  # Maps local col index -> global col index
+
+    # Extract values using the sparse matrix interface
+    for i in 1:local_nrows
+        for local_j in 1:length(col_indices)
+            global_j = col_indices[local_j]
+            local_dense[i, global_j] = local_A[local_j, i]
+        end
+    end
+
+    # Flatten in row-major order (transpose then vec, then transpose back conceptually)
+    local_data = vec(permutedims(local_dense))  # Row-major flattening
+    local_len = Int32(length(local_data))
+
+    all_lens = MPI.Gather(local_len, 0, comm)
+
+    if rank == 0
+        total_len = sum(all_lens)
+        recv_buf = Vector{T}(undef, total_len)
+        counts = Vector{Int32}(all_lens)
+        disps = Int32[0; cumsum(counts[1:end-1])]
+
+        MPI.Gatherv!(local_data, MPI.VBuffer(recv_buf, counts, disps), 0, comm)
+
+        result = Matrix{T}(undef, m, ncols)
+        offset = 0
+        for r in 0:nranks-1
+            local_nr = A.row_partition[r+2] - A.row_partition[r+1]
+            for i in 1:local_nr
+                global_row = A.row_partition[r+1] + i - 1
+                for j in 1:ncols
+                    result[global_row, j] = recv_buf[offset + (i-1)*ncols + j]
+                end
+            end
+            offset += counts[r+1]
+        end
+        return result
+    else
+        MPI.Gatherv!(local_data, nothing, 0, comm)
+        return Matrix{T}(undef, 0, 0)
+    end
+end
+
 # Create deterministic test data (same on all ranks)
 n = 12  # Vector size, divisible by common rank counts
 
@@ -515,6 +627,200 @@ w_complex = v_complex[2:6]
 @test length(w_complex) == 5
 for (local_idx, global_idx) in enumerate(2:6)
     @test w_complex[local_idx] ≈ v_complex_global[global_idx] atol=TOL
+end
+
+MPI.Barrier(comm)
+
+# ============================================================================
+# VectorMPI indexing with VectorMPI indices
+# ============================================================================
+
+if rank == 0
+    println("[test] VectorMPI getindex with VectorMPI indices")
+    flush(stdout)
+end
+
+# Test v[idx] where idx is VectorMPI{Int}
+idx_global = [3, 1, 5, 2, 6, 4]
+idx = VectorMPI(idx_global)
+result = v[idx]
+
+# Result should have same partition as idx
+@test result.partition == idx.partition
+@test length(result) == length(idx)
+
+# Check values - use gather to compare on all ranks without collective getindex
+result_gathered = gather_to_root(result)
+if rank == 0
+    for k in 1:length(idx_global)
+        @test result_gathered[k] ≈ v_global[idx_global[k]] atol=TOL
+    end
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] VectorMPI setindex! with VectorMPI indices")
+    flush(stdout)
+end
+
+# Test v[idx] = src where idx and src are VectorMPI
+v_modify = VectorMPI(copy(v_global))
+idx_set = VectorMPI([2, 4, 6])
+src_values = VectorMPI([20.0, 40.0, 60.0])
+v_modify[idx_set] = src_values
+
+# Gather to check values without collective single-element getindex
+v_modify_gathered = gather_to_root(v_modify)
+if rank == 0
+    @test v_modify_gathered[2] ≈ 20.0 atol=TOL
+    @test v_modify_gathered[4] ≈ 40.0 atol=TOL
+    @test v_modify_gathered[6] ≈ 60.0 atol=TOL
+    # Unchanged values
+    @test v_modify_gathered[1] ≈ v_global[1] atol=TOL
+    @test v_modify_gathered[3] ≈ v_global[3] atol=TOL
+    @test v_modify_gathered[5] ≈ v_global[5] atol=TOL
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] MatrixMPI getindex with VectorMPI indices")
+    flush(stdout)
+end
+
+# Test A[row_idx, col_idx] for MatrixMPI
+A_dense_global = Float64[i + j/10 for i in 1:6, j in 1:4]
+A_dense = MatrixMPI(A_dense_global)
+
+row_idx = VectorMPI([2, 5, 1, 4])
+col_idx = VectorMPI([3, 1])
+
+result_dense = A_dense[row_idx, col_idx]
+@test size(result_dense) == (4, 2)
+
+# Check values using gather: result[i,j] = A[row_idx[i], col_idx[j]]
+row_idx_global = [2, 5, 1, 4]
+col_idx_global = [3, 1]
+result_dense_gathered = gather_to_root(result_dense)
+if rank == 0
+    for i in 1:4
+        for j in 1:2
+            @test result_dense_gathered[i, j] ≈ A_dense_global[row_idx_global[i], col_idx_global[j]] atol=TOL
+        end
+    end
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] MatrixMPI setindex! with VectorMPI indices")
+    flush(stdout)
+end
+
+# Test A[row_idx, col_idx] = src for MatrixMPI
+A_dense_modify = MatrixMPI(zeros(6, 4))
+row_idx_set = VectorMPI([1, 3, 5])
+col_idx_set = VectorMPI([2, 4])
+src_dense = MatrixMPI(ones(3, 2) * 7.0)
+
+A_dense_modify[row_idx_set, col_idx_set] = src_dense
+
+# Check values using gather
+A_dense_modify_gathered = gather_to_root(A_dense_modify)
+if rank == 0
+    # Check that values were set
+    @test A_dense_modify_gathered[1, 2] ≈ 7.0 atol=TOL
+    @test A_dense_modify_gathered[1, 4] ≈ 7.0 atol=TOL
+    @test A_dense_modify_gathered[3, 2] ≈ 7.0 atol=TOL
+    @test A_dense_modify_gathered[3, 4] ≈ 7.0 atol=TOL
+    @test A_dense_modify_gathered[5, 2] ≈ 7.0 atol=TOL
+    @test A_dense_modify_gathered[5, 4] ≈ 7.0 atol=TOL
+
+    # Check that other values are still zero
+    @test A_dense_modify_gathered[1, 1] ≈ 0.0 atol=TOL
+    @test A_dense_modify_gathered[2, 2] ≈ 0.0 atol=TOL
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] SparseMatrixMPI getindex with VectorMPI indices")
+    flush(stdout)
+end
+
+# Test A[row_idx, col_idx] for SparseMatrixMPI (returns dense MatrixMPI)
+A_sparse_test = SparseMatrixMPI{Float64}(A_global)
+row_idx_sparse = VectorMPI([2, 4, 1])
+col_idx_sparse = VectorMPI([1, 3, 5])
+
+result_sparse = A_sparse_test[row_idx_sparse, col_idx_sparse]
+@test result_sparse isa MatrixMPI
+@test size(result_sparse) == (3, 3)
+
+# Check values using gather
+row_idx_sparse_global = [2, 4, 1]
+col_idx_sparse_global = [1, 3, 5]
+result_sparse_gathered = gather_to_root(result_sparse)
+if rank == 0
+    for i in 1:3
+        for j in 1:3
+            @test result_sparse_gathered[i, j] ≈ A_global[row_idx_sparse_global[i], col_idx_sparse_global[j]] atol=TOL
+        end
+    end
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] SparseMatrixMPI setindex! with VectorMPI indices")
+    flush(stdout)
+end
+
+# Test A[row_idx, col_idx] = src for SparseMatrixMPI
+A_sparse_modify = SparseMatrixMPI{Float64}(spzeros(6, 6))
+row_idx_sparse_set = VectorMPI([1, 3, 5])
+col_idx_sparse_set = VectorMPI([2, 4])
+src_sparse = MatrixMPI(ones(3, 2) * 9.0)
+
+A_sparse_modify[row_idx_sparse_set, col_idx_sparse_set] = src_sparse
+
+# Check values using gather (convert to dense first)
+A_sparse_modify_dense = gather_to_root(A_sparse_modify)
+if rank == 0
+    # Check that values were set (structural modification)
+    @test A_sparse_modify_dense[1, 2] ≈ 9.0 atol=TOL
+    @test A_sparse_modify_dense[1, 4] ≈ 9.0 atol=TOL
+    @test A_sparse_modify_dense[3, 2] ≈ 9.0 atol=TOL
+    @test A_sparse_modify_dense[3, 4] ≈ 9.0 atol=TOL
+    @test A_sparse_modify_dense[5, 2] ≈ 9.0 atol=TOL
+    @test A_sparse_modify_dense[5, 4] ≈ 9.0 atol=TOL
+
+    # Check that other values are still zero
+    @test A_sparse_modify_dense[1, 1] ≈ 0.0 atol=TOL
+    @test A_sparse_modify_dense[2, 2] ≈ 0.0 atol=TOL
+end
+
+MPI.Barrier(comm)
+
+if rank == 0
+    println("[test] VectorMPI indexing with VectorMPI indices (complex)")
+    flush(stdout)
+end
+
+# Test with ComplexF64
+v_complex_modify = VectorMPI(copy(v_complex_global))
+idx_complex = VectorMPI([1, 3, 5])
+src_complex = VectorMPI([100.0 + 200.0im, 300.0 + 400.0im, 500.0 + 600.0im])
+v_complex_modify[idx_complex] = src_complex
+
+# Use gather to check values (single-element indexing is collective)
+v_complex_modify_gathered = gather_to_root(v_complex_modify)
+if rank == 0
+    @test v_complex_modify_gathered[1] ≈ 100.0 + 200.0im atol=TOL
+    @test v_complex_modify_gathered[3] ≈ 300.0 + 400.0im atol=TOL
+    @test v_complex_modify_gathered[5] ≈ 500.0 + 600.0im atol=TOL
+    @test v_complex_modify_gathered[2] ≈ v_complex_global[2] atol=TOL
 end
 
 MPI.Barrier(comm)
