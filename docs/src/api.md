@@ -266,6 +266,83 @@ size(v)        # Returns (length,)
 eltype(v)      # Element type
 ```
 
+## Indexing
+
+All distributed types support element access and assignment. These are collective operations - all MPI ranks must call them with the same arguments.
+
+### VectorMPI Indexing
+
+```julia
+v[i]           # Get element (collective)
+v[i] = x       # Set element (collective)
+v[1:10]        # Range indexing (returns VectorMPI)
+v[1:10] = x    # Range assignment (scalar or vector)
+v[idx]         # VectorMPI{Int} indexing (returns VectorMPI)
+v[idx] = src   # VectorMPI{Int} assignment (src::VectorMPI)
+```
+
+### MatrixMPI Indexing
+
+```julia
+# Single element
+A[i, j]        # Get element
+A[i, j] = x    # Set element
+
+# Range indexing (returns MatrixMPI)
+A[1:3, 2:5]    # Submatrix by ranges
+A[1:3, :]      # Row range, all columns
+A[:, 2:5]      # All rows, column range
+
+# VectorMPI indices (returns MatrixMPI)
+A[row_idx, col_idx]  # Both indices are VectorMPI{Int}
+
+# Mixed indexing (returns MatrixMPI or VectorMPI)
+A[row_idx, 1:5]      # VectorMPI rows, range columns
+A[row_idx, :]        # VectorMPI rows, all columns
+A[1:5, col_idx]      # Range rows, VectorMPI columns
+A[:, col_idx]        # All rows, VectorMPI columns
+A[row_idx, j]        # VectorMPI rows, single column (returns VectorMPI)
+A[i, col_idx]        # Single row, VectorMPI columns (returns VectorMPI)
+```
+
+### SparseMatrixMPI Indexing
+
+```julia
+# Single element
+A[i, j]        # Get element (returns 0 for structural zeros)
+A[i, j] = x    # Set element (modifies structure if needed)
+
+# Range indexing (returns SparseMatrixMPI)
+A[1:3, 2:5]    # Submatrix by ranges
+A[1:3, :]      # Row range, all columns
+A[:, 2:5]      # All rows, column range
+
+# VectorMPI indices (returns SparseMatrixMPI)
+A[row_idx, col_idx]  # Both indices are VectorMPI{Int}
+
+# Mixed indexing (returns SparseMatrixMPI or VectorMPI)
+A[row_idx, 1:5]      # VectorMPI rows, range columns
+A[row_idx, :]        # VectorMPI rows, all columns
+A[1:5, col_idx]      # Range rows, VectorMPI columns
+A[:, col_idx]        # All rows, VectorMPI columns
+A[row_idx, j]        # VectorMPI rows, single column (returns VectorMPI)
+A[i, col_idx]        # Single row, VectorMPI columns (returns VectorMPI)
+```
+
+### setindex! Source Types
+
+For `setindex!` operations, the source type depends on the indexing pattern:
+
+| Index Pattern | Source Type |
+|--------------|-------------|
+| `A[i, j] = x` | Scalar |
+| `A[range, range] = x` | Scalar, Matrix, or distributed matrix |
+| `A[VectorMPI, VectorMPI] = src` | MatrixMPI (matching partitions) |
+| `A[VectorMPI, range] = src` | MatrixMPI |
+| `A[range, VectorMPI] = src` | MatrixMPI |
+| `A[VectorMPI, j] = src` | VectorMPI |
+| `A[i, VectorMPI] = src` | VectorMPI |
+
 ## Utility Functions
 
 ### Rank-Selective Output
