@@ -728,6 +728,211 @@ end
 # Use looser tolerance due to ill-conditioning
 @test err_small < 1e-6
 
+MPI.Barrier(comm)
+
+# Test 23: LU with exactly zero pivot (tests abs(diag_val) == 0 branch)
+if rank == 0
+    println("[test] LU with zero pivot")
+    flush(stdout)
+end
+
+n_zero = 4
+A_zero = zeros(n_zero, n_zero)
+A_zero[1, 1] = 0.0  # Exactly zero pivot - will be replaced by eps
+A_zero[1, 2] = 0.0  # Zero off-diagonal so no pivot swap
+A_zero[2, 1] = 0.0
+A_zero[2, 2] = 1.0
+A_zero[2, 3] = -0.5
+A_zero[3, 2] = -0.5
+A_zero[3, 3] = 1.0
+A_zero[3, 4] = -0.5
+A_zero[4, 3] = -0.5
+A_zero[4, 4] = 1.0
+A_zero_sp = sparse(A_zero)
+A_zero_mpi = SparseMatrixMPI{Float64}(A_zero_sp)
+
+# This should trigger zero pivot replacement and warning
+F_zero = lu(A_zero_mpi)
+
+# The factorization will have modified the pivot, so solve will work
+# but the original matrix is singular, so we just test that solve completes
+b_zero_full = [0.0, 1.0, 1.0, 1.0]  # RHS consistent with singular row
+b_zero = VectorMPI(b_zero_full)
+x_zero = solve(F_zero, b_zero)
+x_zero_full = Vector(x_zero)
+
+if rank == 0
+    println("  LU with zero pivot: solve completed")
+end
+@test length(x_zero_full) == n_zero  # Just verify solve completes
+
+MPI.Barrier(comm)
+
+# Test 24: LDLT with exactly zero 1x1 pivot (tests abs(d_kk) == 0 branch)
+if rank == 0
+    println("[test] LDLT with zero 1x1 pivot")
+    flush(stdout)
+end
+
+n_ldlt_zero = 4
+A_ldlt_zero = zeros(n_ldlt_zero, n_ldlt_zero)
+# Create symmetric matrix with zero diagonal that will trigger 1x1 pivot
+# (no larger off-diagonal in column to trigger 2x2)
+A_ldlt_zero[1, 1] = 0.0  # Zero pivot
+A_ldlt_zero[2, 2] = 2.0
+A_ldlt_zero[3, 3] = 2.0
+A_ldlt_zero[4, 4] = 2.0
+# Small symmetric off-diagonals (smaller than alpha * |diagonal|)
+A_ldlt_zero[2, 1] = 0.0
+A_ldlt_zero[1, 2] = 0.0
+A_ldlt_zero[3, 2] = -0.1
+A_ldlt_zero[2, 3] = -0.1
+A_ldlt_zero[4, 3] = -0.1
+A_ldlt_zero[3, 4] = -0.1
+A_ldlt_zero_sp = sparse(A_ldlt_zero)
+A_ldlt_zero_mpi = SparseMatrixMPI{Float64}(A_ldlt_zero_sp)
+
+F_ldlt_zero = ldlt(A_ldlt_zero_mpi)
+
+b_ldlt_zero_full = [0.0, 1.0, 1.0, 1.0]
+b_ldlt_zero = VectorMPI(b_ldlt_zero_full)
+x_ldlt_zero = solve(F_ldlt_zero, b_ldlt_zero)
+x_ldlt_zero_full = Vector(x_ldlt_zero)
+
+if rank == 0
+    println("  LDLT with zero 1x1 pivot: solve completed")
+end
+@test length(x_ldlt_zero_full) == n_ldlt_zero
+
+MPI.Barrier(comm)
+
+# Test 25: LDLT with near-zero 2x2 pivot determinant
+# Uses similar structure to Test 18 but with det(2x2 block) ≈ 0
+if rank == 0
+    println("[test] LDLT with small 2x2 determinant")
+    flush(stdout)
+end
+
+n_det = 4
+A_det = zeros(n_det, n_det)
+# Create a 2x2 block at (1,2) with det ≈ 0
+# det = a11*a22 - a12^2 = 1e-16 * 1e-16 - (1e-16)^2 = 0
+A_det[1, 1] = 1e-16   # Tiny diagonal
+A_det[2, 2] = 1e-16   # Tiny diagonal
+A_det[2, 1] = 1e-16   # Off-diagonal: makes det = 1e-32 - 1e-32 = 0
+A_det[1, 2] = 1e-16
+# Large off-diagonals to force 2x2 pivot selection (like Test 18)
+for i in 1:n_det
+    for j in i+1:n_det
+        if (i <= 2 && j <= 2)
+            continue  # Skip the 2x2 block we already set
+        end
+        A_det[i, j] = 1.0 + 0.1 * (i + j)
+        A_det[j, i] = A_det[i, j]
+    end
+end
+A_det[3, 3] = 1e-16  # Small diagonals throughout
+A_det[4, 4] = 1e-16
+A_det_sp = sparse(A_det)
+A_det_mpi = SparseMatrixMPI{Float64}(A_det_sp)
+
+F_det = ldlt(A_det_mpi)
+
+# Check that 2x2 pivot was used
+has_2x2_det = any(F_det.pivots .< 0)
+
+if rank == 0
+    println("  2x2 pivot used: $has_2x2_det")
+end
+@test has_2x2_det  # Should use 2x2 pivots
+
+b_det_full = ones(n_det)
+b_det = VectorMPI(b_det_full)
+x_det = solve(F_det, b_det)
+x_det_full = Vector(x_det)
+
+if rank == 0
+    println("  LDLT with small 2x2 determinant: solve completed")
+end
+@test length(x_det_full) == n_det
+
+MPI.Barrier(comm)
+
+# Test 26: Test swap_rows_cols_sym! with i==j (no-op branch)
+# This occurs when Bunch-Kaufman selects the diagonal element as pivot
+if rank == 0
+    println("[test] LDLT diagonal pivot (no swap)")
+    flush(stdout)
+end
+
+n_diag = 4
+A_diag = zeros(n_diag, n_diag)
+# Diagonally dominant: diagonal element will be selected as pivot without swap
+A_diag[1, 1] = 10.0  # Large diagonal
+A_diag[2, 2] = 10.0
+A_diag[3, 3] = 10.0
+A_diag[4, 4] = 10.0
+A_diag[2, 1] = -0.1  # Small off-diagonals
+A_diag[1, 2] = -0.1
+A_diag[3, 2] = -0.1
+A_diag[2, 3] = -0.1
+A_diag[4, 3] = -0.1
+A_diag[3, 4] = -0.1
+A_diag_sp = sparse(A_diag)
+A_diag_mpi = SparseMatrixMPI{Float64}(A_diag_sp)
+
+F_diag = ldlt(A_diag_mpi)
+
+b_diag_full = ones(n_diag)
+b_diag = VectorMPI(b_diag_full)
+x_diag = solve(F_diag, b_diag)
+x_diag_full = Vector(x_diag)
+err_diag = norm(A_diag_sp * x_diag_full - b_diag_full, Inf)
+
+if rank == 0
+    println("  Diagonal pivot residual: $err_diag")
+end
+@test err_diag < TOL
+
+MPI.Barrier(comm)
+
+# Test 27: LDLT 2x2 pivot with update rows - exercises extract_L_D! else branch
+# Need a matrix where 2x2 pivots are used and there are update rows
+if rank == 0
+    println("[test] LDLT 2x2 pivot with update structure")
+    flush(stdout)
+end
+
+# Use a 2D Laplacian variant that forces 2x2 pivots with update rows
+# The AMD ordering creates supernodes with children, and we make diagonals
+# small to force 2x2 pivot selection
+A_2x2_base = create_2d_laplacian(3, 3)  # 9 nodes
+A_2x2 = Matrix(A_2x2_base)
+# Make first two diagonal elements very small to force 2x2 pivot
+A_2x2[1, 1] = 1e-16
+A_2x2[2, 2] = 1e-16
+# But keep the off-diagonal between them
+A_2x2[2, 1] = -1.0
+A_2x2[1, 2] = -1.0
+A_2x2_sp = sparse(A_2x2)
+A_2x2_mpi = SparseMatrixMPI{Float64}(A_2x2_sp)
+
+F_2x2 = ldlt(A_2x2_mpi)
+
+# Check 2x2 pivots were used
+has_2x2_update = any(F_2x2.pivots .< 0)
+
+b_2x2_full = ones(9)
+b_2x2 = VectorMPI(b_2x2_full)
+x_2x2 = solve(F_2x2, b_2x2)
+x_2x2_full = Vector(x_2x2)
+
+if rank == 0
+    println("  2x2 pivots with updates used: $has_2x2_update")
+    println("  LDLT 2x2 with updates: solve completed")
+end
+@test length(x_2x2_full) == 9
+
 end  # QuietTestSet
 
 # Aggregate results across ranks
