@@ -46,6 +46,78 @@ function create_symmetric_indefinite(n::Int)
     return sparse(I_A, J_A, V_A, n, n)
 end
 
+function create_2d_laplacian(nx::Int, ny::Int)
+    # 2D Laplacian on nx × ny grid - creates multiple supernodes with children
+    n = nx * ny
+    I_A = Int[]
+    J_A = Int[]
+    V_A = Float64[]
+
+    for i = 1:nx
+        for j = 1:ny
+            idx = (j-1)*nx + i
+            # Diagonal
+            push!(I_A, idx)
+            push!(J_A, idx)
+            push!(V_A, 4.0)
+            # Left neighbor
+            if i > 1
+                push!(I_A, idx)
+                push!(J_A, idx-1)
+                push!(V_A, -1.0)
+            end
+            # Right neighbor
+            if i < nx
+                push!(I_A, idx)
+                push!(J_A, idx+1)
+                push!(V_A, -1.0)
+            end
+            # Bottom neighbor
+            if j > 1
+                push!(I_A, idx)
+                push!(J_A, idx-nx)
+                push!(V_A, -1.0)
+            end
+            # Top neighbor
+            if j < ny
+                push!(I_A, idx)
+                push!(J_A, idx+nx)
+                push!(V_A, -1.0)
+            end
+        end
+    end
+
+    return sparse(I_A, J_A, V_A, n, n)
+end
+
+function create_complex_symmetric(n::Int)
+    # Complex symmetric (NOT Hermitian) matrix
+    # A = A^T but A != A' (adjoint)
+    I_A = Int[]
+    J_A = Int[]
+    V_A = ComplexF64[]
+
+    # Complex diagonal
+    for i = 1:n
+        push!(I_A, i)
+        push!(J_A, i)
+        push!(V_A, 3.0 + 1.0im)  # Complex diagonal
+    end
+
+    # Complex symmetric off-diagonal (not Hermitian: A[i,j] = A[j,i], not conj)
+    for i = 1:n-1
+        val = -0.5 + 0.2im
+        push!(I_A, i+1)
+        push!(J_A, i)
+        push!(V_A, val)
+        push!(I_A, i)
+        push!(J_A, i+1)
+        push!(V_A, val)  # Same value, not conjugate
+    end
+
+    return sparse(I_A, J_A, V_A, n, n)
+end
+
 ts = @testset QuietTestSet "Distributed Factorization Tests" begin
 
 # Test 1: LU factorization of small matrix
@@ -362,6 +434,112 @@ if rank == 0
     println("  Right division (adjoint/adjoint) residual: $err_rdaa")
 end
 @test err_rdaa < TOL
+
+MPI.Barrier(comm)
+
+# Test 14: LDLT transpose/adjoint solves via factorization (real symmetric)
+if rank == 0
+    println("[test] LDLT factorization transpose/adjoint")
+    flush(stdout)
+end
+
+n = 10
+A_ldlt_full = create_spd_tridiagonal(n)
+A_ldlt = SparseMatrixMPI{Float64}(A_ldlt_full)
+F_ldlt = ldlt(A_ldlt)
+
+b_ldlt_full = ones(n)
+b_ldlt = VectorMPI(b_ldlt_full)
+
+# transpose(F) \ b should solve transpose(A) * x = b (same as A * x = b for symmetric)
+x_ldlt_t = transpose(F_ldlt) \ b_ldlt
+x_ldlt_t_full = Vector(x_ldlt_t)
+err_ldlt_t = norm(A_ldlt_full * x_ldlt_t_full - b_ldlt_full, Inf)
+
+# F' \ b should solve A' * x = b (same as A * x = b for real symmetric)
+x_ldlt_a = F_ldlt' \ b_ldlt
+x_ldlt_a_full = Vector(x_ldlt_a)
+err_ldlt_a = norm(A_ldlt_full * x_ldlt_a_full - b_ldlt_full, Inf)
+
+if rank == 0
+    println("  LDLT transpose solve residual: $err_ldlt_t")
+    println("  LDLT adjoint solve residual: $err_ldlt_a")
+end
+@test err_ldlt_t < TOL
+@test err_ldlt_a < TOL
+
+MPI.Barrier(comm)
+
+# Test 15: Complex symmetric LDLT
+if rank == 0
+    println("[test] LDLT factorization - complex symmetric")
+    flush(stdout)
+end
+
+n = 6
+A_cx_full = create_complex_symmetric(n)
+A_cx = SparseMatrixMPI{ComplexF64}(A_cx_full)
+
+F_cx = ldlt(A_cx)
+
+b_cx_full = ones(ComplexF64, n)
+b_cx = VectorMPI(b_cx_full)
+x_cx = solve(F_cx, b_cx)
+
+x_cx_full = Vector(x_cx)
+residual_cx = A_cx_full * x_cx_full - b_cx_full
+err_cx = norm(residual_cx, Inf)
+
+if rank == 0
+    println("  Complex symmetric LDLT residual: $err_cx")
+end
+@test err_cx < TOL
+
+MPI.Barrier(comm)
+
+# Test 16: Complex symmetric LDLT adjoint solve (exercises conj helpers)
+if rank == 0
+    println("[test] LDLT adjoint solve - complex symmetric")
+    flush(stdout)
+end
+
+# For complex symmetric A (A = A^T but A != A'), adjoint solve is different
+# solve A' * x = b where A' = conj(A)
+x_cx_adj = F_cx' \ b_cx
+x_cx_adj_full = Vector(x_cx_adj)
+residual_cx_adj = A_cx_full' * x_cx_adj_full - b_cx_full
+err_cx_adj = norm(residual_cx_adj, Inf)
+
+if rank == 0
+    println("  Complex symmetric LDLT adjoint residual: $err_cx_adj")
+end
+@test err_cx_adj < TOL
+
+MPI.Barrier(comm)
+
+# Test 17: 2D Laplacian - exercises extend_add_sym! with supernode children
+if rank == 0
+    println("[test] LDLT factorization - 2D Laplacian (supernode extend-add)")
+    flush(stdout)
+end
+
+A_2d_full = create_2d_laplacian(6, 6)  # 36-element grid
+A_2d = SparseMatrixMPI{Float64}(A_2d_full)
+
+F_2d = ldlt(A_2d)
+
+b_2d_full = ones(36)
+b_2d = VectorMPI(b_2d_full)
+x_2d = solve(F_2d, b_2d)
+
+x_2d_full = Vector(x_2d)
+residual_2d = A_2d_full * x_2d_full - b_2d_full
+err_2d = norm(residual_2d, Inf)
+
+if rank == 0
+    println("  2D Laplacian LDLT residual: $err_2d")
+end
+@test err_2d < TOL
 
 end  # QuietTestSet
 
