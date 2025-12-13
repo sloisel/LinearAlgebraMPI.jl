@@ -116,14 +116,16 @@ end
 col_sums = sum(Adist; dims=1)
 ref_col_sums = vec(sum(A_global; dims=1))
 counts1 = Int32[col_sums.partition[r+2] - col_sums.partition[r+1] for r in 0:nranks-1]
-full_col_sums = MPI.Allgatherv(col_sums.v, counts1, comm)
+full_col_sums = similar(col_sums.v, sum(counts1))
+MPI.Allgatherv!(col_sums.v, MPI.VBuffer(full_col_sums, counts1), comm)
 err1 = norm(full_col_sums - ref_col_sums)
 @test err1 < TOL
 
 row_sums = sum(Adist; dims=2)
 ref_row_sums = vec(sum(A_global; dims=2))
 counts2 = Int32[row_sums.partition[r+2] - row_sums.partition[r+1] for r in 0:nranks-1]
-full_row_sums = MPI.Allgatherv(row_sums.v, counts2, comm)
+full_row_sums = similar(row_sums.v, sum(counts2))
+MPI.Allgatherv!(row_sums.v, MPI.VBuffer(full_row_sums, counts2), comm)
 err2 = norm(full_row_sums - ref_row_sums)
 @test err2 < TOL
 
@@ -153,13 +155,17 @@ end
 # Test diag
 d = diag(Adist)
 ref_d = diag(A_global)
-full_d = MPI.Allgatherv(d.v, Int32[d.partition[r+2] - d.partition[r+1] for r in 0:nranks-1], comm)
+counts_d = Int32[d.partition[r+2] - d.partition[r+1] for r in 0:nranks-1]
+full_d = similar(d.v, sum(counts_d))
+MPI.Allgatherv!(d.v, MPI.VBuffer(full_d, counts_d), comm)
 err1 = norm(full_d - ref_d)
 @test err1 < TOL
 
 d1 = diag(Adist, 1)
 ref_d1 = diag(A_global, 1)
-full_d1 = MPI.Allgatherv(d1.v, Int32[d1.partition[r+2] - d1.partition[r+1] for r in 0:nranks-1], comm)
+counts_d1 = Int32[d1.partition[r+2] - d1.partition[r+1] for r in 0:nranks-1]
+full_d1 = similar(d1.v, sum(counts_d1))
+MPI.Allgatherv!(d1.v, MPI.VBuffer(full_d1, counts_d1), comm)
 err2 = norm(full_d1 - ref_d1)
 @test err2 < TOL
 

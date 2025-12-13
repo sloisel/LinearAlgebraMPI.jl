@@ -118,7 +118,7 @@ function numerical_factorization_ldlt(A::SparseMatrixMPI{T},
                     # Cross-rank child - receive update matrix
                     # First receive size
                     size_buf = Vector{Int}(undef, 1)
-                    MPI.Recv!(size_buf, child_owner, LDLT_SIZE_TAG + child_sidx, comm)
+                    MPI.Recv!(size_buf, comm; source=child_owner, tag=LDLT_SIZE_TAG + child_sidx)
                     nrows_update = size_buf[1]
 
                     if nrows_update > 0
@@ -126,8 +126,8 @@ function numerical_factorization_ldlt(A::SparseMatrixMPI{T},
                         update_matrix = Matrix{T}(undef, nrows_update, nrows_update)
                         child_rows = Vector{Int}(undef, nrows_update)
 
-                        MPI.Recv!(update_matrix, child_owner, LDLT_UPDATE_TAG + child_sidx, comm)
-                        MPI.Recv!(child_rows, child_owner, LDLT_ROWS_TAG + child_sidx, comm)
+                        MPI.Recv!(update_matrix, comm; source=child_owner, tag=LDLT_UPDATE_TAG + child_sidx)
+                        MPI.Recv!(child_rows, comm; source=child_owner, tag=LDLT_ROWS_TAG + child_sidx)
 
                         extend_add_sym!(F, update_matrix, child_rows)
                     end

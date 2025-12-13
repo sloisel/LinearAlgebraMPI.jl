@@ -113,7 +113,7 @@ function numerical_factorization_lu(A::SparseMatrixMPI{T},
                     # Cross-rank child - receive update matrix
                     # First receive size
                     size_buf = Vector{Int}(undef, 2)
-                    MPI.Recv!(size_buf, child_owner, FACTOR_SIZE_TAG + child_sidx, comm)
+                    MPI.Recv!(size_buf, comm; source=child_owner, tag=FACTOR_SIZE_TAG + child_sidx)
                     nrows_update, ncols_update = size_buf[1], size_buf[2]
 
                     if nrows_update > 0 && ncols_update > 0
@@ -122,9 +122,9 @@ function numerical_factorization_lu(A::SparseMatrixMPI{T},
                         child_rows = Vector{Int}(undef, nrows_update)
                         child_cols = Vector{Int}(undef, ncols_update)
 
-                        MPI.Recv!(update_matrix, child_owner, FACTOR_UPDATE_TAG + child_sidx, comm)
-                        MPI.Recv!(child_rows, child_owner, FACTOR_ROWS_TAG + child_sidx, comm)
-                        MPI.Recv!(child_cols, child_owner, FACTOR_COLS_TAG + child_sidx, comm)
+                        MPI.Recv!(update_matrix, comm; source=child_owner, tag=FACTOR_UPDATE_TAG + child_sidx)
+                        MPI.Recv!(child_rows, comm; source=child_owner, tag=FACTOR_ROWS_TAG + child_sidx)
+                        MPI.Recv!(child_cols, comm; source=child_owner, tag=FACTOR_COLS_TAG + child_sidx)
 
                         extend_add!(F, update_matrix, child_rows, child_cols)
                     end

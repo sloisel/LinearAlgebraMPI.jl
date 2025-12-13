@@ -136,7 +136,7 @@ F = lu(A)
 
 b_full = ones(n)
 b = VectorMPI(b_full)
-x = solve(F, b)
+x = F \ b  # Use backslash operator instead of solve() to test the \ interface
 
 x_full = Vector(x)
 residual = A_full * x_full - b_full
@@ -165,7 +165,7 @@ F = ldlt(A)
 
 b_full = ones(n)
 b = VectorMPI(b_full)
-x = solve(F, b)
+x = F \ b  # Use backslash operator instead of solve() to test the \ interface
 
 x_full = Vector(x)
 residual = A_full * x_full - b_full

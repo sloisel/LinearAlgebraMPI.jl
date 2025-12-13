@@ -458,10 +458,10 @@ A = Float64.([i + 0.1*j for i in 1:m, j in 1:n])
 Adist = MatrixMPI(A)
 
 # Function that transforms each row: 5 elements -> 3 elements
-f(x) = [norm(x), maximum(x), sum(x)]
+f_row = x -> [norm(x), maximum(x), sum(x)]
 
-Bdist = mapslices(f, Adist; dims=2)
-B_ref = mapslices(f, A; dims=2)
+Bdist = mapslices(f_row, Adist; dims=2)
+B_ref = mapslices(f_row, A; dims=2)
 
 @test size(Bdist) == size(B_ref)
 
@@ -482,10 +482,10 @@ A = Float64.([i + 0.1*j for i in 1:m, j in 1:n])
 Adist = MatrixMPI(A)
 
 # Function that transforms each column: 8 elements -> 2 elements
-f(x) = [norm(x), maximum(x)]
+f_col = x -> [norm(x), maximum(x)]
 
-Bdist = mapslices(f, Adist; dims=1)
-B_ref = mapslices(f, A; dims=1)
+Bdist = mapslices(f_col, Adist; dims=1)
+B_ref = mapslices(f_col, A; dims=1)
 
 @test size(Bdist) == size(B_ref)
 
@@ -505,8 +505,8 @@ A = Float64.([i + 0.1*j for i in 1:m, j in 1:n])
 
 Adist = MatrixMPI(A)
 
-f(x) = [norm(x), maximum(x)]
-Bdist = mapslices(f, Adist; dims=2)
+f_partition = x -> [norm(x), maximum(x)]
+Bdist = mapslices(f_partition, Adist; dims=2)
 
 # dims=2 preserves row partition
 @test Bdist.row_partition == Adist.row_partition
@@ -524,10 +524,10 @@ A = ComplexF64.([i + 0.1*j for i in 1:m, j in 1:n]) .+ im .* ComplexF64.([i - j 
 Adist = MatrixMPI(A)
 
 # Function that returns real values
-f(x) = [norm(x), abs(maximum(real.(x)))]
+f_complex = x -> [norm(x), abs(maximum(real.(x)))]
 
-Bdist = mapslices(f, Adist; dims=2)
-B_ref = mapslices(f, A; dims=2)
+Bdist = mapslices(f_complex, Adist; dims=2)
+B_ref = mapslices(f_complex, A; dims=2)
 
 @test size(Bdist) == size(B_ref)
 

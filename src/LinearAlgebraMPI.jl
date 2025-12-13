@@ -140,7 +140,7 @@ the factorization once with `lu(A)` or `ldlt(A)` and reuse it.
 """
 function Base.:\(A::SparseMatrixMPI{T}, b::VectorMPI{T}) where T
     F = LinearAlgebra.lu(A)
-    return solve(F, b)
+    return F \ b
 end
 
 """
@@ -153,7 +153,7 @@ function Base.:\(At::Transpose{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
     # Materialize the transpose and factorize directly
     A_t = materialize_transpose(At.parent)
     F = LinearAlgebra.lu(A_t)
-    return solve(F, b)
+    return F \ b
 end
 
 """
@@ -168,7 +168,7 @@ function Base.:\(Ac::Adjoint{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
     A_t = materialize_transpose(Ac.parent)
     A_adj = conj(A_t)
     F = LinearAlgebra.lu(A_adj)
-    return solve(F, b)
+    return F \ b
 end
 
 # ============================================================================

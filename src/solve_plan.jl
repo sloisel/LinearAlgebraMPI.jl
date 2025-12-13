@@ -273,7 +273,7 @@ function distributed_forward_solve_lu!(y_local::Vector{T},
             if child_owner != plan.myrank
                 # Receive contribution from child
                 recv_buf = plan.recv_buffers[(child, child_owner)]
-                MPI.Recv!(recv_buf, child_owner, child, comm)
+                MPI.Recv!(recv_buf, comm; source=child_owner, tag=child)
 
                 # Subtract contribution from y_local for the update rows
                 # (contribution = L[row,col] * y[col], and forward solve does y[row] -= L[row,col] * y[col])
@@ -392,157 +392,109 @@ function distributed_backward_solve_lu!(x_local::Vector{T},
         end
     end
 
-    # For multi-rank: First gather all x contributions from other ranks' columns
-    # that affect our rows, BEFORE we start processing our supernodes
-    if plan.nranks > 1
-        # We need to wait for higher columns to be computed first
-        # Use barrier + Allreduce approach: process in waves by rank, starting with
-        # the rank that owns the highest columns
+    # Two-pass approach with Allreduce to handle cross-rank dependencies
 
-        # Determine which rank owns the root (highest column)
-        max_col_rank = elim_col_to_owner[n]
+    # First pass: each rank does local backward sub for its columns only
+    # (not applying cross-rank U entries yet)
+    for sidx in reverse(plan.my_supernodes_postorder)
+        snode = symbolic.supernodes[sidx]
+        info = symbolic.frontal_info[sidx]
+        nfs = info.nfs
 
-        # Process from root down: first rank with highest cols, then next, etc.
-        # For simplicity, use a global Allreduce after ALL local backward subs
+        # Local backward substitution within this supernode (reverse order)
+        local_range = plan.local_snode_indices[sidx]
+        for local_col in reverse(collect(local_range))
+            elim_col = plan.local_to_global[local_col]
 
-        # First pass: each rank does local backward sub for its columns only
-        # (not applying cross-rank U entries yet)
-        for sidx in reverse(plan.my_supernodes_postorder)
-            snode = symbolic.supernodes[sidx]
-            info = symbolic.frontal_info[sidx]
-            nfs = info.nfs
+            # First, we need to account for contributions from columns > elim_col
+            # that are owned by OTHER ranks. We'll handle this after Allreduce.
+            # For now, just compute partial result.
 
-            # Local backward substitution within this supernode (reverse order)
-            local_range = plan.local_snode_indices[sidx]
-            for local_col in reverse(collect(local_range))
-                elim_col = plan.local_to_global[local_col]
-
-                # First, we need to account for contributions from columns > elim_col
-                # that are owned by OTHER ranks. We'll handle this after Allreduce.
-                # For now, just compute partial result.
-
-                # Divide by diagonal
-                diag_val = zero(T)
-                for idx in nzrange(U_local, elim_col)
-                    if rowvals(U_local)[idx] == elim_col
-                        diag_val = nonzeros(U_local)[idx]
-                        break
-                    end
+            # Divide by diagonal
+            diag_val = zero(T)
+            for idx in nzrange(U_local, elim_col)
+                if rowvals(U_local)[idx] == elim_col
+                    diag_val = nonzeros(U_local)[idx]
+                    break
                 end
-                if diag_val == zero(T)
-                    error("Zero diagonal in U at elimination step $elim_col")
-                end
-                x_local[local_col] /= diag_val
+            end
+            if diag_val == zero(T)
+                error("Zero diagonal in U at elimination step $elim_col")
+            end
+            x_local[local_col] /= diag_val
 
-                xk = x_local[local_col]
+            xk = x_local[local_col]
 
-                # Update rows above (only for columns we own)
-                for idx in nzrange(U_local, elim_col)
-                    elim_row = rowvals(U_local)[idx]
-                    if elim_row != elim_col
-                        local_row = plan.global_to_local[elim_row]
-                        if local_row > 0
-                            # Only apply if the update column is owned by us
-                            x_local[local_row] -= nonzeros(U_local)[idx] * xk
-                        end
+            # Update rows above (only for columns we own)
+            for idx in nzrange(U_local, elim_col)
+                elim_row = rowvals(U_local)[idx]
+                if elim_row != elim_col
+                    local_row = plan.global_to_local[elim_row]
+                    if local_row > 0
+                        # Only apply if the update column is owned by us
+                        x_local[local_row] -= nonzeros(U_local)[idx] * xk
                     end
                 end
             end
         end
+    end
 
-        # Gather all x values
-        x_global = zeros(T, n)
-        for local_idx in 1:length(x_local)
-            elim_idx = plan.local_to_global[local_idx]
-            x_global[elim_idx] = x_local[local_idx]
-        end
-        x_global = MPI.Allreduce(x_global, +, comm)
+    # Gather all x values
+    x_global = zeros(T, n)
+    for local_idx in 1:length(x_local)
+        elim_idx = plan.local_to_global[local_idx]
+        x_global[elim_idx] = x_local[local_idx]
+    end
+    x_global = MPI.Allreduce(x_global, +, comm)
 
-        # Now re-compute x values by applying contributions from other ranks' columns
-        # We need to re-do the backward solve with proper ordering
-        # Process columns in decreasing order, applying cross-rank contributions
+    # Now re-compute x values by applying contributions from other ranks' columns
+    # We need to re-do the backward solve with proper ordering
+    # Process columns in decreasing order, applying cross-rank contributions
 
-        # Reset x_local to y_local
-        copy!(x_local, y_local)
+    # Reset x_local to y_local
+    copy!(x_local, y_local)
 
-        # Process ALL columns in decreasing order, using x_global for cross-rank columns
-        for elim_col in n:-1:1
-            local_col = plan.global_to_local[elim_col]
-            col_owner = elim_col_to_owner[elim_col]
+    # Process ALL columns in decreasing order, using x_global for cross-rank columns
+    for elim_col in n:-1:1
+        local_col = plan.global_to_local[elim_col]
+        col_owner = elim_col_to_owner[elim_col]
 
-            if col_owner == plan.myrank
-                # We own this column, compute x[elim_col]
-                # First apply contributions from columns > elim_col that we own
-                # (already done via y_local updates during first pass... but we reset)
-                # Actually, let's do it fresh here
+        if col_owner == plan.myrank
+            # We own this column, compute x[elim_col]
+            # First apply contributions from columns > elim_col that we own
+            # (already done via y_local updates during first pass... but we reset)
+            # Actually, let's do it fresh here
 
-                # Apply contributions from ALL columns > elim_col
-                for elim_col2 in elim_col+1:n
-                    col2_owner = elim_col_to_owner[elim_col2]
-                    if col2_owner == plan.myrank
-                        # Use local x value
-                        local_col2 = plan.global_to_local[elim_col2]
-                        x_col2 = x_local[local_col2]
-                    else
-                        # Use global x value from other rank
-                        x_col2 = x_global[elim_col2]
-                    end
-
-                    # Find U[elim_col, elim_col2]
-                    for idx in nzrange(U_local, elim_col2)
-                        if rowvals(U_local)[idx] == elim_col
-                            x_local[local_col] -= nonzeros(U_local)[idx] * x_col2
-                            break
-                        end
-                    end
+            # Apply contributions from ALL columns > elim_col
+            for elim_col2 in elim_col+1:n
+                col2_owner = elim_col_to_owner[elim_col2]
+                if col2_owner == plan.myrank
+                    # Use local x value
+                    local_col2 = plan.global_to_local[elim_col2]
+                    x_col2 = x_local[local_col2]
+                else
+                    # Use global x value from other rank
+                    x_col2 = x_global[elim_col2]
                 end
 
-                # Divide by diagonal
-                diag_val = zero(T)
-                for idx in nzrange(U_local, elim_col)
+                # Find U[elim_col, elim_col2]
+                for idx in nzrange(U_local, elim_col2)
                     if rowvals(U_local)[idx] == elim_col
-                        diag_val = nonzeros(U_local)[idx]
+                        x_local[local_col] -= nonzeros(U_local)[idx] * x_col2
                         break
                     end
                 end
-                x_local[local_col] /= diag_val
             end
-        end
-    else
-        # Single rank: standard backward solve
-        for sidx in reverse(plan.my_supernodes_postorder)
-            snode = symbolic.supernodes[sidx]
-            info = symbolic.frontal_info[sidx]
-            nfs = info.nfs
 
-            local_range = plan.local_snode_indices[sidx]
-            for local_col in reverse(collect(local_range))
-                elim_col = plan.local_to_global[local_col]
-
-                diag_val = zero(T)
-                for idx in nzrange(U_local, elim_col)
-                    if rowvals(U_local)[idx] == elim_col
-                        diag_val = nonzeros(U_local)[idx]
-                        break
-                    end
-                end
-                if diag_val == zero(T)
-                    error("Zero diagonal in U at elimination step $elim_col")
-                end
-                x_local[local_col] /= diag_val
-
-                xk = x_local[local_col]
-
-                for idx in nzrange(U_local, elim_col)
-                    elim_row = rowvals(U_local)[idx]
-                    if elim_row != elim_col
-                        local_row = plan.global_to_local[elim_row]
-                        if local_row > 0
-                            x_local[local_row] -= nonzeros(U_local)[idx] * xk
-                        end
-                    end
+            # Divide by diagonal
+            diag_val = zero(T)
+            for idx in nzrange(U_local, elim_col)
+                if rowvals(U_local)[idx] == elim_col
+                    diag_val = nonzeros(U_local)[idx]
+                    break
                 end
             end
+            x_local[local_col] /= diag_val
         end
     end
 
@@ -705,7 +657,7 @@ function distributed_forward_solve_ldlt!(y_local::Vector{T},
             child_owner = symbolic.snode_owner[child]
             if child_owner != plan.myrank
                 recv_buf = plan.recv_buffers[(child, child_owner)]
-                MPI.Recv!(recv_buf, child_owner, child, comm)
+                MPI.Recv!(recv_buf, comm; source=child_owner, tag=child)
 
                 # Subtract contribution from y_local for the update rows
                 child_info = symbolic.frontal_info[child]
@@ -902,84 +854,64 @@ function distributed_backward_solve_ldlt!(x_local::Vector{T},
         end
     end
 
-    if plan.nranks > 1
-        # Multi-rank: use two-pass approach with Allreduce
+    # Two-pass approach with Allreduce to handle cross-rank dependencies
 
-        # First pass: each rank does local backward sub for its columns only
-        for sidx in reverse(plan.my_supernodes_postorder)
-            local_range = plan.local_snode_indices[sidx]
-            for local_col in reverse(collect(local_range))
-                elim_col = plan.local_to_global[local_col]
+    # First pass: each rank does local backward sub for its columns only
+    for sidx in reverse(plan.my_supernodes_postorder)
+        local_range = plan.local_snode_indices[sidx]
+        for local_col in reverse(collect(local_range))
+            elim_col = plan.local_to_global[local_col]
 
-                # Apply L^T contributions from local rows only
+            # Apply L^T contributions from local rows only
+            for idx in nzrange(L_local, elim_col)
+                elim_row = rowvals(L_local)[idx]
+                if elim_row > elim_col
+                    local_row = plan.global_to_local[elim_row]
+                    if local_row > 0
+                        x_local[local_col] -= nonzeros(L_local)[idx] * x_local[local_row]
+                    end
+                end
+            end
+        end
+    end
+
+    # Gather all x values via Allreduce
+    x_global = zeros(T, n)
+    for local_idx in 1:length(x_local)
+        elim_idx = plan.local_to_global[local_idx]
+        x_global[elim_idx] = x_local[local_idx]
+    end
+    x_global = MPI.Allreduce(x_global, +, comm)
+
+    # Reset x_local to z_local
+    copy!(x_local, z_local)
+
+    # Second pass: process all columns in decreasing order
+    for elim_col in n:-1:1
+        local_col = plan.global_to_local[elim_col]
+        col_owner = elim_col_to_owner[elim_col]
+
+        if col_owner == plan.myrank
+            # Apply contributions from ALL columns > elim_col
+            for elim_col2 in elim_col+1:n
+                col2_owner = elim_col_to_owner[elim_col2]
+                if col2_owner == plan.myrank
+                    local_col2 = plan.global_to_local[elim_col2]
+                    x_col2 = x_local[local_col2]
+                else
+                    x_col2 = x_global[elim_col2]
+                end
+
+                # Find L[elim_col2, elim_col] (L is stored in CSC by column elim_col)
+                # For L^T solve: x[elim_col] -= L[elim_col2, elim_col] * x[elim_col2]
                 for idx in nzrange(L_local, elim_col)
-                    elim_row = rowvals(L_local)[idx]
-                    if elim_row > elim_col
-                        local_row = plan.global_to_local[elim_row]
-                        if local_row > 0
-                            x_local[local_col] -= nonzeros(L_local)[idx] * x_local[local_row]
-                        end
+                    if rowvals(L_local)[idx] == elim_col2
+                        x_local[local_col] -= nonzeros(L_local)[idx] * x_col2
+                        break
                     end
                 end
             end
-        end
-
-        # Gather all x values via Allreduce
-        x_global = zeros(T, n)
-        for local_idx in 1:length(x_local)
-            elim_idx = plan.local_to_global[local_idx]
-            x_global[elim_idx] = x_local[local_idx]
-        end
-        x_global = MPI.Allreduce(x_global, +, comm)
-
-        # Reset x_local to z_local
-        copy!(x_local, z_local)
-
-        # Second pass: process all columns in decreasing order
-        for elim_col in n:-1:1
-            local_col = plan.global_to_local[elim_col]
-            col_owner = elim_col_to_owner[elim_col]
-
-            if col_owner == plan.myrank
-                # Apply contributions from ALL columns > elim_col
-                for elim_col2 in elim_col+1:n
-                    col2_owner = elim_col_to_owner[elim_col2]
-                    if col2_owner == plan.myrank
-                        local_col2 = plan.global_to_local[elim_col2]
-                        x_col2 = x_local[local_col2]
-                    else
-                        x_col2 = x_global[elim_col2]
-                    end
-
-                    # Find L[elim_col2, elim_col] (L is stored in CSC by column elim_col)
-                    # For L^T solve: x[elim_col] -= L[elim_col2, elim_col] * x[elim_col2]
-                    for idx in nzrange(L_local, elim_col)
-                        if rowvals(L_local)[idx] == elim_col2
-                            x_local[local_col] -= nonzeros(L_local)[idx] * x_col2
-                            break
-                        end
-                    end
-                end
-                # Unit diagonal - no division needed
-            end
-        end
-    else
-        # Single rank: standard backward solve
-        for sidx in reverse(plan.my_supernodes_postorder)
-            local_range = plan.local_snode_indices[sidx]
-            for local_col in reverse(collect(local_range))
-                elim_col = plan.local_to_global[local_col]
-
-                for idx in nzrange(L_local, elim_col)
-                    elim_row = rowvals(L_local)[idx]
-                    if elim_row > elim_col
-                        local_row = plan.global_to_local[elim_row]
-                        if local_row > 0
-                            x_local[local_col] -= nonzeros(L_local)[idx] * x_local[local_row]
-                        end
-                    end
-                end
-            end
+            # Unit diagonal - no division needed
         end
     end
 

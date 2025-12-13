@@ -90,7 +90,7 @@ function initialize_input_plan!(plan::FactorizationInputPlan{T},
     # Step 3: Exchange request counts via Alltoall
     send_counts = Int32[length(needs_from_rank[r]) for r in 0:plan.nranks-1]
     recv_counts = Vector{Int32}(undef, plan.nranks)
-    MPI.Alltoall!(send_counts, recv_counts, 1, comm)
+    MPI.Alltoall!(MPI.UBuffer(send_counts, 1), MPI.UBuffer(recv_counts, 1), comm)
 
     # Step 4: Exchange index requests via Alltoallv
     # Pack (row, col) pairs as Int32 pairs
