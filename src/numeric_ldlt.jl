@@ -41,15 +41,12 @@ function LinearAlgebra.ldlt(A::SparseMatrixMPI{T}; reuse_symbolic::Bool=true) wh
         get_symbolic_factorization(A; symmetric=true) :
         compute_symbolic_factorization(A; symmetric=true)
 
-    # Get or compute communication plans (currently just for caching)
-    plans = get_factorization_plans(A, symbolic)
-
     # Perform numerical factorization
-    return numerical_factorization_ldlt(A, symbolic, plans)
+    return numerical_factorization_ldlt(A, symbolic)
 end
 
 """
-    numerical_factorization_ldlt(A, symbolic, plans) -> LDLTFactorizationMPI{T}
+    numerical_factorization_ldlt(A, symbolic) -> LDLTFactorizationMPI{T}
 
 Perform the numerical LDLT factorization with Bunch-Kaufman pivoting.
 
@@ -57,8 +54,7 @@ Note: The current supernode assignment places complete subtrees on single ranks,
 so all parent-child communication is local (no MPI communication during factorization).
 """
 function numerical_factorization_ldlt(A::SparseMatrixMPI{T},
-                                      symbolic::SymbolicFactorization,
-                                      plans::FactorizationPlans{T}) where T
+                                      symbolic::SymbolicFactorization) where T
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 

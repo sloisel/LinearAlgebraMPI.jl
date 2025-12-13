@@ -15,7 +15,7 @@ export io0   # Utility for rank-selective output
 # Factorization exports
 export LUFactorizationMPI, LDLTFactorizationMPI, SymbolicFactorization
 export solve, solve!, solve_transpose, solve_adjoint
-export clear_symbolic_cache!, clear_factorization_plan_cache!
+export clear_symbolic_cache!
 
 # Type alias for 256-bit Blake3 hash
 const Blake3Hash = NTuple{32,UInt8}
@@ -56,9 +56,6 @@ function clear_plan_cache!()
     end
     if isdefined(@__MODULE__, :_symbolic_cache)
         empty!(_symbolic_cache)
-    end
-    if isdefined(@__MODULE__, :_factorization_plan_cache)
-        empty!(_factorization_plan_cache)
     end
 end
 
@@ -111,11 +108,10 @@ include("sparse.jl")
 include("blocks.jl")
 include("indexing.jl")
 
-# Include factorization files (order matters: types, then utils, then symbolic, then plans, then numeric, then solve)
+# Include factorization files (order matters: types, then utils, then symbolic, then numeric, then solve)
 include("factorization_types.jl")
 include("factorization_utils.jl")
 include("symbolic.jl")
-include("factorization_plans.jl")
 include("numeric_lu.jl")
 include("numeric_ldlt.jl")
 include("solve_lu.jl")

@@ -33,15 +33,12 @@ function LinearAlgebra.lu(A::SparseMatrixMPI{T}; reuse_symbolic::Bool=true) wher
         get_symbolic_factorization(A; symmetric=false) :
         compute_symbolic_factorization(A; symmetric=false)
 
-    # Get or compute communication plans (currently just for caching)
-    plans = get_factorization_plans(A, symbolic)
-
     # Perform numerical factorization
-    return numerical_factorization_lu(A, symbolic, plans)
+    return numerical_factorization_lu(A, symbolic)
 end
 
 """
-    numerical_factorization_lu(A, symbolic, plans) -> LUFactorizationMPI{T}
+    numerical_factorization_lu(A, symbolic) -> LUFactorizationMPI{T}
 
 Perform the numerical LU factorization.
 
@@ -49,8 +46,7 @@ Note: The current supernode assignment places complete subtrees on single ranks,
 so all parent-child communication is local (no MPI communication during factorization).
 """
 function numerical_factorization_lu(A::SparseMatrixMPI{T},
-                                    symbolic::SymbolicFactorization,
-                                    plans::FactorizationPlans{T}) where T
+                                    symbolic::SymbolicFactorization) where T
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
