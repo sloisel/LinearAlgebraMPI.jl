@@ -191,6 +191,115 @@ Base.size(ldlt::LDLTFactorizationMPI) = (ldlt.symbolic.n, ldlt.symbolic.n)
 Base.eltype(::LDLTFactorizationMPI{T}) where T = T
 
 # ============================================================================
+# Distributed Solve Plan
+# ============================================================================
+
+"""
+    SolvePlan{T}
+
+Communication plan for distributed triangular solves.
+
+With subtree-to-rank assignment, cross-rank communication only occurs at
+subtree boundaries. This plan precomputes:
+1. Which supernodes send/receive across rank boundaries
+2. Buffer sizes and pre-allocated storage
+3. Index mappings for RHS/solution vectors
+
+## Forward solve (L y = b)
+
+Process supernodes in postorder (leaves → root):
+- Receive update contributions from children on other ranks
+- Perform local forward substitution
+- Send update contribution to parent on another rank
+
+## Backward solve (U x = y or L^T x = y)
+
+Process supernodes in reverse postorder (root → leaves):
+- Receive solution from parent on another rank
+- Perform local backward substitution
+- Send solution components to children on other ranks
+
+## Communication pattern
+
+For each supernode s where parent is on a different rank:
+- Forward: send update contribution (size = number of update rows in parent)
+- Backward: receive solution (size = number of update rows shared with parent)
+"""
+mutable struct SolvePlan{T}
+    # Reference to symbolic factorization
+    symbolic::SymbolicFactorization
+
+    # MPI info
+    myrank::Int
+    nranks::Int
+
+    # Supernodes that communicate across rank boundaries
+    # (supernodes whose parent is on a different rank = subtree roots)
+    subtree_roots::Vector{Int}
+
+    # For each subtree root: the update rows that need to be communicated
+    # subtree_root_update_rows[sidx] = row indices (global) that contribute to parent
+    subtree_root_update_rows::Dict{Int, Vector{Int}}
+
+    # Forward solve communication (send to parent, receive from children)
+    forward_send_to::Dict{Int, Int}           # sidx -> rank to send to
+    forward_recv_from::Dict{Int, Int}         # sidx -> rank to receive from
+
+    # Backward solve communication (receive from parent, send to children)
+    backward_send_to::Dict{Int, Vector{Int}}  # sidx -> ranks to send to
+    backward_recv_from::Dict{Int, Int}        # sidx -> rank to receive from
+
+    # Pre-allocated communication buffers
+    send_buffers::Dict{Tuple{Int,Int}, Vector{T}}  # (sidx, dest_rank) -> buffer
+    recv_buffers::Dict{Tuple{Int,Int}, Vector{T}}  # (sidx, src_rank) -> buffer
+
+    # Local vector storage: maps global indices to local positions
+    # For the solve, we work in elimination order
+    local_snode_indices::Dict{Int, UnitRange{Int}}  # sidx -> range in local work vector
+
+    # Vector of supernodes owned by this rank (in postorder)
+    my_supernodes_postorder::Vector{Int}
+
+    # Work vector for intermediate values (sized to number of columns this rank owns)
+    work_vector::Vector{T}
+
+    # Mapping: global elimination index -> local work index (or 0 if not local)
+    global_to_local::Vector{Int}
+
+    # Mapping: local work index -> global elimination index
+    local_to_global::Vector{Int}
+
+    # Flag indicating if plan has been initialized
+    initialized::Bool
+end
+
+"""
+    SolvePlan{T}(symbolic::SymbolicFactorization) where T
+
+Create an uninitialized solve plan. Call `initialize_solve_plan!` to set it up.
+"""
+function SolvePlan{T}(symbolic::SymbolicFactorization) where T
+    return SolvePlan{T}(
+        symbolic,
+        0, 0,  # myrank, nranks - set during init
+        Int[],
+        Dict{Int, Vector{Int}}(),
+        Dict{Int, Int}(),
+        Dict{Int, Int}(),
+        Dict{Int, Vector{Int}}(),
+        Dict{Int, Int}(),
+        Dict{Tuple{Int,Int}, Vector{T}}(),
+        Dict{Tuple{Int,Int}, Vector{T}}(),
+        Dict{Int, UnitRange{Int}}(),
+        Int[],
+        T[],
+        Int[],
+        Int[],
+        false
+    )
+end
+
+# ============================================================================
 # Cache for Symbolic Factorizations
 # ============================================================================
 
@@ -206,4 +315,100 @@ Clear the symbolic factorization cache.
 """
 function clear_symbolic_cache!()
     empty!(_symbolic_cache)
+end
+
+# ============================================================================
+# Distributed Factorization Input Plan
+# ============================================================================
+
+"""
+    FactorizationInputPlan{T}
+
+Communication plan for distributing matrix entries to ranks that need them
+for frontal matrix initialization.
+
+With distributed input, each rank only stores its portion of the input matrix A.
+Before factorization, ranks exchange entries needed for their supernodes' frontal
+matrices via point-to-point communication.
+
+## Communication pattern
+
+For each supernode this rank owns:
+1. Determine which entries of A[perm, perm] are needed (from symbolic factorization)
+2. Map back to original A indices: need A[perm[i], perm[j]]
+3. Request entries from ranks that own those rows
+4. Receive values and store for frontal matrix initialization
+
+## Fields
+
+- `symbolic`: Reference to symbolic factorization
+- `myrank`, `nranks`: MPI info
+- `needed_entries`: Dict mapping supernode idx -> list of (perm_i, perm_j) needed
+- `send_to_ranks`: Which ranks to send entries to
+- `recv_from_ranks`: Which ranks to receive entries from
+- `send_indices`: For each destination rank -> list of (row, col) pairs to send
+- `recv_indices`: For each source rank -> list of (perm_i, perm_j) pairs to receive
+- `send_buffers`, `recv_buffers`: Pre-allocated communication buffers
+- `initialized`: Flag indicating if plan has been set up
+"""
+mutable struct FactorizationInputPlan{T}
+    # Reference to symbolic factorization
+    symbolic::SymbolicFactorization
+
+    # MPI info
+    myrank::Int
+    nranks::Int
+
+    # Row partition of input matrix A
+    row_partition::Vector{Int}
+
+    # For each supernode this rank owns: entries needed (in permuted coordinates)
+    # needed_entries[sidx] = [(perm_row, perm_col), ...]
+    needed_entries::Dict{Int, Vector{Tuple{Int,Int}}}
+
+    # Ranks we send entries to (these ranks own supernodes needing our A rows)
+    send_to_ranks::Vector{Int}
+
+    # Ranks we receive entries from (these ranks own A rows we need)
+    recv_from_ranks::Vector{Int}
+
+    # For each destination rank: which (orig_row, orig_col) pairs to send
+    # send_indices[dest_rank] = [(row, col), ...]
+    send_indices::Dict{Int, Vector{Tuple{Int,Int}}}
+
+    # For each source rank: which (perm_row, perm_col) pairs we receive
+    # recv_indices[src_rank] = [(perm_i, perm_j), ...]
+    recv_indices::Dict{Int, Vector{Tuple{Int,Int}}}
+
+    # Pre-allocated send/receive buffers
+    send_buffers::Dict{Int, Vector{T}}
+    recv_buffers::Dict{Int, Vector{T}}
+
+    # Received values storage: maps (perm_i, perm_j) -> value
+    received_values::Dict{Tuple{Int,Int}, T}
+
+    # Flag indicating if plan has been initialized
+    initialized::Bool
+end
+
+"""
+    FactorizationInputPlan{T}(symbolic::SymbolicFactorization) where T
+
+Create an uninitialized factorization input plan.
+"""
+function FactorizationInputPlan{T}(symbolic::SymbolicFactorization) where T
+    return FactorizationInputPlan{T}(
+        symbolic,
+        0, 0,  # myrank, nranks
+        Int[],  # row_partition
+        Dict{Int, Vector{Tuple{Int,Int}}}(),
+        Int[],
+        Int[],
+        Dict{Int, Vector{Tuple{Int,Int}}}(),
+        Dict{Int, Vector{Tuple{Int,Int}}}(),
+        Dict{Int, Vector{T}}(),
+        Dict{Int, Vector{T}}(),
+        Dict{Tuple{Int,Int}, T}(),
+        false
+    )
 end

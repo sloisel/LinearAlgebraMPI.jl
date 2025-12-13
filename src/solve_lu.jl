@@ -32,16 +32,36 @@ function solve(F::LUFactorizationMPI{T}, b::VectorMPI{T}) where T
 end
 
 """
-    solve!(x::VectorMPI{T}, F::LUFactorizationMPI{T}, b::VectorMPI{T})
+    solve!(x::VectorMPI{T}, F::LUFactorizationMPI{T}, b::VectorMPI{T}; distributed::Bool=true)
 
 Solve A*x = b in-place using LU factorization.
+
+By default uses distributed solve (MUMPS-style) that keeps factors distributed
+and only communicates at subtree boundaries. Set `distributed=false` to use the
+gathered solve which collects L/U to all ranks (useful for debugging).
+"""
+function solve!(x::VectorMPI{T}, F::LUFactorizationMPI{T}, b::VectorMPI{T}; distributed::Bool=true) where T
+    if distributed
+        distributed_solve_lu!(x, F, b)
+    else
+        solve_gathered!(x, F, b)
+    end
+    return x
+end
+
+"""
+    solve_gathered!(x::VectorMPI{T}, F::LUFactorizationMPI{T}, b::VectorMPI{T})
+
+Solve A*x = b in-place using gathered L/U factors (all ranks have full factors).
+
+This is the original sequential solve. Useful for debugging and verification.
 
 L and U are stored in elimination order. The solve works entirely in elimination order:
 1. Transform RHS to elimination order with pivoting
 2. Triangular solves in elimination order
 3. Transform solution back to original order
 """
-function solve!(x::VectorMPI{T}, F::LUFactorizationMPI{T}, b::VectorMPI{T}) where T
+function solve_gathered!(x::VectorMPI{T}, F::LUFactorizationMPI{T}, b::VectorMPI{T}) where T
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     n = F.symbolic.n

@@ -15,7 +15,9 @@ export io0   # Utility for rank-selective output
 # Factorization exports
 export LUFactorizationMPI, LDLTFactorizationMPI, SymbolicFactorization
 export solve, solve!, solve_transpose, solve_adjoint
-export clear_symbolic_cache!
+export clear_symbolic_cache!, clear_solve_plan_cache!
+export distributed_solve_lu!, distributed_solve_ldlt!  # Distributed solve without gathering
+export clear_input_plan_cache!  # Factorization input plan cache
 
 # Type alias for 256-bit Blake3 hash
 const Blake3Hash = NTuple{32,UInt8}
@@ -56,6 +58,12 @@ function clear_plan_cache!()
     end
     if isdefined(@__MODULE__, :_symbolic_cache)
         empty!(_symbolic_cache)
+    end
+    if isdefined(@__MODULE__, :_solve_plan_cache)
+        empty!(_solve_plan_cache)
+    end
+    if isdefined(@__MODULE__, :_input_plan_cache)
+        empty!(_input_plan_cache)
     end
 end
 
@@ -116,6 +124,8 @@ include("numeric_lu.jl")
 include("numeric_ldlt.jl")
 include("solve_lu.jl")
 include("solve_ldlt.jl")
+include("solve_plan.jl")
+include("factorization_input.jl")
 
 # ============================================================================
 # Direct Solve Interface (A \ b)

@@ -29,11 +29,31 @@ function solve(F::LDLTFactorizationMPI{T}, b::VectorMPI{T}) where T
 end
 
 """
-    solve!(x::VectorMPI{T}, F::LDLTFactorizationMPI{T}, b::VectorMPI{T})
+    solve!(x::VectorMPI{T}, F::LDLTFactorizationMPI{T}, b::VectorMPI{T}; distributed::Bool=true)
 
 Solve A*x = b in-place using LDLT factorization.
+
+By default uses distributed solve (MUMPS-style) that keeps factors distributed
+and only communicates at subtree boundaries. Set `distributed=false` to use the
+gathered solve which collects L/D to all ranks (useful for debugging).
 """
-function solve!(x::VectorMPI{T}, F::LDLTFactorizationMPI{T}, b::VectorMPI{T}) where T
+function solve!(x::VectorMPI{T}, F::LDLTFactorizationMPI{T}, b::VectorMPI{T}; distributed::Bool=true) where T
+    if distributed
+        distributed_solve_ldlt!(x, F, b)
+    else
+        solve_gathered!(x, F, b)
+    end
+    return x
+end
+
+"""
+    solve_gathered!(x::VectorMPI{T}, F::LDLTFactorizationMPI{T}, b::VectorMPI{T})
+
+Solve A*x = b in-place using gathered L/D factors (all ranks have full factors).
+
+This is the original sequential solve. Useful for debugging and verification.
+"""
+function solve_gathered!(x::VectorMPI{T}, F::LDLTFactorizationMPI{T}, b::VectorMPI{T}) where T
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     n = F.symbolic.n

@@ -18,7 +18,7 @@ using MPI
 using SparseArrays
 
 """
-    ldlt(A::SparseMatrixMPI{T}; reuse_symbolic=true) -> LDLTFactorizationMPI{T}
+    ldlt(A::SparseMatrixMPI{T}; reuse_symbolic=true, distributed_input=false) -> LDLTFactorizationMPI{T}
 
 Compute LDLT factorization of a distributed symmetric sparse matrix.
 
@@ -34,36 +34,53 @@ and complex symmetric matrices, but NOT for complex Hermitian matrices.
 
 If `reuse_symbolic=true`, caches and reuses symbolic factorization for matrices
 with the same sparsity pattern.
+
+If `distributed_input=true`, uses MUMPS-style distributed matrix input where each
+rank only provides its local portion of the matrix, avoiding the O(nnz) gather.
 """
-function LinearAlgebra.ldlt(A::SparseMatrixMPI{T}; reuse_symbolic::Bool=true) where T
+function LinearAlgebra.ldlt(A::SparseMatrixMPI{T}; reuse_symbolic::Bool=true, distributed_input::Bool=false) where T
     # Get or compute symbolic factorization (symmetric variant)
     symbolic = reuse_symbolic ?
         get_symbolic_factorization(A; symmetric=true) :
         compute_symbolic_factorization(A; symmetric=true)
 
     # Perform numerical factorization
-    return numerical_factorization_ldlt(A, symbolic)
+    return numerical_factorization_ldlt(A, symbolic; distributed_input=distributed_input)
 end
 
 """
-    numerical_factorization_ldlt(A, symbolic) -> LDLTFactorizationMPI{T}
+    numerical_factorization_ldlt(A, symbolic; distributed_input=false) -> LDLTFactorizationMPI{T}
 
 Perform the numerical LDLT factorization with Bunch-Kaufman pivoting.
+
+If `distributed_input=true`, uses distributed matrix input where each rank only
+provides its local portion of the matrix.
 
 Note: The current supernode assignment places complete subtrees on single ranks,
 so all parent-child communication is local (no MPI communication during factorization).
 """
 function numerical_factorization_ldlt(A::SparseMatrixMPI{T},
-                                      symbolic::SymbolicFactorization) where T
+                                      symbolic::SymbolicFactorization;
+                                      distributed_input::Bool=false) where T
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
     n = symbolic.n
     nsupernodes = length(symbolic.supernodes)
 
-    # Gather the permuted matrix on all ranks for local access
-    A_full = SparseMatrixCSC(A)
-    Ap = A_full[symbolic.perm, symbolic.perm]
+    # Get matrix input (either gathered or distributed)
+    local input_plan::Union{Nothing, FactorizationInputPlan{T}} = nothing
+    local Ap::Union{Nothing, SparseMatrixCSC{T,Int}} = nothing
+
+    if distributed_input
+        # Use distributed input plan
+        input_plan = get_or_create_input_plan(symbolic, A)
+        execute_input_plan!(input_plan, A)
+    else
+        # Gather the permuted matrix on all ranks for local access
+        A_full = SparseMatrixCSC(A)
+        Ap = A_full[symbolic.perm, symbolic.perm]
+    end
 
     # Storage for update matrices (keyed by supernode index)
     updates = Dict{Int, Matrix{T}}()
@@ -94,7 +111,11 @@ function numerical_factorization_ldlt(A::SparseMatrixMPI{T},
             # This rank owns this supernode
 
             # 1. Initialize frontal matrix (symmetric)
-            F = initialize_frontal_sym(Ap, snode, info)
+            if distributed_input
+                F = initialize_frontal_sym_distributed(input_plan, A, snode, info)
+            else
+                F = initialize_frontal_sym(Ap, snode, info)
+            end
 
             # 2. Extend-add update matrices from children
             # Note: All children are on the same rank (subtrees assigned to single ranks)
