@@ -112,7 +112,7 @@ Distributed LU factorization result.
 
 The factorization satisfies: P_row * Ap = L * U
 where:
-- Ap = A[perm, perm] (fill-reducing permutation)
+- Ap is A symmetrically permuted by perm (the fill-reducing permutation)
 - P_row is the row permutation from partial pivoting
 - L is unit lower triangular (in elimination order)
 - U is upper triangular (in elimination order)
@@ -150,7 +150,7 @@ Distributed LDLT factorization result for symmetric matrices.
 
 The factorization satisfies: Ap = P' * L * D * Lᵀ * P
 where:
-- Ap = A[perm, perm] (fill-reducing permutation)
+- Ap is A symmetrically permuted by perm (the fill-reducing permutation)
 - P is the symmetric permutation from Bunch-Kaufman pivoting
 - L is unit lower triangular (in elimination order)
 - D is block diagonal (1×1 and 2×2 blocks for indefinite matrices)

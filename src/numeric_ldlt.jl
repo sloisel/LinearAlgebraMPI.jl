@@ -27,7 +27,7 @@ Uses the multifrontal method with:
 - Bunch-Kaufman pivoting for numerical stability with indefinite matrices
 - MUMPS-style subtree-to-rank mapping
 
-The factorization satisfies: A[perm,perm] = P' * L * D * L^T * P
+The factorization computes P' * L * D * L^T * P which equals A symmetrically permuted by perm.
 
 Note: Uses transpose (L^T), not adjoint (L*). Correct for real symmetric
 and complex symmetric matrices, but NOT for complex Hermitian matrices.
