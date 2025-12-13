@@ -430,7 +430,6 @@ SymbolicFactorization
 solve
 solve!
 solve_transpose
-solve_adjoint
 ```
 
 ### Usage Examples
