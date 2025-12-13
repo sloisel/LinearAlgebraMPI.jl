@@ -412,7 +412,7 @@ Compute LDLT factorization of a distributed symmetric sparse matrix using the mu
 - Bunch-Kaufman pivoting for numerical stability with indefinite matrices
 - MUMPS-style subtree-to-rank mapping
 
-The factorization satisfies: `A[perm,perm]` equals `P' * L * D * L^T * P` where `perm` is the fill-reducing permutation.
+The factorization computes `P' * L * D * L^T * P` which equals the symmetrically permuted matrix (A reordered by the fill-reducing permutation `perm`).
 
 Note: Uses transpose (`L^T`), not adjoint (`L*`). Correct for real symmetric and complex symmetric matrices, but NOT for complex Hermitian matrices.
 
