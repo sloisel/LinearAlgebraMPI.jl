@@ -70,4 +70,7 @@ end
     @testset "MPI Factorization" begin
         run_mpi_test(joinpath(@__DIR__, "test_factorization.jl"); nprocs=4, expect_success=true)
     end
+    @testset "Threaded Sparse Multiplication" begin
+        run_mpi_test(joinpath(@__DIR__, "test_threaded_mul.jl"); nprocs=4, expect_success=true)
+    end
 end

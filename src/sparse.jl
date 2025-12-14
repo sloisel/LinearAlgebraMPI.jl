@@ -52,8 +52,8 @@ Reindex AT's rowval from old_col_indices space to union_indices space.
 AT.rowval contains local indices into old_col_indices; converts to local indices into union_indices.
 """
 function reindex_to_union(AT::SparseMatrixCSC{T,Int},
-                          old_col_indices::Vector{Int},
-                          union_indices::Vector{Int}) where T
+    old_col_indices::Vector{Int},
+    union_indices::Vector{Int}) where T
     if isempty(AT.rowval)
         return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, Int[], T[])
     end
@@ -96,8 +96,8 @@ Note: AT stores rows in its columns (transpose layout), so:
 - AT row = local column index (into col_indices)
 """
 function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int},
-                                      insertions::Vector{Tuple{Int,Int,T}},
-                                      row_offset::Int) where T
+    insertions::Vector{Tuple{Int,Int,T}},
+    row_offset::Int) where T
     if isempty(insertions)
         return AT, col_indices
     end
@@ -118,7 +118,7 @@ function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Int}, col_indices::Ve
 
     # Collect all entries: (AT_col, AT_row, val) = (local_row, local_col_in_expanded, val)
     # Using a Dict to handle duplicates (later values win)
-    entries = Dict{Tuple{Int,Int}, T}()
+    entries = Dict{Tuple{Int,Int},T}()
 
     # Add existing entries from AT (reindex to expanded col_indices)
     old_global_to_local = Dict(g => l for (l, g) in enumerate(col_indices))
@@ -140,7 +140,7 @@ function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Int}, col_indices::Ve
 
     # Build new CSC arrays using standard COO→CSC algorithm
     # Sort entries by (AT_col, AT_row)
-    sorted_entries = sort(collect(entries), by = x -> (x[1][1], x[1][2]))
+    sorted_entries = sort(collect(entries), by=x -> (x[1][1], x[1][2]))
 
     nnz = length(sorted_entries)
 
@@ -153,7 +153,7 @@ function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Int}, col_indices::Ve
     # Build colptr from cumulative counts
     new_colptr = ones(Int, n_local_rows + 1)
     for j in 1:n_local_rows
-        new_colptr[j + 1] = new_colptr[j] + col_counts[j]
+        new_colptr[j+1] = new_colptr[j] + col_counts[j]
     end
 
     # Fill rowval and nzval
@@ -211,7 +211,7 @@ mutable struct SparseMatrixMPI{T}
     col_partition::Vector{Int}
     col_indices::Vector{Int}
     A::Transpose{T,SparseMatrixCSC{T,Int}}
-    cached_transpose::Union{Nothing, SparseMatrixMPI{T}}
+    cached_transpose::Union{Nothing,SparseMatrixMPI{T}}
 end
 
 """
@@ -233,9 +233,9 @@ Each rank extracts only its local rows from `A`, so:
 Use `uniform_partition(n, nranks)` to compute custom partitions.
 """
 function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int};
-                            comm::MPI.Comm=MPI.COMM_WORLD,
-                            row_partition::Vector{Int}=uniform_partition(size(A, 1), MPI.Comm_size(comm)),
-                            col_partition::Vector{Int}=uniform_partition(size(A, 2), MPI.Comm_size(comm))) where T
+    comm::MPI.Comm=MPI.COMM_WORLD,
+    row_partition::Vector{Int}=uniform_partition(size(A, 1), MPI.Comm_size(comm)),
+    col_partition::Vector{Int}=uniform_partition(size(A, 2), MPI.Comm_size(comm))) where T
     rank = MPI.Comm_rank(comm)
 
     # Local row range (1-indexed, Julia style)
@@ -297,8 +297,8 @@ A = SparseMatrixMPI_local(transpose(local_AT))
 ```
 """
 function SparseMatrixMPI_local(A_local::Transpose{T,SparseMatrixCSC{T,Int}};
-                               comm::MPI.Comm=MPI.COMM_WORLD,
-                               col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where T
+    comm::MPI.Comm=MPI.COMM_WORLD,
+    col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where T
     nranks = MPI.Comm_size(comm)
 
     AT_local = A_local.parent  # The underlying CSC storage
@@ -340,12 +340,12 @@ end
 
 # Adjoint version: conjugate values during construction
 function SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Int}};
-                               comm::MPI.Comm=MPI.COMM_WORLD,
-                               col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where T
+    comm::MPI.Comm=MPI.COMM_WORLD,
+    col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where T
     # Convert adjoint to transpose with conjugated values
     AT_parent = A_local.parent
     AT_conj = SparseMatrixCSC(AT_parent.m, AT_parent.n, copy(AT_parent.colptr),
-                               copy(AT_parent.rowval), conj.(AT_parent.nzval))
+        copy(AT_parent.rowval), conj.(AT_parent.nzval))
     return SparseMatrixMPI_local(transpose(AT_conj); comm=comm, col_partition=col_partition)
 end
 
@@ -573,7 +573,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
             combined_colptr[out_col+1] = combined_colptr[out_col] + col_nnz
             # B.A.parent.rowval contains LOCAL indices, convert to global using B.col_indices
             for (i, idx) in enumerate(start_idx:end_idx)
-                combined_rowval[nnz_idx + i - 1] = B.col_indices[B.A.parent.rowval[idx]]
+                combined_rowval[nnz_idx+i-1] = B.col_indices[B.A.parent.rowval[idx]]
             end
             # Track for local copy
             if col_nnz > 0
@@ -716,6 +716,88 @@ function execute_plan!(plan::MatrixPlan{T}, B::SparseMatrixMPI{T}) where T
 end
 
 """
+    _merge_thread_columns(m, n, thread_cols, thread_colptrs, thread_rowvals, thread_nzvals, Ti)
+
+Merge thread-local column data into a single SparseMatrixCSC.
+Each thread computed a subset of columns; this function combines them in column order.
+"""
+function _merge_thread_columns(m::Int, n::Int, thread_cols, thread_colptrs, thread_rowvals, thread_nzvals, ::Type{Tv}, ::Type{Ti}) where {Tv,Ti}
+    nthreads = length(thread_cols)
+
+    # Count total nonzeros
+    total_nnz = sum(length(rv) for rv in thread_rowvals)
+
+    # Build mapping: for each column j, find (thread_id, local_col_index)
+    col_to_thread = Vector{Tuple{Int,Int}}(undef, n)
+    for tid in 1:nthreads
+        for (local_idx, j) in enumerate(thread_cols[tid])
+            col_to_thread[j] = (tid, local_idx)
+        end
+    end
+
+    # Build final CSC structure
+    colptr = Vector{Ti}(undef, n + 1)
+    rowval = Vector{Ti}(undef, total_nnz)
+    nzval = Vector{Tv}(undef, total_nnz)
+
+    colptr[1] = 1
+    pos = 1
+
+    for j in 1:n
+        tid, local_idx = col_to_thread[j]
+
+        # Get range for this column in thread's data
+        start_ptr = thread_colptrs[tid][local_idx]
+        end_ptr = local_idx < length(thread_colptrs[tid]) ? thread_colptrs[tid][local_idx+1] - 1 : length(thread_rowvals[tid])
+
+        # Copy this column's data
+        for k in start_ptr:end_ptr
+            rowval[pos] = thread_rowvals[tid][k]
+            nzval[pos] = thread_nzvals[tid][k]
+            pos += 1
+        end
+
+        colptr[j+1] = pos
+    end
+
+    return SparseMatrixCSC{Tv,Ti}(m, n, colptr, rowval, nzval)
+end
+
+"""
+    ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}) where {Tv,Ti}
+
+Multithreaded sparse matrix multiplication by splitting B into column blocks
+and computing A * B_block in parallel using Julia's optimized builtin *.
+
+This leverages the highly-tuned single-threaded implementation while
+parallelizing at the block level.
+"""
+function ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads::Int=Threads.nthreads()) where {Tv,Ti}
+    n = size(B, 2)
+    nthreads = min(max_threads, n ÷ 100)
+    if nthreads <= 1
+        return A * B
+    end
+
+    # Column range for thread t: col_start(t):col_end(t)
+    cols_per_thread, remainder = divrem(n, nthreads)
+    @inline col_start(t) = 1 + (t - 1) * cols_per_thread + min(t - 1, remainder)
+    @inline col_end(t) = t * cols_per_thread + min(t, remainder)
+
+    # Storage for block results
+    results = Vector{SparseMatrixCSC{Tv,Ti}}(undef, nthreads)
+
+    # Compute A * B_block in parallel using builtin *
+    Threads.@threads :static for t in 1:nthreads
+        B_block = B[:, col_start(t):col_end(t)]
+        results[t] = A * B_block
+    end
+
+    # Concatenate results horizontally
+    return hcat(results...)
+end
+
+"""
     Base.*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
 
 Multiply two distributed sparse matrices A * B.
@@ -738,7 +820,7 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     # C^T = B^T * A^T = (plan.AT) * (A.A.parent)
     # plan.AT is (ncols_B, n_gathered), A.A.parent is (n_gathered, local_nrows_A)
     # result is (ncols_B, local_nrows_A) = shape of C.AT
-    result_AT = plan.AT * A.A.parent
+    result_AT = plan.AT ⊛ A.A.parent
 
     # col_indices are the columns of C that have nonzeros in our local rows (global indices from plan.AT)
     result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
@@ -1342,7 +1424,7 @@ The result has the same row partition as A.
 """
 function Base.:*(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
     rank = MPI.Comm_rank(MPI.COMM_WORLD)
-    local_rows = A.row_partition[rank + 2] - A.row_partition[rank + 1]
+    local_rows = A.row_partition[rank+2] - A.row_partition[rank+1]
     y = VectorMPI{T}(
         compute_partition_hash(A.row_partition),
         copy(A.row_partition),
@@ -1357,7 +1439,7 @@ end
 Compute transpose(v) * A as transpose(transpose(A) * v).
 Returns a transposed VectorMPI.
 """
-function Base.:*(vt::Transpose{<:Any, VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
+function Base.:*(vt::Transpose{<:Any,VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
     v = vt.parent
     # transpose(v) * A = transpose(transpose(A) * v)
     A_transposed = materialize_transpose(A)
@@ -1832,7 +1914,7 @@ function tr(A::SparseMatrixMPI{T}) where T
     my_row_end = A.row_partition[rank+2] - 1
 
     local_trace = zero(T)
-    for local_row in 1:(my_row_end - my_row_start + 1)
+    for local_row in 1:(my_row_end-my_row_start+1)
         global_row = my_row_start + local_row - 1
         # Diagonal element is at (global_row, global_row) if within bounds
         if global_row <= n
@@ -2007,7 +2089,7 @@ function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
         local_to_compressed = Dict(old => new for (new, old) in enumerate(local_used))
         compressed_rowval = [local_to_compressed[r] for r in new_rowval]
         compressed_AT = SparseMatrixCSC(length(new_col_indices), size(A.A.parent, 2),
-                                        new_colptr, compressed_rowval, new_nzval)
+            new_colptr, compressed_rowval, new_nzval)
     end
 
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, compressed_AT, comm)
@@ -2081,7 +2163,7 @@ function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
         local_to_compressed = Dict(old => new for (new, old) in enumerate(local_used))
         compressed_rowval = [local_to_compressed[r] for r in new_rowval]
         compressed_AT = SparseMatrixCSC(length(new_col_indices), size(A.A.parent, 2),
-                                        new_colptr, compressed_rowval, new_nzval)
+            new_colptr, compressed_rowval, new_nzval)
     end
 
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, compressed_AT, comm)
@@ -2274,7 +2356,7 @@ For diagonal k with length n:
 
 Returns the maximum dimensions needed to fit all diagonals.
 """
-function _compute_spdiagm_size(kv::Pair{<:Integer, <:VectorMPI}...)
+function _compute_spdiagm_size(kv::Pair{<:Integer,<:VectorMPI}...)
     m = 0
     n = 0
     for (k, v) in kv
@@ -2305,7 +2387,7 @@ v2 = VectorMPI([4.0, 5.0])
 A = spdiagm(0 => v1, 1 => v2)  # Main diagonal and first superdiagonal
 ```
 """
-function spdiagm(kv::Pair{<:Integer, <:VectorMPI}...)
+function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
     isempty(kv) && error("spdiagm requires at least one diagonal")
 
     comm = MPI.COMM_WORLD
@@ -2339,7 +2421,7 @@ function spdiagm(kv::Pair{<:Integer, <:VectorMPI}...)
     # Diagonal k: v[i] at (row, col) where:
     #   k >= 0: (i, i+k)
     #   k < 0: (i+|k|, i)
-    needed_indices_per_diag = Dict{Int, Vector{Int}}()  # k => global vector indices
+    needed_indices_per_diag = Dict{Int,Vector{Int}}()  # k => global vector indices
 
     for (k, v) in kv
         vec_len = length(v)
@@ -2373,7 +2455,7 @@ function spdiagm(kv::Pair{<:Integer, <:VectorMPI}...)
     # Step 4: Gather needed vector elements for each diagonal
     # IMPORTANT: All ranks must call _gather_specific_elements for each diagonal
     # to participate in MPI collectives, even if they need no elements
-    gathered_values = Dict{Int, Vector{T}}()
+    gathered_values = Dict{Int,Vector{T}}()
 
     for (k, v) in kv
         indices = get(needed_indices_per_diag, k, Int[])
@@ -2446,7 +2528,7 @@ v = VectorMPI([1.0, 2.0])
 A = spdiagm(4, 4, 0 => v)  # 4×4 matrix with [1,2] on main diagonal
 ```
 """
-function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer, <:VectorMPI}...)
+function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
     isempty(kv) && error("spdiagm requires at least one diagonal")
 
     comm = MPI.COMM_WORLD
@@ -2474,7 +2556,7 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer, <:VectorMPI}...)
     local_nrows = my_row_end - my_row_start + 1
 
     # Step 2: For each diagonal, determine which vector elements we need
-    needed_indices_per_diag = Dict{Int, Vector{Int}}()
+    needed_indices_per_diag = Dict{Int,Vector{Int}}()
 
     for (k, v) in kv
         vec_len = length(v)
@@ -2504,7 +2586,7 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer, <:VectorMPI}...)
     # Step 3: Gather needed vector elements
     # IMPORTANT: All ranks must call _gather_specific_elements for each diagonal
     # to participate in MPI collectives, even if they need no elements
-    gathered_values = Dict{Int, Vector{T}}()
+    gathered_values = Dict{Int,Vector{T}}()
 
     for (k, v) in kv
         indices = get(needed_indices_per_diag, k, Int[])
