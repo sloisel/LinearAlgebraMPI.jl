@@ -34,6 +34,21 @@ a * A          # Scalar multiplication
 A * a          # Scalar multiplication
 ```
 
+### Threaded Sparse Multiplication
+
+```@docs
+⊛
+```
+
+The `⊛` operator (typed as `\circledast<tab>`) provides multithreaded sparse matrix multiplication for `SparseMatrixCSC`. It is used internally by `SparseMatrixMPI` multiplication and can also be used directly on local sparse matrices:
+
+```julia
+using SparseArrays
+A = sprand(10000, 10000, 0.001)
+B = sprand(10000, 5000, 0.001)
+C = A ⊛ B   # Parallel multiplication using available threads
+```
+
 ### Transpose and Adjoint
 
 ```julia

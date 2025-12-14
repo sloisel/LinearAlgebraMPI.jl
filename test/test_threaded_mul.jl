@@ -81,6 +81,19 @@ C_ref4 = A4 * B4
 @test nnz(C_threaded4) == 0
 @test size(C_threaded4) == size(C_ref4)
 
+println(io0(), "[test] Large matrix (triggers threading, n > 200)")
+
+# 500×500 matrix large enough to trigger threading (n ÷ 100 = 5 threads)
+n5 = 500
+I_A5 = [1:n5; 1:n5-1; 2:n5]
+J_A5 = [1:n5; 2:n5; 1:n5-1]
+V_A5 = [2.0*ones(Float64, n5); -0.5*ones(n5-1); -0.5*ones(n5-1)]
+A5 = sparse(I_A5, J_A5, V_A5, n5, n5)
+
+C_threaded5 = A5 ⊛ A5
+C_ref5 = A5 * A5
+@test norm(C_threaded5 - C_ref5, Inf) < TOL
+
 println(io0(), "[test] All tests passed")
 
 end  # QuietTestSet

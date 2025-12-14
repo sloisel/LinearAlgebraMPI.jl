@@ -13,7 +13,7 @@ catch err
 end
 
 # Helper to run a test file under mpiexec with a fixed project and check exit status
-function run_mpi_test(test_file::AbstractString; nprocs::Integer=4, expect_success::Bool=true)
+function run_mpi_test(test_file::AbstractString; nprocs::Integer=4, nthreads::Integer=2, expect_success::Bool=true)
     # Allow overriding mpiexec via environment variable (useful for CI with system MPI)
     mpiexec_cmd = get(ENV, "MPIEXEC_PATH", nothing)
     if mpiexec_cmd === nothing
@@ -24,7 +24,7 @@ function run_mpi_test(test_file::AbstractString; nprocs::Integer=4, expect_succe
     # Use the active test environment project (which has already been precompiled above)
     # This ensures LocalPreferences.toml is honored and avoids recompilation under mpiexec
     test_proj = Base.active_project()
-    cmd = `$mpiexec_cmd -n $nprocs $(Base.julia_cmd()) --project=$test_proj $test_file`
+    cmd = `$mpiexec_cmd -n $nprocs $(Base.julia_cmd()) --threads=$nthreads --project=$test_proj $test_file`
     proc = run(ignorestatus(cmd))
     ok = success(proc)
     if ok != expect_success

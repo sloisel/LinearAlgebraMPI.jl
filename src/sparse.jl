@@ -764,13 +764,24 @@ function _merge_thread_columns(m::Int, n::Int, thread_cols, thread_colptrs, thre
 end
 
 """
-    ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}) where {Tv,Ti}
+    ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads=Threads.nthreads()) where {Tv,Ti}
 
-Multithreaded sparse matrix multiplication by splitting B into column blocks
-and computing A * B_block in parallel using Julia's optimized builtin *.
+Multithreaded sparse matrix multiplication. Splits B into column blocks
+and computes `A * B_block` in parallel using Julia's optimized builtin `*`.
 
-This leverages the highly-tuned single-threaded implementation while
-parallelizing at the block level.
+# Threading behavior
+- Uses at most `n ÷ 100` threads, where `n = size(B, 2)`, ensuring at least 100 columns per thread
+- Falls back to single-threaded `A * B` when `n < 100` or when threading overhead would dominate
+- The `max_threads` keyword limits the maximum number of threads used
+
+# Examples
+```julia
+using SparseArrays
+A = sprand(1000, 1000, 0.01)
+B = sprand(1000, 500, 0.01)
+C = A ⊛ B                    # Use all available threads (up to n÷100)
+C = ⊛(A, B; max_threads=2)   # Limit to 2 threads
+```
 """
 function ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads::Int=Threads.nthreads()) where {Tv,Ti}
     n = size(B, 2)
