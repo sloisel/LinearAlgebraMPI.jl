@@ -76,6 +76,7 @@ Returns the pivot indices for each fully summed column.
 function partial_factor!(F::FrontalMatrix{T}) where T
     nfs = F.nfs
     nrows = size(F.F, 1)
+    ncols = size(F.F, 2)
     pivots = collect(1:nfs)
 
     for k = 1:nfs
@@ -94,7 +95,7 @@ function partial_factor!(F::FrontalMatrix{T}) where T
 
         # Swap rows if needed
         if piv_row != k
-            for j = 1:nrows  # Swap entire row
+            for j = 1:ncols  # Swap entire row
                 F.F[k, j], F.F[piv_row, j] = F.F[piv_row, j], F.F[k, j]
             end
             F.row_indices[k], F.row_indices[piv_row] =
@@ -116,12 +117,24 @@ function partial_factor!(F::FrontalMatrix{T}) where T
             F.F[i, k] /= diag_val
         end
 
-        # Update trailing matrix (Schur complement)
-        for j = k+1:nrows
-            for i = k+1:nrows
-                F.F[i, j] -= F.F[i, k] * F.F[k, j]
+        # Rank-1 updates with deferred Schur complement:
+        # 1. Update fully summed rows (k+1:nfs) - full width for correct U values
+        # 2. Update rows for L columns (nfs+1:nrows, k+1:nfs)
+        # 3. Defer Schur complement (nfs+1:nrows, nfs+1:ncols) for batched gemm
+        if k < nfs
+            # Fully summed rows: need full width for correct U row values
+            BLAS.ger!(-one(T), view(F.F, k+1:nfs, k), view(F.F, k, k+1:ncols), view(F.F, k+1:nfs, k+1:ncols))
+            # Update rows: only L columns (defer Schur complement)
+            if nfs < nrows
+                BLAS.ger!(-one(T), view(F.F, nfs+1:nrows, k), view(F.F, k, k+1:nfs), view(F.F, nfs+1:nrows, k+1:nfs))
             end
         end
+    end
+
+    # Batched Schur complement update using BLAS Level-3
+    # F[nfs+1:nrows, nfs+1:ncols] -= L[nfs+1:nrows, 1:nfs] * U[1:nfs, nfs+1:ncols]
+    if nfs < nrows && nfs < ncols
+        BLAS.gemm!('N', 'N', -one(T), view(F.F, nfs+1:nrows, 1:nfs), view(F.F, 1:nfs, nfs+1:ncols), one(T), view(F.F, nfs+1:nrows, nfs+1:ncols))
     end
 
     F.pivots = pivots
@@ -305,21 +318,31 @@ function partial_factor_ldlt!(F::FrontalMatrix{T}) where T
                 F.F[i, k] /= d_kk
             end
 
-            # Symmetric Schur complement update
-            for j = k+1:nrows
-                ljk = F.F[j, k]
-                ljk_dk = ljk * d_kk
-                for i = j:nrows  # Only lower triangle
-                    F.F[i, j] -= F.F[i, k] * ljk_dk
+            # Symmetric Schur complement update with batched deferred update:
+            # 1. Update fully summed block (k+1:nfs) - full update for pivot selection
+            # 2. Update L columns for update rows (nfs+1:nrows, k+1:nfs)
+            # 3. Defer Schur complement (nfs+1:nrows, nfs+1:nrows) for batched gemm
+            if k < nfs
+                # Update fully summed block (lower triangle)
+                BLAS.syr!('L', -d_kk, view(F.F, k+1:nfs, k), view(F.F, k+1:nfs, k+1:nfs))
+                # Mirror to upper for subsequent iterations within fully summed block
+                for j = k+1:nfs
+                    for i = j+1:nfs
+                        F.F[j, i] = F.F[i, j]
+                    end
+                end
+                # Update L columns for update rows (lower triangle only, cols k+1:nfs)
+                if nfs < nrows
+                    for j = k+1:nfs
+                        ljk = F.F[j, k]
+                        ljk_dk = ljk * d_kk
+                        for i = nfs+1:nrows
+                            F.F[i, j] -= F.F[i, k] * ljk_dk
+                        end
+                    end
                 end
             end
-
-            # Mirror to upper triangle for subsequent iterations
-            for j = k+1:nrows
-                for i = j+1:nrows
-                    F.F[j, i] = F.F[i, j]
-                end
-            end
+            # DON'T update F[nfs+1:nrows, nfs+1:nrows] - batched at the end
 
             k += 1
 
@@ -357,39 +380,87 @@ function partial_factor_ldlt!(F::FrontalMatrix{T}) where T
                 f_ik = F.F[i, k]
                 f_ik1 = F.F[i, k+1]
 
-                # L[i,k] = f_ik * inv_d_kk + f_ik1 * inv_d_k1k
-                # L[i,k+1] = f_ik * inv_d_k1k + f_ik1 * inv_d_k1k1
                 F.F[i, k] = f_ik * inv_d_kk + f_ik1 * inv_d_k1k
                 F.F[i, k+1] = f_ik * inv_d_k1k + f_ik1 * inv_d_k1k1
             end
 
-            # Symmetric Schur complement update using 2×2 block
-            # F[i,j] -= L[i,k:k+1] * D_block * L[j,k:k+1]'
-            for j = k+2:nrows
-                ljk = F.F[j, k]
-                ljk1 = F.F[j, k+1]
-
-                # D * L[j,:]' = [d_kk*ljk + d_k1k*ljk1; d_k1k*ljk + d_k1k1*ljk1]
-                dl_j0 = d_kk * ljk + d_k1k * ljk1
-                dl_j1 = d_k1k * ljk + d_k1k1 * ljk1
-
-                for i = j:nrows  # Only lower triangle
-                    lik = F.F[i, k]
-                    lik1 = F.F[i, k+1]
-
-                    # L[i,:] * D * L[j,:]'
-                    F.F[i, j] -= lik * dl_j0 + lik1 * dl_j1
+            # Symmetric Schur complement update with batched deferred update
+            if k + 2 <= nfs
+                # Update fully summed block
+                for j = k+2:nfs
+                    ljk = F.F[j, k]
+                    ljk1 = F.F[j, k+1]
+                    dl_j0 = d_kk * ljk + d_k1k * ljk1
+                    dl_j1 = d_k1k * ljk + d_k1k1 * ljk1
+                    for i = j:nfs
+                        lik = F.F[i, k]
+                        lik1 = F.F[i, k+1]
+                        F.F[i, j] -= lik * dl_j0 + lik1 * dl_j1
+                    end
+                end
+                # Mirror to upper for subsequent iterations
+                for j = k+2:nfs
+                    for i = j+1:nfs
+                        F.F[j, i] = F.F[i, j]
+                    end
+                end
+                # Update L columns for update rows
+                if nfs < nrows
+                    for j = k+2:nfs
+                        ljk = F.F[j, k]
+                        ljk1 = F.F[j, k+1]
+                        dl_j0 = d_kk * ljk + d_k1k * ljk1
+                        dl_j1 = d_k1k * ljk + d_k1k1 * ljk1
+                        for i = nfs+1:nrows
+                            lik = F.F[i, k]
+                            lik1 = F.F[i, k+1]
+                            F.F[i, j] -= lik * dl_j0 + lik1 * dl_j1
+                        end
+                    end
                 end
             end
-
-            # Mirror to upper triangle
-            for j = k+2:nrows
-                for i = j+1:nrows
-                    F.F[j, i] = F.F[i, j]
-                end
-            end
+            # DON'T update F[nfs+1:nrows, nfs+1:nrows] - batched at the end
 
             k += 2
+        end
+    end
+
+    # Batched Schur complement update: S -= L * D * L'
+    # where L = F[nfs+1:nrows, 1:nfs], D = block diagonal from D_local
+    if nfs < nrows
+        m = nrows - nfs
+        # Compute LD = L * D (column by column, accounting for D structure)
+        LD = Matrix{T}(undef, m, nfs)
+        j = 1
+        while j <= nfs
+            if pivot_info[j] > 0
+                # 1×1 pivot: LD[:, j] = L[:, j] * D[j]
+                d_j = T(D_local[j])
+                for i = 1:m
+                    LD[i, j] = F.F[nfs + i, j] * d_j
+                end
+                j += 1
+            else
+                # 2×2 pivot: LD[:, j:j+1] = L[:, j:j+1] * D_block
+                d_kk, d_k1k, d_k1k1 = D_local[j]
+                for i = 1:m
+                    l_ij = F.F[nfs + i, j]
+                    l_ij1 = F.F[nfs + i, j + 1]
+                    LD[i, j] = l_ij * d_kk + l_ij1 * d_k1k
+                    LD[i, j + 1] = l_ij * d_k1k + l_ij1 * d_k1k1
+                end
+                j += 2
+            end
+        end
+        # S -= LD * L' using BLAS Level-3
+        L = view(F.F, nfs+1:nrows, 1:nfs)
+        S = view(F.F, nfs+1:nrows, nfs+1:nrows)
+        BLAS.gemm!('N', 'T', -one(T), LD, L, one(T), S)
+        # Mirror lower to upper
+        for j = 1:m
+            for i = j+1:m
+                S[j, i] = S[i, j]
+            end
         end
     end
 
