@@ -75,6 +75,23 @@ B_imag = imag(Adist_complex)
 bi_sum = sum(B_imag)
 @test bi_sum ≈ sum(imag.(A_complex)) atol=TOL
 
+# Test floor/ceil/round/map
+B_floor = floor(Adist)
+bf_sum = sum(B_floor)
+@test bf_sum ≈ sum(floor.(A_global.nzval)) atol=TOL
+
+B_ceil = ceil(Adist)
+bc_sum = sum(B_ceil)
+@test bc_sum ≈ sum(ceil.(A_global.nzval)) atol=TOL
+
+B_round = round(Adist)
+br_sum = sum(B_round)
+@test br_sum ≈ sum(round.(A_global.nzval)) atol=TOL
+
+B_map = map(x -> x^2 + 1, Adist)
+bm_sum = sum(B_map)
+@test bm_sum ≈ sum(x -> x^2 + 1, A_global.nzval) atol=TOL
+
 
 println(io0(), "[test] Reductions")
 
@@ -141,6 +158,22 @@ full_d1 = similar(d1.v, sum(counts_d1))
 MPI.Allgatherv!(d1.v, MPI.VBuffer(full_d1, counts_d1), comm)
 err2 = norm(full_d1 - ref_d1)
 @test err2 < TOL
+
+# Test sub-diagonal (negative k)
+dm1 = diag(Adist, -1)
+ref_dm1 = diag(A_global, -1)
+counts_dm1 = Int32[dm1.partition[r+2] - dm1.partition[r+1] for r in 0:nranks-1]
+full_dm1 = similar(dm1.v, sum(counts_dm1))
+MPI.Allgatherv!(dm1.v, MPI.VBuffer(full_dm1, counts_dm1), comm)
+err3 = norm(full_dm1 - ref_dm1)
+@test err3 < TOL
+
+# Test empty diagonal (k too large)
+d_empty = diag(Adist, n + 5)
+@test length(d_empty) == 0
+
+d_empty2 = diag(Adist, -(n + 5))
+@test length(d_empty2) == 0
 
 
 println(io0(), "[test] Triangular parts")

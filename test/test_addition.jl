@@ -92,6 +92,26 @@ C_ref_dist3 = SparseMatrixMPI{Float64}(C_ref3)
 err3 = norm(Cdist3 - C_ref_dist3, Inf)
 @test err3 < TOL
 
+println(io0(), "[test] Cached addition path")
+
+# Test that repeating the same addition uses the cached plan
+Cdist3_repeat = Adist3 + Bdist3
+err3_repeat = norm(Cdist3_repeat - C_ref_dist3, Inf)
+@test err3_repeat < TOL
+
+println(io0(), "[test] Cached subtraction path")
+
+# Test that repeating the same subtraction uses the cached plan
+Ddist = Adist3 - Bdist3
+D_ref = A3 - B3
+D_ref_dist = SparseMatrixMPI{Float64}(D_ref)
+err_sub1 = norm(Ddist - D_ref_dist, Inf)
+@test err_sub1 < TOL
+
+Ddist_repeat = Adist3 - Bdist3
+err_sub2 = norm(Ddist_repeat - D_ref_dist, Inf)
+@test err_sub2 < TOL
+
 end  # QuietTestSet
 
 # Aggregate counts across ranks

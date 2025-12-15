@@ -46,39 +46,6 @@ function compress_AT(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int}) where
 end
 
 """
-    reindex_to_union(AT, old_col_indices, union_indices)
-
-Reindex AT's rowval from old_col_indices space to union_indices space.
-AT.rowval contains local indices into old_col_indices; converts to local indices into union_indices.
-"""
-function reindex_to_union(AT::SparseMatrixCSC{T,Int},
-    old_col_indices::Vector{Int},
-    union_indices::Vector{Int}) where T
-    if isempty(AT.rowval)
-        return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, Int[], T[])
-    end
-    # Map global indices to union indices
-    global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
-    # Convert: local in old → global → local in union
-    new_rowval = [global_to_union[old_col_indices[r]] for r in AT.rowval]
-    return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, new_rowval, AT.nzval)
-end
-
-"""
-    reindex_global_to_union(AT, union_indices)
-
-Reindex AT's rowval from global indices to union_indices space.
-"""
-function reindex_global_to_union(AT::SparseMatrixCSC{T,Int}, union_indices::Vector{Int}) where T
-    if isempty(AT.rowval)
-        return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, Int[], T[])
-    end
-    global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
-    new_rowval = [global_to_union[r] for r in AT.rowval]
-    return SparseMatrixCSC(length(union_indices), AT.n, AT.colptr, new_rowval, AT.nzval)
-end
-
-"""
     reindex_to_union_cached(AT, col_to_union_map, union_size)
 
 Optimized reindex using precomputed mapping vector.
