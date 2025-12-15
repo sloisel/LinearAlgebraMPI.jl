@@ -134,9 +134,6 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
     rows_needed_from = [Int[] for _ in 1:nranks]  # rows_needed_from[r+1] = rows we need from rank r
     for row in my_row_start:my_row_end
         owner = searchsortedlast(B.row_partition, row) - 1
-        if owner >= nranks
-            owner = nranks - 1
-        end
         push!(rows_needed_from[owner + 1], row)
     end
 
@@ -173,15 +170,11 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
     B_row_start = B.row_partition[rank + 1]
 
     # Prepare send buffers: pack row data
-    send_data = Dict{Int, Vector{UInt8}}()
-    send_data_reqs = MPI.Request[]
-
+    send_data = Vector{Vector{UInt8}}(undef, nranks)
     for r in 0:nranks-1
-        if r == rank
-            continue
-        end
         rows = get(rows_to_send, r, Int[])
-        if isempty(rows)
+        if isempty(rows) || r == rank
+            send_data[r + 1] = UInt8[]
             continue
         end
 
@@ -202,10 +195,35 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
                 write(io, BT.nzval[ptr])
             end
         end
-        send_data[r] = take!(io)
-        req = MPI.Isend(send_data[r], comm; dest=r, tag=81)
-        push!(send_data_reqs, req)
+        send_data[r + 1] = take!(io)
     end
+
+    # Exchange message sizes so we know how much to receive
+    send_sizes = Int32[length(send_data[r + 1]) for r in 0:nranks-1]
+    recv_sizes = MPI.Alltoall(MPI.UBuffer(send_sizes, 1), comm)
+
+    # Now send and receive row data with known sizes
+    send_data_reqs = MPI.Request[]
+    for r in 0:nranks-1
+        if r != rank && send_sizes[r + 1] > 0
+            req = MPI.Isend(send_data[r + 1], comm; dest=r, tag=81)
+            push!(send_data_reqs, req)
+        end
+    end
+
+    recv_data = Vector{Vector{UInt8}}(undef, nranks)
+    recv_data_reqs = MPI.Request[]
+    for r in 0:nranks-1
+        if r != rank && recv_sizes[r + 1] > 0
+            recv_data[r + 1] = Vector{UInt8}(undef, recv_sizes[r + 1])
+            req = MPI.Irecv!(recv_data[r + 1], comm; source=r, tag=81)
+            push!(recv_data_reqs, req)
+        else
+            recv_data[r + 1] = UInt8[]
+        end
+    end
+
+    MPI.Waitall(vcat(send_data_reqs, recv_data_reqs))
 
     # Receive row data and compare with A's local rows
     local_match = true
@@ -252,24 +270,18 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
         end
     end
 
-    # Now receive and compare rows from other ranks
+    # Now compare rows received from other ranks
     for r in 0:nranks-1
-        if r == rank || send_counts[r + 1] == 0
+        if r == rank || isempty(recv_data[r + 1])
             continue
         end
+
         if !local_match
-            # Still need to receive to avoid deadlock
-            MPI.Recv!(Vector{UInt8}(undef, 0), comm; source=r, tag=81)
+            # Already know it doesn't match, data already received
             continue
         end
 
-        # Probe to get message size
-        status = MPI.Probe(comm; source=r, tag=81)
-        count = MPI.Get_count(status, UInt8)
-        recv_buf = Vector{UInt8}(undef, count)
-        MPI.Recv!(recv_buf, comm; source=r, tag=81)
-
-        io = IOBuffer(recv_buf)
+        io = IOBuffer(recv_data[r + 1])
         for global_row in rows_needed_from[r + 1]
             local_row_A = global_row - A_row_start + 1
 
@@ -306,8 +318,6 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
             end
         end
     end
-
-    MPI.Waitall(send_data_reqs)
 
     # Allreduce to check if all ranks matched
     global_match = MPI.Allreduce(local_match ? 1 : 0, MPI.BAND, comm)

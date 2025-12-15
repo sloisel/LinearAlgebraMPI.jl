@@ -427,6 +427,43 @@ err = norm(A_full * x_full - b_full, Inf)
 println(io0(), "  solve! residual: $err")
 @test err < TOL
 
+
+# Test 16: issymmetric with asymmetric partitions (exercises cross-rank row comparison)
+println(io0(), "[test] issymmetric with asymmetric partitions - symmetric matrix")
+
+# Use size that guarantees different partitions with 4 ranks
+# n=12: uniform gives [1,4,7,10,13], we use [1,3,6,9,13] for columns
+n_asym = 12
+A_sym_full_asym = create_spd_tridiagonal(n_asym)
+row_part = LinearAlgebraMPI.uniform_partition(n_asym, nranks)
+# Create a different valid partition: sizes 2,3,3,4 instead of 3,3,3,3
+col_part = if nranks == 4
+    [1, 3, 6, 9, 13]
+else
+    # For other rank counts, just offset by 1 where possible
+    rp = copy(row_part)
+    for i in 2:length(rp)-1
+        if rp[i] + 1 < rp[i+1]
+            rp[i] += 1
+            break
+        end
+    end
+    rp
+end
+
+A_asym = SparseMatrixMPI{Float64}(A_sym_full_asym; row_partition=row_part, col_partition=col_part)
+@test issymmetric(A_asym) == true
+println(io0(), "  Symmetric matrix with asymmetric partitions: passed")
+
+
+# Test 17: issymmetric with asymmetric partitions - non-symmetric matrix
+println(io0(), "[test] issymmetric with asymmetric partitions - non-symmetric matrix")
+
+A_nonsym_full_asym = create_general_tridiagonal(n_asym)  # Has -0.5 above diagonal, -0.8 below
+A_nonsym_asym = SparseMatrixMPI{Float64}(A_nonsym_full_asym; row_partition=row_part, col_partition=col_part)
+@test issymmetric(A_nonsym_asym) == false
+println(io0(), "  Non-symmetric matrix with asymmetric partitions: passed")
+
 end  # QuietTestSet
 
 # Aggregate results across ranks
