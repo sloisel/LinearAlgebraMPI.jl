@@ -12,6 +12,35 @@ using MUMPS: Mumps, set_icntl!, MUMPS_INT, MUMPS_INT8, suppress_printing!
 import MUMPS: invoke_mumps_unsafe!
 
 # ============================================================================
+# MUMPS Automatic Finalization Management
+# ============================================================================
+#
+# MUMPS cleanup requires synchronized MPI calls across all ranks, but Julia's
+# GC runs asynchronously on each rank. This system handles automatic cleanup:
+#
+# 1. Each MUMPS factorization gets a unique integer ID (_mumps_count)
+# 2. Objects are registered in _mumps_registry by ID
+# 3. Julia's GC finalizer queues the ID to _destroy_list (no MPI calls)
+# 4. When creating a new factorization, _process_finalizers() is called:
+#    - All ranks broadcast their _destroy_list
+#    - Lists are merged, sorted, uniqued
+#    - Objects are finalized in deterministic order across all ranks
+#
+# This ensures synchronized cleanup without blocking in finalizers.
+
+# Global counter for unique MUMPS object IDs
+const _mumps_count = Ref{Int}(0)
+
+# Registry mapping ID -> MUMPSFactorizationMPI (prevents GC until removed from registry)
+const _mumps_registry = Dict{Int, Any}()
+
+# List of MUMPS IDs queued for destruction by this rank's GC
+const _destroy_list = Int[]
+
+# Lock for thread-safe access to _destroy_list (finalizers may run from GC thread)
+const _destroy_list_lock = ReentrantLock()
+
+# ============================================================================
 # MUMPS Factorization Type
 # ============================================================================
 
@@ -20,9 +49,12 @@ import MUMPS: invoke_mumps_unsafe!
 
 Distributed MUMPS factorization result. Can be reused for multiple solves.
 
-**Important:** Call `finalize!(F)` when done to release MUMPS resources.
+Factorization objects are automatically cleaned up when garbage collected,
+with synchronized finalization across MPI ranks. Manual `finalize!(F)` is
+still available for explicit control (must be called on all ranks together).
 """
 mutable struct MUMPSFactorizationMPI{T}
+    id::Int  # Unique ID for finalization tracking
     mumps::Any  # Mumps{T,R} where R is the real type (Float64 for both real and complex)
     irn_loc::Vector{MUMPS_INT}
     jcn_loc::Vector{MUMPS_INT}
@@ -35,6 +67,72 @@ end
 
 Base.size(F::MUMPSFactorizationMPI) = (F.n, F.n)
 Base.eltype(::MUMPSFactorizationMPI{T}) where T = T
+
+# ============================================================================
+# Automatic Finalization Functions
+# ============================================================================
+
+"""
+    _queue_for_destruction(F::MUMPSFactorizationMPI)
+
+Julia finalizer callback. Queues the factorization ID for later synchronized
+destruction. Does NOT call MPI (unsafe from GC thread).
+"""
+function _queue_for_destruction(F::MUMPSFactorizationMPI)
+    lock(_destroy_list_lock) do
+        push!(_destroy_list, F.id)
+    end
+    return nothing
+end
+
+"""
+    _process_finalizers()
+
+Process pending MUMPS finalizations in a synchronized manner across all ranks.
+This is a **collective operation** - all ranks must call it together.
+
+Called automatically when creating new factorizations. Gathers pending
+destruction requests from all ranks, merges them, and finalizes in
+deterministic order.
+"""
+function _process_finalizers()
+    comm = MPI.COMM_WORLD
+    nranks = MPI.Comm_size(comm)
+
+    # Thread-safe: detach current destroy list, replace with empty
+    local_list = lock(_destroy_list_lock) do
+        list = copy(_destroy_list)
+        empty!(_destroy_list)
+        list
+    end
+
+    # Allgather counts of how many IDs each rank has
+    local_count = Int32(length(local_list))
+    all_counts = MPI.Allgather(local_count, comm)
+
+    # Allgatherv to collect all IDs from all ranks
+    total_count = sum(all_counts)
+    if total_count == 0
+        return  # Nothing to finalize
+    end
+
+    all_ids = Vector{Int}(undef, total_count)
+    MPI.Allgatherv!(local_list, MPI.VBuffer(all_ids, all_counts), comm)
+
+    # Sort and unique to get deterministic order across all ranks
+    dead_list = sort!(unique(all_ids))
+
+    # Finalize each in order (check registry to avoid double-finalize)
+    for id in dead_list
+        if haskey(_mumps_registry, id)
+            F = _mumps_registry[id]
+            delete!(_mumps_registry, id)
+            # Actually finalize the MUMPS object
+            F.mumps._finalized = false
+            MUMPS.finalize!(F.mumps)
+        end
+    end
+end
 
 # ============================================================================
 # Extract COO from SparseMatrixMPI
@@ -96,6 +194,13 @@ function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) whe
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
+    # Process any pending finalizations first (collective operation)
+    _process_finalizers()
+
+    # Assign unique ID for this factorization
+    id = _mumps_count[]
+    _mumps_count[] += 1
+
     m, n = size(A)
     @assert m == n "Matrix must be square for factorization"
 
@@ -107,7 +212,7 @@ function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) whe
     # sym=0: unsymmetric, sym=1: SPD, sym=2: general symmetric
     mumps_sym = symmetric ? MUMPS.mumps_definite : MUMPS.mumps_unsymmetric
     mumps = Mumps{T}(mumps_sym, MUMPS.default_icntl, MUMPS.default_cntl64)
-    mumps._finalized = true  # Disable GC finalizer to avoid post-MPI crash
+    mumps._finalized = true  # Disable MUMPS GC finalizer to avoid post-MPI crash
 
     # Suppress all MUMPS output
     suppress_printing!(mumps)
@@ -142,10 +247,19 @@ function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) whe
     # Pre-allocate RHS buffer on rank 0
     rhs_buffer = rank == 0 ? zeros(T, n) : T[]
 
-    return MUMPSFactorizationMPI{T}(
-        mumps, irn_loc, jcn_loc, a_loc,
+    # Create factorization object with ID
+    F = MUMPSFactorizationMPI{T}(
+        id, mumps, irn_loc, jcn_loc, a_loc,
         n, symmetric, copy(A.row_partition), rhs_buffer
     )
+
+    # Register in global registry (prevents GC until removed)
+    _mumps_registry[id] = F
+
+    # Attach Julia finalizer to queue for synchronized destruction
+    finalizer(_queue_for_destruction, F)
+
+    return F
 end
 
 """
@@ -168,7 +282,7 @@ end
 
 Compute LU factorization of a distributed sparse matrix using MUMPS.
 Returns a `MUMPSFactorizationMPI` for use with `\\` or `solve`.
-Call `finalize!(F)` when done.
+Factorization is automatically cleaned up when garbage collected.
 """
 function LinearAlgebra.lu(A::SparseMatrixMPI{T}) where T
     return _create_mumps_factorization(A, false)
@@ -180,7 +294,7 @@ end
 Compute LDLT factorization of a distributed symmetric sparse matrix using MUMPS.
 The matrix must be symmetric; only the lower triangular part is used.
 Returns a `MUMPSFactorizationMPI` for use with `\\` or `solve`.
-Call `finalize!(F)` when done.
+Factorization is automatically cleaned up when garbage collected.
 """
 function LinearAlgebra.ldlt(A::SparseMatrixMPI{T}) where T
     return _create_mumps_factorization(A, true)
@@ -257,9 +371,22 @@ end
 """
     finalize!(F::MUMPSFactorizationMPI)
 
-Release MUMPS resources. Must be called when done with the factorization.
+Manually release MUMPS resources. This is a **collective operation** - all
+ranks must call it together for immediate cleanup.
+
+If the factorization has already been cleaned up (by automatic finalization
+or a previous manual call), this is a no-op but all ranks must still call it.
 """
 function finalize!(F::MUMPSFactorizationMPI)
+    # Check if already finalized (removed from registry)
+    if !haskey(_mumps_registry, F.id)
+        return F  # Already finalized, no-op
+    end
+
+    # Remove from registry
+    delete!(_mumps_registry, F.id)
+
+    # Actually finalize the MUMPS object
     F.mumps._finalized = false  # Re-enable MUMPS finalization
     MUMPS.finalize!(F.mumps)
     return F

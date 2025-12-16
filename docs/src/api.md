@@ -428,7 +428,10 @@ solve
 solve!
 ```
 
-### Releasing Factorization Resources
+### Manual Cleanup (Optional)
+
+Factorization objects are automatically cleaned up when garbage collected.
+For explicit control, `finalize!` can be called manually (must be called on all ranks together).
 
 ```@docs
 finalize!
@@ -456,14 +459,14 @@ x = solve(F, b)
 # Or use backslash
 x = F \ b
 
-# Release factorization resources when done
-finalize!(F)
+# F is automatically cleaned up when garbage collected
+# (or call finalize!(F) for immediate cleanup on all ranks)
 
 # For non-symmetric matrices, use LU
 A_nonsym = SparseMatrixMPI{Float64}(sprand(1000, 1000, 0.01) + 10I)
 F_lu = lu(A_nonsym)
 x = F_lu \ b
-finalize!(F_lu)
+# F_lu is automatically cleaned up when garbage collected
 ```
 
 ### Direct Solve Syntax
@@ -481,7 +484,7 @@ x = transpose(b) / A           # solve x*A = transpose(b)
 x = transpose(b) / transpose(A)  # solve x*transpose(A) = transpose(b)
 ```
 
-Note: One-shot solves like `A \ b` automatically clean up the factorization. For repeated solves with the same matrix, compute the factorization once with `lu()` or `ldlt()`, reuse it, then call `finalize!()` when done.
+Note: Factorizations are automatically cleaned up when garbage collected. Cleanup is synchronized across MPI ranks when the next factorization is created.
 
 ## Cache Management
 
