@@ -2054,7 +2054,9 @@ Extract the k-th diagonal of A as a VectorMPI.
 - k>0: k-th superdiagonal
 - k<0: |k|-th subdiagonal
 
-The result is distributed across ranks with an even partition.
+The result partition is derived from A's row partition: diagonal element d
+is at row (row_offset + d), so the rank owning that row owns element d.
+This is a purely local operation with no MPI communication.
 """
 function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
     comm = MPI.COMM_WORLD
@@ -2063,7 +2065,7 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
 
     m, n = size(A)
 
-    # Compute diagonal length
+    # Compute diagonal length and offsets
     if k >= 0
         diag_len = min(m, n - k)
         row_offset = 0
@@ -2081,31 +2083,37 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
         return VectorMPI{T}(hash, partition, T[])
     end
 
-    # Each rank extracts diagonal elements from its rows
+    # Compute result partition from A's row partition (no communication needed)
+    # Diagonal element d is at row (row_offset + d)
+    # Rank r owns rows [A.row_partition[r+1], A.row_partition[r+2] - 1]
+    # So rank r owns diagonal elements d where (row_offset + d) is in that range
+    # i.e., d in [A.row_partition[r+1] - row_offset, A.row_partition[r+2] - row_offset - 1]
+    result_partition = Vector{Int}(undef, nranks + 1)
+    for r in 0:(nranks-1)
+        first_d = A.row_partition[r+1] - row_offset
+        result_partition[r+1] = clamp(first_d, 1, diag_len + 1)
+    end
+    result_partition[nranks+1] = diag_len + 1
+
+    # My diagonal element range
+    my_diag_start = result_partition[rank+1]
+    my_diag_end = result_partition[rank+2] - 1
+    my_diag_len = max(0, my_diag_end - my_diag_start + 1)
+
+    # Extract local diagonal elements (no communication!)
     my_row_start = A.row_partition[rank+1]
-    my_row_end = A.row_partition[rank+2] - 1
+    local_diag = Vector{T}(undef, my_diag_len)
 
-    # Build full diagonal using Allreduce (each rank contributes its portion)
-    full_diag = zeros(T, diag_len)
-    for d in 1:diag_len
-        global_row = row_offset + d
+    for i in 1:my_diag_len
+        d = my_diag_start + i - 1
+        local_row = (row_offset + d) - my_row_start + 1
         global_col = col_offset + d
-
-        if global_row >= my_row_start && global_row <= my_row_end
-            local_row = global_row - my_row_start + 1
-            # Use binary search to find the element at (local_row, global_col)
-            val = _find_nzval_at_global_col(A, local_row, global_col)
-            if val !== nothing
-                full_diag[d] = val
-            end
-        end
+        val = _find_nzval_at_global_col(A, local_row, global_col)
+        local_diag[i] = val === nothing ? zero(T) : val
     end
 
-    # Allreduce combines contributions (only one rank has each element)
-    global_diag = MPI.Allreduce(full_diag, MPI.SUM, comm)
-
-    # Create VectorMPI from the global diagonal
-    return VectorMPI(global_diag; comm=comm)
+    hash = compute_partition_hash(result_partition)
+    return VectorMPI{T}(hash, result_partition, local_diag)
 end
 
 """
@@ -2462,12 +2470,43 @@ function _compute_spdiagm_size(kv::Pair{<:Integer,<:VectorMPI}...)
 end
 
 """
+    _diag_target_partition(row_partition::Vector{Int}, k::Integer, vec_len::Int) -> Vector{Int}
+
+Compute the target partition for repartitioning a vector v of length vec_len
+for use in diagonal k of a matrix with the given row_partition.
+
+For diagonal k:
+- k >= 0: vec_idx = global_row (element v[i] goes to position (i, i+k))
+- k < 0: vec_idx = global_row + k (element v[i] goes to position (i-k, i))
+
+The target partition ensures each rank owns the vector elements it needs for its rows.
+"""
+function _diag_target_partition(row_partition::Vector{Int}, k::Integer, vec_len::Int)
+    nranks = length(row_partition) - 1
+    target = Vector{Int}(undef, nranks + 1)
+
+    for r in 0:(nranks-1)
+        if k >= 0
+            # vec_idx = global_row, so we need v starting at row_partition[r+1]
+            target[r+1] = min(row_partition[r+1], vec_len + 1)
+        else
+            # vec_idx = global_row + k, so we need v starting at row_partition[r+1] + k
+            target[r+1] = clamp(row_partition[r+1] + k, 1, vec_len + 1)
+        end
+    end
+    target[nranks+1] = vec_len + 1
+
+    return target
+end
+
+"""
     spdiagm(kv::Pair{<:Integer, <:VectorMPI}...)
 
 Construct a sparse diagonal SparseMatrixMPI from pairs of diagonals and VectorMPI vectors.
 
-This is a distributed implementation that only gathers the vector elements each rank
-needs for its local rows, rather than gathering the entire vector to all ranks.
+Uses `repartition` to redistribute vector elements to the ranks that need them.
+This provides plan caching for repeated operations and a fast path when partitions
+already match (no communication needed).
 
 # Example
 ```julia
@@ -2489,83 +2528,35 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
         T = promote_type(T, eltype(v))
     end
 
-    # Step 1: Compute output dimensions
+    # Step 1: Compute output dimensions and row partition
+    # Julia's spdiagm(kv...) returns a square matrix by default
     m, n = _compute_spdiagm_size(kv...)
-
-    # Step 2: Compute output row partition (standard balanced partition)
-    rows_per_rank = div(m, nranks)
-    row_remainder = mod(m, nranks)
-    row_partition = Vector{Int}(undef, nranks + 1)
-    row_partition[1] = 1
-    for r in 1:nranks
-        extra = r <= row_remainder ? 1 : 0
-        row_partition[r+1] = row_partition[r] + rows_per_rank + extra
-    end
+    sz = max(m, n)
+    m = n = sz
+    row_partition = uniform_partition(m, nranks)
 
     my_row_start = row_partition[rank+1]
     my_row_end = row_partition[rank+2] - 1
     local_nrows = my_row_end - my_row_start + 1
 
-    # Step 3: For each diagonal, determine which vector elements we need
-    # Diagonal k: v[i] at (row, col) where:
-    #   k >= 0: (i, i+k)
-    #   k < 0: (i+|k|, i)
-    needed_indices_per_diag = Dict{Int,Vector{Int}}()  # k => global vector indices
-
+    # Step 2: Repartition each vector to match the rows that need it
+    # Uses plan caching and has fast path when partitions already match
+    repartitioned = Dict{Int, VectorMPI}()
     for (k, v) in kv
-        vec_len = length(v)
-        indices = Int[]
-
-        for local_row_idx in 1:local_nrows
-            global_row = my_row_start + local_row_idx - 1
-
-            # Determine vector index for this row on diagonal k
-            if k >= 0
-                # v[i] at (i, i+k), so row = i => vec_idx = row
-                vec_idx = global_row
-                col = global_row + k
-            else
-                # v[i] at (i+|k|, i), so row = i+|k| => vec_idx = row - |k| = row + k
-                vec_idx = global_row + k
-                col = vec_idx
-            end
-
-            # Check if this row has an entry on this diagonal
-            if 1 <= vec_idx <= vec_len && 1 <= col <= n
-                push!(indices, vec_idx)
-            end
-        end
-
-        if !isempty(indices)
-            needed_indices_per_diag[k] = indices
-        end
+        target = _diag_target_partition(row_partition, k, length(v))
+        repartitioned[k] = repartition(v, target)
     end
 
-    # Step 4: Gather needed vector elements for each diagonal
-    # IMPORTANT: All ranks must call _gather_specific_elements for each diagonal
-    # to participate in MPI collectives, even if they need no elements
-    gathered_values = Dict{Int,Vector{T}}()
-
-    for (k, v) in kv
-        indices = get(needed_indices_per_diag, k, Int[])
-        gathered_values[k] = _gather_specific_elements(v, indices)
-    end
-
-    # Step 5: Build local triplets (local_row, global_col, value)
+    # Step 3: Build local triplets (local_row, global_col, value)
     local_I = Int[]
     local_J = Int[]
     local_V = T[]
 
     for (k, v) in kv
-        if !haskey(needed_indices_per_diag, k)
-            continue
-        end
-
-        indices = needed_indices_per_diag[k]
-        values = gathered_values[k]
         vec_len = length(v)
+        v_repart = repartitioned[k]
+        my_v_start = v_repart.partition[rank+1]
 
-        val_idx = 1
         for local_row_idx in 1:local_nrows
             global_row = my_row_start + local_row_idx - 1
 
@@ -2578,16 +2569,16 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
             end
 
             if 1 <= vec_idx <= vec_len && 1 <= col <= n
+                # Index into repartitioned vector
+                local_v_idx = vec_idx - my_v_start + 1
                 push!(local_I, local_row_idx)
                 push!(local_J, col)
-                push!(local_V, values[val_idx])
-                val_idx += 1
+                push!(local_V, v_repart.v[local_v_idx])
             end
         end
     end
 
-    # Step 6: Build M^T directly as CSC (swap I↔J), then wrap in lazy transpose for CSR
-    # This avoids an unnecessary physical transpose operation
+    # Step 4: Build M^T directly as CSC (swap I↔J), then wrap in lazy transpose for CSR
     AT_local = isempty(local_I) ?
         SparseMatrixCSC(n, local_nrows, ones(Int, local_nrows + 1), Int[], T[]) :
         sparse(local_J, local_I, local_V, n, local_nrows)
@@ -2600,8 +2591,9 @@ end
 
 Construct an m×n sparse diagonal SparseMatrixMPI from pairs of diagonals and VectorMPI vectors.
 
-This is a distributed implementation that only gathers the vector elements each rank
-needs for its local rows, rather than gathering the entire vector to all ranks.
+Uses `repartition` to redistribute vector elements to the ranks that need them.
+This provides plan caching for repeated operations and a fast path when partitions
+already match (no communication needed).
 
 # Example
 ```julia
@@ -2623,72 +2615,29 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
     end
 
     # Step 1: Compute output row partition
-    rows_per_rank = div(m, nranks)
-    row_remainder = mod(m, nranks)
-    row_partition = Vector{Int}(undef, nranks + 1)
-    row_partition[1] = 1
-    for r in 1:nranks
-        extra = r <= row_remainder ? 1 : 0
-        row_partition[r+1] = row_partition[r] + rows_per_rank + extra
-    end
+    row_partition = uniform_partition(m, nranks)
 
     my_row_start = row_partition[rank+1]
     my_row_end = row_partition[rank+2] - 1
     local_nrows = my_row_end - my_row_start + 1
 
-    # Step 2: For each diagonal, determine which vector elements we need
-    needed_indices_per_diag = Dict{Int,Vector{Int}}()
-
+    # Step 2: Repartition each vector to match the rows that need it
+    repartitioned = Dict{Int, VectorMPI}()
     for (k, v) in kv
-        vec_len = length(v)
-        indices = Int[]
-
-        for local_row_idx in 1:local_nrows
-            global_row = my_row_start + local_row_idx - 1
-
-            if k >= 0
-                vec_idx = global_row
-                col = global_row + k
-            else
-                vec_idx = global_row + k
-                col = vec_idx
-            end
-
-            if 1 <= vec_idx <= vec_len && 1 <= col <= n && 1 <= global_row <= m
-                push!(indices, vec_idx)
-            end
-        end
-
-        if !isempty(indices)
-            needed_indices_per_diag[k] = indices
-        end
+        target = _diag_target_partition(row_partition, k, length(v))
+        repartitioned[k] = repartition(v, target)
     end
 
-    # Step 3: Gather needed vector elements
-    # IMPORTANT: All ranks must call _gather_specific_elements for each diagonal
-    # to participate in MPI collectives, even if they need no elements
-    gathered_values = Dict{Int,Vector{T}}()
-
-    for (k, v) in kv
-        indices = get(needed_indices_per_diag, k, Int[])
-        gathered_values[k] = _gather_specific_elements(v, indices)
-    end
-
-    # Step 4: Build local triplets
+    # Step 3: Build local triplets
     local_I = Int[]
     local_J = Int[]
     local_V = T[]
 
     for (k, v) in kv
-        if !haskey(needed_indices_per_diag, k)
-            continue
-        end
-
-        indices = needed_indices_per_diag[k]
-        values = gathered_values[k]
         vec_len = length(v)
+        v_repart = repartitioned[k]
+        my_v_start = v_repart.partition[rank+1]
 
-        val_idx = 1
         for local_row_idx in 1:local_nrows
             global_row = my_row_start + local_row_idx - 1
 
@@ -2701,16 +2650,15 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
             end
 
             if 1 <= vec_idx <= vec_len && 1 <= col <= n && 1 <= global_row <= m
+                local_v_idx = vec_idx - my_v_start + 1
                 push!(local_I, local_row_idx)
                 push!(local_J, col)
-                push!(local_V, values[val_idx])
-                val_idx += 1
+                push!(local_V, v_repart.v[local_v_idx])
             end
         end
     end
 
-    # Step 5: Build M^T directly as CSC (swap I↔J), then wrap in lazy transpose for CSR
-    # This avoids an unnecessary physical transpose operation
+    # Step 4: Build M^T directly as CSC (swap I↔J), then wrap in lazy transpose for CSR
     AT_local = isempty(local_I) ?
         SparseMatrixCSC(n, local_nrows, ones(Int, local_nrows + 1), Int[], T[]) :
         sparse(local_J, local_I, local_V, n, local_nrows)

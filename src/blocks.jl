@@ -321,12 +321,36 @@ function Base.cat(vs::VectorMPI{T}...; dims) where T
 end
 
 """
+    _vcat_target_partition(output_partition::Vector{Int}, offset::Int, vec_len::Int) -> Vector{Int}
+
+Compute the target partition for repartitioning a vector for use in vcat.
+
+The vector starts at position (offset + 1) in the output. Each rank needs elements
+from this vector that fall within its output range.
+"""
+function _vcat_target_partition(output_partition::Vector{Int}, offset::Int, vec_len::Int)
+    nranks = length(output_partition) - 1
+    target = Vector{Int}(undef, nranks + 1)
+
+    for r in 0:(nranks-1)
+        # Rank r owns output indices [output_partition[r+1], output_partition[r+2]-1]
+        # From this vector (at offset), it needs indices starting at:
+        # max(1, output_partition[r+1] - offset)
+        target[r+1] = clamp(output_partition[r+1] - offset, 1, vec_len + 1)
+    end
+    target[nranks+1] = vec_len + 1
+
+    return target
+end
+
+"""
     _vcat_vectors(vs::VectorMPI{T}...) where T
 
 Vertically concatenate VectorMPI vectors.
 
-This is a distributed implementation that only gathers the vector elements each rank
-needs for its local output, rather than gathering all data to all ranks.
+Uses `repartition` to redistribute each input vector's elements to the ranks that
+need them for the output. This provides plan caching and a fast path when partitions
+already align (no communication needed).
 """
 function _vcat_vectors(vs::VectorMPI{T}...) where T
     length(vs) == 1 && return copy(vs[1])
@@ -341,14 +365,7 @@ function _vcat_vectors(vs::VectorMPI{T}...) where T
     offsets = [0; cumsum(lengths[1:end-1])]
 
     # Step 2: Compute output partition
-    elements_per_rank = div(total_length, nranks)
-    elem_remainder = mod(total_length, nranks)
-    output_partition = Vector{Int}(undef, nranks + 1)
-    output_partition[1] = 1
-    for r in 1:nranks
-        extra = r <= elem_remainder ? 1 : 0
-        output_partition[r+1] = output_partition[r] + elements_per_rank + extra
-    end
+    output_partition = uniform_partition(total_length, nranks)
 
     my_out_start = output_partition[rank+1]
     my_out_end = output_partition[rank+2] - 1
@@ -357,33 +374,31 @@ function _vcat_vectors(vs::VectorMPI{T}...) where T
     # Step 3: Allocate local output vector
     local_v = Vector{T}(undef, local_len)
 
-    # Step 4: For each input vector, gather elements (all ranks must participate)
+    # Step 4: For each input vector, repartition and copy elements
     for (vec_idx, v) in enumerate(vs)
-        vec_start = offsets[vec_idx] + 1
-        vec_end = offsets[vec_idx] + lengths[vec_idx]
+        vec_len = lengths[vec_idx]
+        offset = offsets[vec_idx]
+        vec_start = offset + 1
+        vec_end = offset + vec_len
 
-        # Determine indices we need from this vector
-        # NOTE: ALL ranks must call _gather_specific_elements for EVERY vector to
-        # participate in MPI collectives. Pass empty array if no overlap.
+        # Compute target partition for this vector and repartition
+        target = _vcat_target_partition(output_partition, offset, vec_len)
+        v_repart = repartition(v, target)
+        my_v_start = v_repart.partition[rank+1]
+
+        # Check if this vector contributes to my output range
         has_overlap = !(vec_end < my_out_start || vec_start > my_out_end)
 
         if has_overlap
-            first_in_vec = max(1, my_out_start - offsets[vec_idx])
-            last_in_vec = min(lengths[vec_idx], my_out_end - offsets[vec_idx])
-            indices_needed = collect(first_in_vec:last_in_vec)
-        else
-            indices_needed = Int[]
-        end
+            # Copy elements from repartitioned vector to output
+            first_in_vec = max(1, my_out_start - offset)
+            last_in_vec = min(vec_len, my_out_end - offset)
 
-        # Gather these elements (all ranks must call this!)
-        gathered = _gather_specific_elements(v, indices_needed)
-
-        # Place into local output (only if we have overlap)
-        if has_overlap
-            for (i, idx_in_vec) in enumerate(indices_needed)
-                global_out_idx = offsets[vec_idx] + idx_in_vec
+            for idx_in_vec in first_in_vec:last_in_vec
+                global_out_idx = offset + idx_in_vec
                 local_out_idx = global_out_idx - my_out_start + 1
-                local_v[local_out_idx] = gathered[i]
+                local_v_idx = idx_in_vec - my_v_start + 1
+                local_v[local_out_idx] = v_repart.v[local_v_idx]
             end
         end
     end
