@@ -394,14 +394,6 @@ mutable struct MatrixPlan{T}
     product_col_indices::Union{Nothing, Vector{Int}}
     product_row_partition::Union{Nothing, Vector{Int}}
     product_compress_map::Union{Nothing, Vector{Int}}  # global_col -> local_col mapping for compress_AT
-    # Cached hash for addition result (computed lazily on first execution)
-    addition_structural_hash::OptionalBlake3Hash
-    addition_col_indices::Union{Nothing, Vector{Int}}
-    addition_union_indices::Union{Nothing, Vector{Int}}
-    # Cached reindex mappings for addition (computed lazily)
-    addition_A_col_to_union::Union{Nothing, Vector{Int}}  # A's local col indices -> union indices
-    addition_plan_global_to_union::Union{Nothing, Vector{Int}}  # plan.AT global -> union (dense vector, 0 = not present)
-    addition_result_col_indices_local::Union{Nothing, Vector{Int}}  # local col indices in result
 end
 
 """
@@ -673,9 +665,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
         recv_rank_ids, recv_bufs, recv_reqs, recv_offsets_vec,
         local_ranges,
         plan_AT,
-        nothing, nothing, nothing, nothing,  # product: hash, col_indices, row_partition, compress_map
-        nothing, nothing, nothing,           # addition: hash, col_indices, union_indices
-        nothing, nothing, nothing            # addition: A_col_to_union, plan_global_to_union, result_col_indices_local
+        nothing, nothing, nothing, nothing  # product: hash, col_indices, row_partition, compress_map
     )
 end
 
@@ -838,35 +828,6 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
         nothing)
 end
 
-# Cache for addition MatrixPlans (keyed by A's row_partition hash and B's structural hash)
-const _addition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
-
-"""
-    get_addition_plan(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
-
-Get a memoized MatrixPlan for gathering B's rows to match A's row partition.
-Used for A + B or A - B operations.
-"""
-function get_addition_plan(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
-    # Cache key: A's structural hash (determines row partition) + B's structural hash
-    key = (_ensure_hash(A), _ensure_hash(B), T)
-    if haskey(_addition_plan_cache, key)
-        return _addition_plan_cache[key]::MatrixPlan{T}
-    end
-
-    comm = MPI.COMM_WORLD
-    rank = MPI.Comm_rank(comm)
-
-    # Get the rows we need from B (our local rows in A's partition)
-    my_row_start = A.row_partition[rank+1]
-    my_row_end = A.row_partition[rank+2] - 1
-    row_indices = collect(my_row_start:my_row_end)
-
-    plan = MatrixPlan(row_indices, B)
-    _addition_plan_cache[key] = plan
-    return plan
-end
-
 """
     Base.+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
 
@@ -875,80 +836,39 @@ Add two distributed sparse matrices. The result has A's row partition.
 function Base.:+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     comm = MPI.COMM_WORLD
 
-    # Get plan and gather B's rows
-    plan = get_addition_plan(A, B)
-    execute_plan!(plan, B)
+    # Repartition B to match A's row partition
+    B_repart = repartition(B, A.row_partition)
 
-    # Check if mappings are already cached in the plan
-    if plan.addition_A_col_to_union === nothing
-        # First execution: compute everything and cache
+    # Both A and B_repart now have:
+    # - Same row_partition (A.row_partition)
+    # - Local CSC storage with compressed column indices
+    # - col_indices mapping compressed → global
 
-        # A.A.parent has compressed local indices (m = length(A.col_indices))
-        # plan.AT has global indices (m = ncols_B)
-        # We need to reindex both to a common "union" space before adding
+    # Compute union of column indices
+    union_indices = sort(unique(vcat(A.col_indices, B_repart.col_indices)))
+    union_size = length(union_indices)
 
-        # Compute union of column indices
-        plan_col_indices = isempty(plan.AT.rowval) ? Int[] : unique(sort(plan.AT.rowval))
-        union_indices = sort(unique(vcat(A.col_indices, plan_col_indices)))
-        union_size = length(union_indices)
+    # Build mappings: compressed → union for both A and B_repart
+    global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
+    A_col_to_union = [global_to_union[g] for g in A.col_indices]
+    B_col_to_union = [global_to_union[g] for g in B_repart.col_indices]
 
-        # Build and cache mapping: A's local col indices -> union indices
-        global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
-        A_col_to_union = [global_to_union[g] for g in A.col_indices]
+    # Reindex both to union space
+    A_union = reindex_to_union_cached(A.A.parent, A_col_to_union, union_size)
+    B_union = reindex_to_union_cached(B_repart.A.parent, B_col_to_union, union_size)
 
-        # Build and cache mapping: plan.AT global indices -> union indices (dense vector)
-        ncols_B = plan.AT.m
-        plan_global_to_union = zeros(Int, ncols_B)
-        for g in plan_col_indices
-            plan_global_to_union[g] = global_to_union[g]
-        end
+    # Add in union space
+    result_union = A_union + B_union
 
-        # Reindex both to union space using the mappings
-        A_union = reindex_to_union_cached(A.A.parent, A_col_to_union, union_size)
-        plan_union = reindex_global_to_union_cached(plan.AT, plan_global_to_union, union_size)
+    # Convert result back to compressed indices
+    result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
+    result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
 
-        # Add in union space
-        result_union = A_union + plan_union
+    # Compress result
+    compressed_result = compress_AT(result_union, result_col_indices_local)
 
-        # Convert result back to global col_indices
-        result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
-        result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
-
-        # Compress result
-        compressed_result = compress_AT(result_union, result_col_indices_local)
-
-        # Compute hash from actual result
-        result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
-
-        # Cache only the INPUT-DEPENDENT mappings (these depend on A and B structure, not values)
-        # NOTE: We do NOT cache result_col_indices, result_col_indices_local, or result hash
-        # because those depend on numerical VALUES and can differ even with same input structure
-        plan.addition_union_indices = union_indices
-        plan.addition_A_col_to_union = A_col_to_union
-        plan.addition_plan_global_to_union = plan_global_to_union
-    else
-        # Subsequent executions: use cached INPUT-DEPENDENT mappings
-        union_indices = plan.addition_union_indices
-        union_size = length(union_indices)
-
-        # Use cached mappings for reindexing (these are INPUT-DEPENDENT, safe to cache)
-        A_union = reindex_to_union_cached(A.A.parent, plan.addition_A_col_to_union, union_size)
-        plan_union = reindex_global_to_union_cached(plan.AT, plan.addition_plan_global_to_union, union_size)
-
-        # Add in union space
-        result_union = A_union + plan_union
-
-        # NOTE: We must compute result structure FRESH because numerical values can differ
-        # and produce different sparsity patterns (e.g., due to cancellation)
-        result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
-        result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
-
-        # Compress result
-        compressed_result = compress_AT(result_union, result_col_indices_local)
-
-        # Compute hash from actual result structure
-        result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
-    end
+    # Compute hash from actual result
+    result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
 
     return SparseMatrixMPI{T}(result_hash, A.row_partition, A.col_partition,
         result_col_indices, transpose(compressed_result), nothing)
@@ -962,77 +882,39 @@ Subtract two distributed sparse matrices. The result has A's row partition.
 function Base.:-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     comm = MPI.COMM_WORLD
 
-    # Get plan and gather B's rows
-    plan = get_addition_plan(A, B)
-    execute_plan!(plan, B)
+    # Repartition B to match A's row partition
+    B_repart = repartition(B, A.row_partition)
 
-    # Check if mappings are already cached in the plan
-    if plan.addition_A_col_to_union === nothing
-        # First execution: compute everything and cache
+    # Both A and B_repart now have:
+    # - Same row_partition (A.row_partition)
+    # - Local CSC storage with compressed column indices
+    # - col_indices mapping compressed → global
 
-        # A.A.parent has compressed local indices (m = length(A.col_indices))
-        # plan.AT has global indices (m = ncols_B)
-        # We need to reindex both to a common "union" space before subtracting
+    # Compute union of column indices
+    union_indices = sort(unique(vcat(A.col_indices, B_repart.col_indices)))
+    union_size = length(union_indices)
 
-        # Compute union of column indices
-        plan_col_indices = isempty(plan.AT.rowval) ? Int[] : unique(sort(plan.AT.rowval))
-        union_indices = sort(unique(vcat(A.col_indices, plan_col_indices)))
-        union_size = length(union_indices)
+    # Build mappings: compressed → union for both A and B_repart
+    global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
+    A_col_to_union = [global_to_union[g] for g in A.col_indices]
+    B_col_to_union = [global_to_union[g] for g in B_repart.col_indices]
 
-        # Build and cache mapping: A's local col indices -> union indices
-        global_to_union = Dict(g => l for (l, g) in enumerate(union_indices))
-        A_col_to_union = [global_to_union[g] for g in A.col_indices]
+    # Reindex both to union space
+    A_union = reindex_to_union_cached(A.A.parent, A_col_to_union, union_size)
+    B_union = reindex_to_union_cached(B_repart.A.parent, B_col_to_union, union_size)
 
-        # Build and cache mapping: plan.AT global indices -> union indices (dense vector)
-        ncols_B = plan.AT.m
-        plan_global_to_union = zeros(Int, ncols_B)
-        for g in plan_col_indices
-            plan_global_to_union[g] = global_to_union[g]
-        end
+    # Subtract in union space
+    result_union = A_union - B_union
 
-        # Reindex both to union space using the mappings
-        A_union = reindex_to_union_cached(A.A.parent, A_col_to_union, union_size)
-        plan_union = reindex_global_to_union_cached(plan.AT, plan_global_to_union, union_size)
+    # Convert result back to compressed indices
+    result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
+    result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
 
-        # Subtract in union space
-        result_union = A_union - plan_union
+    # Compress result
+    compressed_result = compress_AT(result_union, result_col_indices_local)
 
-        # Convert result back to global col_indices
-        result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
-        result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
-
-        # Compress result
-        compressed_result = compress_AT(result_union, result_col_indices_local)
-
-        # Compute hash from actual result
-        result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
-
-        # Cache only the INPUT-DEPENDENT mappings (same as addition)
-        plan.addition_union_indices = union_indices
-        plan.addition_A_col_to_union = A_col_to_union
-        plan.addition_plan_global_to_union = plan_global_to_union
-    else
-        # Subsequent executions: use cached INPUT-DEPENDENT mappings
-        union_indices = plan.addition_union_indices
-        union_size = length(union_indices)
-
-        # Use cached mappings for reindexing
-        A_union = reindex_to_union_cached(A.A.parent, plan.addition_A_col_to_union, union_size)
-        plan_union = reindex_global_to_union_cached(plan.AT, plan.addition_plan_global_to_union, union_size)
-
-        # Subtract in union space
-        result_union = A_union - plan_union
-
-        # Compute result structure FRESH (same reasoning as addition)
-        result_col_indices_local = isempty(result_union.rowval) ? Int[] : unique(sort(result_union.rowval))
-        result_col_indices = isempty(result_col_indices_local) ? Int[] : union_indices[result_col_indices_local]
-
-        # Compress result
-        compressed_result = compress_AT(result_union, result_col_indices_local)
-
-        # Compute hash from actual result structure
-        result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
-    end
+    # Compute hash from actual result
+    result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result, comm)
 
     return SparseMatrixMPI{T}(result_hash, A.row_partition, A.col_partition,
         result_col_indices, transpose(compressed_result), nothing)
@@ -3051,4 +2933,510 @@ Returns λI - A where J = λI.
 """
 function Base.:-(J::UniformScaling, A::SparseMatrixMPI{T}) where T
     return (-A) + J
+end
+
+# ============================================================================
+# SparseRepartitionPlan: Repartition a SparseMatrixMPI to a new row partition
+# ============================================================================
+
+"""
+    SparseRepartitionPlan{T}
+
+Communication plan for repartitioning a SparseMatrixMPI to a new row partition.
+The col_partition remains unchanged - only rows are redistributed.
+
+# Fields
+## Send-side
+- `send_rank_ids::Vector{Int}`: Ranks we send rows to (0-indexed)
+- `send_local_row_ranges::Vector{UnitRange{Int}}`: For each rank, range of local rows to send
+- `send_nnz_counts::Vector{Int}`: Number of nonzeros to send to each rank
+- `send_bufs::Vector{Vector{T}}`: Pre-allocated send value buffers
+
+## Receive-side
+- `recv_rank_ids::Vector{Int}`: Ranks we receive rows from (0-indexed)
+- `recv_nnz_counts::Vector{Int}`: Number of nonzeros to receive from each rank
+- `recv_bufs::Vector{Vector{T}}`: Pre-allocated receive value buffers
+- `recv_value_offsets::Vector{Int}`: Offset into result_nzval for each recv rank
+
+## Local data
+- `local_src_row_range::UnitRange{Int}`: Local rows (in A.A.parent columns) that stay
+- `local_value_offset::Int`: Offset into result_nzval for local values
+- `local_nnz::Int`: Number of local nonzeros
+
+## Result metadata (EAGER)
+- `result_row_partition::Vector{Int}`: Target row partition
+- `result_col_partition::Vector{Int}`: Column partition (unchanged)
+- `result_col_indices::Vector{Int}`: Union of col_indices from received rows
+- `result_AT::SparseMatrixCSC{T,Int}`: Pre-built sparse structure (values to be filled)
+- `result_structural_hash::Blake3Hash`: Pre-computed structural hash
+- `compress_map::Vector{Int}`: global_col -> local_col for result
+"""
+mutable struct SparseRepartitionPlan{T}
+    # Send-side
+    send_rank_ids::Vector{Int}
+    send_local_row_ranges::Vector{UnitRange{Int}}
+    send_nnz_counts::Vector{Int}
+    send_bufs::Vector{Vector{T}}
+    send_reqs::Vector{MPI.Request}
+
+    # Receive-side
+    recv_rank_ids::Vector{Int}
+    recv_nnz_counts::Vector{Int}
+    recv_bufs::Vector{Vector{T}}
+    recv_reqs::Vector{MPI.Request}
+    recv_value_offsets::Vector{Int}
+
+    # Local data
+    local_src_row_range::UnitRange{Int}
+    local_value_offset::Int
+    local_nnz::Int
+
+    # Result metadata (EAGER)
+    result_row_partition::Vector{Int}
+    result_col_partition::Vector{Int}
+    result_col_indices::Vector{Int}
+    result_AT::SparseMatrixCSC{T,Int}
+    result_structural_hash::Blake3Hash
+    compress_map::Vector{Int}
+end
+
+"""
+    SparseRepartitionPlan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+
+Create a communication plan to repartition `A` to have row partition `p`.
+The col_partition remains unchanged.
+
+The plan:
+1. Computes row overlaps between source and target partitions
+2. Exchanges sparse structure (colptr, rowval) to determine result structure
+3. Builds result col_indices, compress_map, and AT structure
+4. Computes structural hash eagerly
+5. Pre-allocates value buffers
+"""
+function SparseRepartitionPlan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    AT = A.A.parent  # Underlying CSC storage
+
+    # Source partition info
+    src_start = A.row_partition[rank+1]
+    src_end = A.row_partition[rank+2] - 1
+
+    # Target partition info
+    dst_start = p[rank+1]
+    dst_end = p[rank+2] - 1
+    result_local_nrows = max(0, dst_end - dst_start + 1)
+
+    # ========== PHASE 1: Determine row overlaps ==========
+
+    # For each destination rank r, compute overlap of our rows with rank r's target
+    send_row_ranges_map = Dict{Int, UnitRange{Int}}()
+    for r in 0:(nranks-1)
+        r_start = p[r+1]
+        r_end = p[r+2] - 1
+        if r_end < r_start
+            continue
+        end
+        overlap_start = max(src_start, r_start)
+        overlap_end = min(src_end, r_end)
+        if overlap_start <= overlap_end
+            # Convert to local row indices (columns in AT)
+            local_start = overlap_start - src_start + 1
+            local_end = overlap_end - src_start + 1
+            send_row_ranges_map[r] = local_start:local_end
+        end
+    end
+
+    # ========== PHASE 2: Exchange row counts and structure ==========
+
+    # Exchange row counts
+    send_row_counts = Int32[haskey(send_row_ranges_map, r) ? length(send_row_ranges_map[r]) : 0 for r in 0:(nranks-1)]
+    recv_row_counts = MPI.Alltoall(MPI.UBuffer(send_row_counts, 1), comm)
+
+    # For each rank we send to, compute structure info: [nrows, colptr..., nnz, rowval_globals...]
+    struct_send_bufs = Dict{Int, Vector{Int}}()
+    struct_send_reqs = MPI.Request[]
+
+    for r in 0:(nranks-1)
+        if haskey(send_row_ranges_map, r) && r != rank
+            row_range = send_row_ranges_map[r]
+            nrows = length(row_range)
+
+            # Build colptr for these rows
+            colptr = Vector{Int}(undef, nrows + 1)
+            colptr[1] = 1
+            for (i, local_row) in enumerate(row_range)
+                ptr_start = AT.colptr[local_row]
+                ptr_end = AT.colptr[local_row+1] - 1
+                row_nnz = ptr_end - ptr_start + 1
+                colptr[i+1] = colptr[i] + row_nnz
+            end
+            nnz_to_send = colptr[end] - 1
+
+            # Convert local col indices to global for sending
+            rowval_globals = Vector{Int}(undef, nnz_to_send)
+            idx = 1
+            for local_row in row_range
+                for ptr in AT.colptr[local_row]:(AT.colptr[local_row+1]-1)
+                    local_col = AT.rowval[ptr]
+                    rowval_globals[idx] = A.col_indices[local_col]
+                    idx += 1
+                end
+            end
+
+            # Pack: [nrows, colptr..., nnz, rowval_globals...]
+            struct_buf = vcat([nrows], colptr, [nnz_to_send], rowval_globals)
+            struct_send_bufs[r] = struct_buf
+            req = MPI.Isend(struct_buf, comm; dest=r, tag=94)
+            push!(struct_send_reqs, req)
+        end
+    end
+
+    # Receive structure from other ranks
+    struct_recv_bufs = Dict{Int, Vector{Int}}()
+    struct_recv_reqs = MPI.Request[]
+
+    # First exchange structure sizes
+    send_struct_sizes = Int32[haskey(struct_send_bufs, r) ? length(struct_send_bufs[r]) : 0 for r in 0:(nranks-1)]
+    recv_struct_sizes = MPI.Alltoall(MPI.UBuffer(send_struct_sizes, 1), comm)
+
+    for r in 0:(nranks-1)
+        if recv_row_counts[r+1] > 0 && r != rank
+            buf = Vector{Int}(undef, recv_struct_sizes[r+1])
+            req = MPI.Irecv!(buf, comm; source=r, tag=94)
+            push!(struct_recv_reqs, req)
+            struct_recv_bufs[r] = buf
+        end
+    end
+
+    MPI.Waitall(struct_recv_reqs)
+    MPI.Waitall(struct_send_reqs)
+
+    # ========== PHASE 3: Build result structure ==========
+
+    # Collect all data that will be in our result (local + received)
+    # We need to build: result_colptr, result_rowval (global), then compress
+
+    # Data structure to hold rows in order: list of (dst_local_row, colptr_slice, rowval_globals)
+    row_data = Vector{Tuple{Int, Vector{Int}, Vector{Int}}}()
+
+    # Local rows that stay on this rank
+    local_src_row_range = 1:0
+    local_nnz = 0
+    if haskey(send_row_ranges_map, rank)
+        local_src_row_range = send_row_ranges_map[rank]
+        for local_row in local_src_row_range
+            global_row = src_start + local_row - 1
+            dst_local_row = global_row - dst_start + 1
+
+            ptr_start = AT.colptr[local_row]
+            ptr_end = AT.colptr[local_row+1] - 1
+            row_nnz = ptr_end - ptr_start + 1
+
+            rowval_globals = [A.col_indices[AT.rowval[ptr]] for ptr in ptr_start:ptr_end]
+            push!(row_data, (dst_local_row, [1, 1 + row_nnz], rowval_globals))
+            local_nnz += row_nnz
+        end
+    end
+
+    # Received rows
+    recv_rank_ids = Int[]
+    recv_nnz_counts = Int[]
+    for r in 0:(nranks-1)
+        if recv_row_counts[r+1] > 0 && r != rank
+            push!(recv_rank_ids, r)
+            buf = struct_recv_bufs[r]
+
+            nrows = buf[1]
+            colptr = buf[2:nrows+2]
+            nnz = buf[nrows+3]
+            rowval_globals = buf[nrows+4:end]
+
+            push!(recv_nnz_counts, nnz)
+
+            # Compute global row range for this rank's rows
+            r_src_start = A.row_partition[r+1]
+
+            for i in 1:nrows
+                # Global row this corresponds to
+                # The rows from rank r in order correspond to the overlap
+                r_dst_start_global = max(r_src_start, dst_start)
+                global_row = r_dst_start_global + (i - 1)
+                dst_local_row = global_row - dst_start + 1
+
+                row_ptr_start = colptr[i]
+                row_ptr_end = colptr[i+1] - 1
+                row_rowvals = rowval_globals[row_ptr_start:row_ptr_end]
+
+                push!(row_data, (dst_local_row, [1, 1 + length(row_rowvals)], row_rowvals))
+            end
+        end
+    end
+
+    # Sort rows by destination local row
+    sort!(row_data, by=x -> x[1])
+
+    # Collect all global column indices
+    all_global_cols = Set{Int}()
+    for (_, _, rowval_globals) in row_data
+        for gc in rowval_globals
+            push!(all_global_cols, gc)
+        end
+    end
+    result_col_indices = sort(collect(all_global_cols))
+
+    # Build compress_map: global_col -> local_col
+    compress_map = zeros(Int, isempty(result_col_indices) ? 0 : maximum(result_col_indices))
+    for (local_idx, global_idx) in enumerate(result_col_indices)
+        compress_map[global_idx] = local_idx
+    end
+
+    # Build result_AT structure
+    result_colptr = Vector{Int}(undef, result_local_nrows + 1)
+    result_colptr[1] = 1
+    result_rowval = Int[]
+    result_nzval = Vector{T}()  # Will be filled during execute_plan!
+
+    # Track value offsets for each data source
+    local_value_offset = 0
+    recv_value_offsets = Int[]
+    current_offset = 1
+
+    # First, local data
+    for (dst_local_row, colptr_slice, rowval_globals) in row_data
+        # Check if this is from local (we'll handle offset tracking separately)
+    end
+
+    # Build colptr and rowval from sorted row_data
+    current_row = 1
+    for (dst_local_row, colptr_slice, rowval_globals) in row_data
+        # Fill any empty rows before this one
+        while current_row < dst_local_row
+            result_colptr[current_row + 1] = result_colptr[current_row]
+            current_row += 1
+        end
+
+        row_nnz = length(rowval_globals)
+        result_colptr[dst_local_row + 1] = result_colptr[dst_local_row] + row_nnz
+
+        # Convert global to local column indices
+        for gc in rowval_globals
+            push!(result_rowval, compress_map[gc])
+        end
+        current_row = dst_local_row + 1
+    end
+
+    # Fill remaining empty rows
+    while current_row <= result_local_nrows
+        result_colptr[current_row + 1] = result_colptr[current_row]
+        current_row += 1
+    end
+
+    total_nnz = result_colptr[end] - 1
+    result_nzval = zeros(T, total_nnz)
+
+    result_AT = SparseMatrixCSC(
+        length(result_col_indices),
+        result_local_nrows,
+        result_colptr,
+        result_rowval,
+        result_nzval
+    )
+
+    # ========== PHASE 4: Compute value offsets ==========
+
+    # We need to track where each source's values go in result_nzval
+    # Rebuild the offset tracking
+
+    # Track by source: local rows first, then received in recv_rank_ids order
+    # Local rows
+    if !isempty(local_src_row_range)
+        # Find where local rows' values go in result_nzval
+        local_value_offset = 0
+        for local_row in local_src_row_range
+            global_row = src_start + local_row - 1
+            dst_local_row = global_row - dst_start + 1
+            local_value_offset = result_colptr[dst_local_row]
+            break  # First local row gives the offset
+        end
+    end
+
+    # Received rows - compute offset for each recv rank
+    for r in recv_rank_ids
+        buf = struct_recv_bufs[r]
+        nrows = buf[1]
+        r_src_start = A.row_partition[r+1]
+        r_dst_start_global = max(r_src_start, dst_start)
+        first_global_row = r_dst_start_global
+        first_dst_local_row = first_global_row - dst_start + 1
+        push!(recv_value_offsets, result_colptr[first_dst_local_row])
+    end
+
+    # ========== PHASE 5: Compute structural hash ==========
+
+    result_structural_hash = compute_structural_hash(p, result_col_indices, result_AT, comm)
+
+    # ========== PHASE 6: Build send arrays and pre-allocate buffers ==========
+
+    send_rank_ids = Int[]
+    send_local_row_ranges = UnitRange{Int}[]
+    send_nnz_counts_arr = Int[]
+
+    for r in 0:(nranks-1)
+        if haskey(send_row_ranges_map, r) && r != rank
+            push!(send_rank_ids, r)
+            push!(send_local_row_ranges, send_row_ranges_map[r])
+
+            # Count nnz for this range
+            row_range = send_row_ranges_map[r]
+            nnz = 0
+            for local_row in row_range
+                nnz += AT.colptr[local_row+1] - AT.colptr[local_row]
+            end
+            push!(send_nnz_counts_arr, nnz)
+        end
+    end
+
+    send_bufs = [Vector{T}(undef, c) for c in send_nnz_counts_arr]
+    recv_bufs = [Vector{T}(undef, c) for c in recv_nnz_counts]
+    send_reqs = Vector{MPI.Request}(undef, length(send_rank_ids))
+    recv_reqs = Vector{MPI.Request}(undef, length(recv_rank_ids))
+
+    return SparseRepartitionPlan{T}(
+        send_rank_ids, send_local_row_ranges, send_nnz_counts_arr, send_bufs, send_reqs,
+        recv_rank_ids, recv_nnz_counts, recv_bufs, recv_reqs, recv_value_offsets,
+        local_src_row_range, local_value_offset, local_nnz,
+        copy(p), copy(A.col_partition), result_col_indices,
+        result_AT, result_structural_hash, compress_map
+    )
+end
+
+"""
+    execute_plan!(plan::SparseRepartitionPlan{T}, A::SparseMatrixMPI{T}) where T
+
+Execute a sparse repartition plan to redistribute rows from A to a new partition.
+Returns a new SparseMatrixMPI with the target row partition.
+"""
+function execute_plan!(plan::SparseRepartitionPlan{T}, A::SparseMatrixMPI{T}) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    src_start = A.row_partition[rank+1]
+    dst_start = plan.result_row_partition[rank+1]
+    AT = A.A.parent
+
+    # Copy result structure (values will be filled in)
+    result_nzval = Vector{T}(undef, length(plan.result_AT.nzval))
+
+    # Step 1: Copy local values
+    if !isempty(plan.local_src_row_range)
+        for local_row in plan.local_src_row_range
+            global_row = src_start + local_row - 1
+            dst_local_row = global_row - dst_start + 1
+
+            src_ptr_start = AT.colptr[local_row]
+            src_ptr_end = AT.colptr[local_row+1] - 1
+            dst_ptr_start = plan.result_AT.colptr[dst_local_row]
+
+            for (i, src_ptr) in enumerate(src_ptr_start:src_ptr_end)
+                result_nzval[dst_ptr_start + i - 1] = AT.nzval[src_ptr]
+            end
+        end
+    end
+
+    # Step 2: Fill send buffers and send
+    @inbounds for i in eachindex(plan.send_rank_ids)
+        row_range = plan.send_local_row_ranges[i]
+        buf = plan.send_bufs[i]
+        buf_idx = 1
+        for local_row in row_range
+            for ptr in AT.colptr[local_row]:(AT.colptr[local_row+1]-1)
+                buf[buf_idx] = AT.nzval[ptr]
+                buf_idx += 1
+            end
+        end
+        plan.send_reqs[i] = MPI.Isend(buf, comm; dest=plan.send_rank_ids[i], tag=96)
+    end
+
+    # Step 3: Post receives
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=96)
+    end
+
+    MPI.Waitall(plan.recv_reqs)
+
+    # Step 4: Copy received values into result
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        offset = plan.recv_value_offsets[i]
+        buf = plan.recv_bufs[i]
+        for k in eachindex(buf)
+            result_nzval[offset + k - 1] = buf[k]
+        end
+    end
+
+    MPI.Waitall(plan.send_reqs)
+
+    # Build result AT with filled values
+    result_AT = SparseMatrixCSC(
+        plan.result_AT.m,
+        plan.result_AT.n,
+        copy(plan.result_AT.colptr),
+        copy(plan.result_AT.rowval),
+        result_nzval
+    )
+
+    return SparseMatrixMPI{T}(
+        plan.result_structural_hash,
+        plan.result_row_partition,
+        plan.result_col_partition,
+        plan.result_col_indices,
+        transpose(result_AT),
+        nothing  # cached_transpose
+    )
+end
+
+"""
+    get_repartition_plan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+
+Get a memoized SparseRepartitionPlan for repartitioning `A` to row partition `p`.
+The plan is cached based on the structural hash of A and the target partition hash.
+"""
+function get_repartition_plan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+    target_hash = compute_partition_hash(p)
+    key = (_ensure_hash(A), target_hash, T)
+    if haskey(_repartition_plan_cache, key)
+        return _repartition_plan_cache[key]::SparseRepartitionPlan{T}
+    end
+    plan = SparseRepartitionPlan(A, p)
+    _repartition_plan_cache[key] = plan
+    return plan
+end
+
+"""
+    repartition(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+
+Redistribute a SparseMatrixMPI to a new row partition `p`.
+The col_partition remains unchanged.
+
+The partition `p` must be a valid partition vector of length `nranks + 1` with
+`p[1] == 1` and `p[end] == size(A, 1) + 1`.
+
+Returns a new SparseMatrixMPI with the same data but `row_partition == p`.
+
+# Example
+```julia
+A = SparseMatrixMPI{Float64}(sprand(6, 4, 0.5))  # uniform partition
+new_partition = [1, 2, 4, 5, 7]  # 1, 2, 1, 2 rows per rank
+A_repart = repartition(A, new_partition)
+```
+"""
+function repartition(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+    # Fast path: partition unchanged
+    if A.row_partition == p
+        return A
+    end
+
+    plan = get_repartition_plan(A, p)
+    return execute_plan!(plan, A)
 end

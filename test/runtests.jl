@@ -92,4 +92,7 @@ end
     @testset "Mixed Sparse-Dense Operations" begin
         run_mpi_test(joinpath(@__DIR__, "test_new_operations.jl"); nprocs=4, expect_success=true)
     end
+    @testset "MPI Repartition" begin
+        run_mpi_test(joinpath(@__DIR__, "test_repartition.jl"); nprocs=4, expect_success=true)
+    end
 end

@@ -8,7 +8,7 @@ import SparseArrays: nnz, issparse, dropzeros, spdiagm, blockdiag
 import LinearAlgebra
 import LinearAlgebra: tr, diag, triu, tril, Transpose, Adjoint, norm, opnorm, mul!, ldlt, BLAS, issymmetric, UniformScaling, dot
 
-export SparseMatrixMPI, MatrixMPI, VectorMPI, clear_plan_cache!, uniform_partition
+export SparseMatrixMPI, MatrixMPI, VectorMPI, clear_plan_cache!, uniform_partition, repartition
 export SparseMatrixCSR  # Type alias for Transpose{SparseMatrixCSC} (CSR storage format)
 export ⊛  # Multithreaded sparse matrix multiplication
 export VectorMPI_local, MatrixMPI_local, SparseMatrixMPI_local  # Local constructors
@@ -111,14 +111,14 @@ const _plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
 # Cache for memoized VectorPlans (for A * x)
 const _vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
 
-# Cache for memoized Vector Alignment Plans (for u +/- v with different partitions)
-const _vector_align_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
-
 # Cache for memoized DenseMatrixVectorPlans (for MatrixMPI * VectorMPI)
 const _dense_vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
 
 # Cache for memoized DenseTransposePlans (for transpose(MatrixMPI))
 const _dense_transpose_plan_cache = Dict{Tuple{Blake3Hash,DataType},Any}()
+
+# Cache for memoized RepartitionPlans (for repartition)
+const _repartition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
 
 """
     clear_plan_cache!()
@@ -128,14 +128,11 @@ Clear all memoized plan caches.
 function clear_plan_cache!()
     empty!(_plan_cache)
     empty!(_vector_plan_cache)
-    empty!(_vector_align_plan_cache)
     empty!(_dense_vector_plan_cache)
     empty!(_dense_transpose_plan_cache)
+    empty!(_repartition_plan_cache)
     if isdefined(@__MODULE__, :_dense_transpose_vector_plan_cache)
         empty!(_dense_transpose_vector_plan_cache)
-    end
-    if isdefined(@__MODULE__, :_addition_plan_cache)
-        empty!(_addition_plan_cache)
     end
 end
 

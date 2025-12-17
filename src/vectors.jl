@@ -271,6 +271,256 @@ function execute_plan!(plan::VectorPlan{T}, x::VectorMPI{T}) where T
 end
 
 # ============================================================================
+# VectorRepartitionPlan: Repartition a VectorMPI to a new partition
+# ============================================================================
+
+"""
+    VectorRepartitionPlan{T}
+
+Communication plan for repartitioning a VectorMPI to a new partition.
+
+# Fields
+- `send_rank_ids::Vector{Int}`: Ranks we send elements to (0-indexed)
+- `send_ranges::Vector{UnitRange{Int}}`: For each rank, range of local indices to send
+- `send_bufs::Vector{Vector{T}}`: Pre-allocated send buffers
+- `send_reqs::Vector{MPI.Request}`: Pre-allocated send request handles
+- `recv_rank_ids::Vector{Int}`: Ranks we receive elements from (0-indexed)
+- `recv_counts::Vector{Int}`: Number of elements to receive from each rank
+- `recv_bufs::Vector{Vector{T}}`: Pre-allocated receive buffers
+- `recv_reqs::Vector{MPI.Request}`: Pre-allocated receive request handles
+- `recv_offsets::Vector{Int}`: Offset into result for each recv rank
+- `local_src_range::UnitRange{Int}`: Source range for local copy
+- `local_dst_offset::Int`: Destination offset for local copy
+- `result_partition::Vector{Int}`: Target partition (copy of p)
+- `result_partition_hash::Blake3Hash`: Hash of target partition
+- `result_local_size::Int`: Number of elements this rank owns after repartition
+"""
+mutable struct VectorRepartitionPlan{T}
+    send_rank_ids::Vector{Int}
+    send_ranges::Vector{UnitRange{Int}}
+    send_bufs::Vector{Vector{T}}
+    send_reqs::Vector{MPI.Request}
+    recv_rank_ids::Vector{Int}
+    recv_counts::Vector{Int}
+    recv_bufs::Vector{Vector{T}}
+    recv_reqs::Vector{MPI.Request}
+    recv_offsets::Vector{Int}
+    local_src_range::UnitRange{Int}
+    local_dst_offset::Int
+    result_partition::Vector{Int}
+    result_partition_hash::Blake3Hash
+    result_local_size::Int
+end
+
+"""
+    VectorRepartitionPlan(x::VectorMPI{T}, p::Vector{Int}) where T
+
+Create a communication plan to repartition `x` to have partition `p`.
+
+The plan computes:
+1. Which elements to send to each rank based on partition overlap
+2. Which elements to receive from each rank
+3. Pre-allocates all buffers for allocation-free execution
+4. Computes the result partition hash eagerly
+"""
+function VectorRepartitionPlan(x::VectorMPI{T}, p::Vector{Int}) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    # Source partition info
+    src_start = x.partition[rank+1]
+    src_end = x.partition[rank+2] - 1
+
+    # Target partition info
+    dst_start = p[rank+1]
+    dst_end = p[rank+2] - 1
+    result_local_size = max(0, dst_end - dst_start + 1)
+
+    # Compute result hash eagerly
+    result_partition_hash = compute_partition_hash(p)
+
+    # Step 1: Determine which elements we send to each rank
+    # For each destination rank r, compute overlap of our elements [src_start, src_end]
+    # with rank r's target range [p[r+1], p[r+2]-1]
+    send_ranges_map = Dict{Int, UnitRange{Int}}()
+    for r in 0:(nranks-1)
+        r_start = p[r+1]
+        r_end = p[r+2] - 1
+        if r_end < r_start
+            continue  # rank r has no elements in target partition
+        end
+        # Intersection of our elements with rank r's target
+        overlap_start = max(src_start, r_start)
+        overlap_end = min(src_end, r_end)
+        if overlap_start <= overlap_end
+            # Convert to local indices in x.v
+            local_start = overlap_start - src_start + 1
+            local_end = overlap_end - src_start + 1
+            send_ranges_map[r] = local_start:local_end
+        end
+    end
+
+    # Step 2: Exchange counts via Alltoall
+    send_counts = Int32[haskey(send_ranges_map, r) ? length(send_ranges_map[r]) : 0 for r in 0:(nranks-1)]
+    recv_counts_raw = MPI.Alltoall(MPI.UBuffer(send_counts, 1), comm)
+
+    # Step 3: Build send/recv structures
+    send_rank_ids = Int[]
+    send_ranges = UnitRange{Int}[]
+    recv_rank_ids = Int[]
+    recv_counts = Int[]
+    recv_offsets = Int[]
+
+    local_src_range = 1:0  # empty range
+    local_dst_offset = 0
+
+    # Handle local copy separately
+    if haskey(send_ranges_map, rank)
+        local_src_range = send_ranges_map[rank]
+        # Compute destination offset: where do these elements go in the result?
+        # The elements at global indices [src_start + local_src_range.start - 1, ...]
+        # go to local indices starting at (global_start - dst_start + 1)
+        global_start = src_start + local_src_range.start - 1
+        local_dst_offset = global_start - dst_start + 1
+    end
+
+    # Build send arrays (excluding local)
+    for r in 0:(nranks-1)
+        if haskey(send_ranges_map, r) && r != rank
+            push!(send_rank_ids, r)
+            push!(send_ranges, send_ranges_map[r])
+        end
+    end
+
+    # Build recv arrays (excluding local)
+    # For each rank r that sends to us, compute where their data goes in our result
+    for r in 0:(nranks-1)
+        if recv_counts_raw[r+1] > 0 && r != rank
+            push!(recv_rank_ids, r)
+            push!(recv_counts, recv_counts_raw[r+1])
+
+            # Elements from rank r: their source range is [x.partition[r+1], x.partition[r+2]-1]
+            # intersected with our target range [dst_start, dst_end]
+            r_src_start = x.partition[r+1]
+            r_src_end = x.partition[r+2] - 1
+            overlap_start = max(r_src_start, dst_start)
+            # The offset in our result where these elements go
+            offset = overlap_start - dst_start + 1
+            push!(recv_offsets, offset)
+        end
+    end
+
+    # Pre-allocate buffers
+    send_bufs = [Vector{T}(undef, length(r)) for r in send_ranges]
+    recv_bufs = [Vector{T}(undef, c) for c in recv_counts]
+    send_reqs = Vector{MPI.Request}(undef, length(send_rank_ids))
+    recv_reqs = Vector{MPI.Request}(undef, length(recv_rank_ids))
+
+    return VectorRepartitionPlan{T}(
+        send_rank_ids, send_ranges, send_bufs, send_reqs,
+        recv_rank_ids, recv_counts, recv_bufs, recv_reqs, recv_offsets,
+        local_src_range, local_dst_offset,
+        copy(p), result_partition_hash, result_local_size
+    )
+end
+
+"""
+    execute_plan!(plan::VectorRepartitionPlan{T}, x::VectorMPI{T}) where T
+
+Execute a vector repartition plan to redistribute elements from x to a new partition.
+Returns a new VectorMPI with the target partition.
+"""
+function execute_plan!(plan::VectorRepartitionPlan{T}, x::VectorMPI{T}) where T
+    comm = MPI.COMM_WORLD
+
+    # Allocate result
+    result_v = Vector{T}(undef, plan.result_local_size)
+
+    # Step 1: Local copy
+    if !isempty(plan.local_src_range)
+        @inbounds for (i, src_i) in enumerate(plan.local_src_range)
+            result_v[plan.local_dst_offset + i - 1] = x.v[src_i]
+        end
+    end
+
+    # Step 2: Fill send buffers and send
+    @inbounds for i in eachindex(plan.send_rank_ids)
+        r = plan.send_rank_ids[i]
+        range = plan.send_ranges[i]
+        buf = plan.send_bufs[i]
+        for (k, src_k) in enumerate(range)
+            buf[k] = x.v[src_k]
+        end
+        plan.send_reqs[i] = MPI.Isend(buf, comm; dest=r, tag=92)
+    end
+
+    # Step 3: Post receives
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=92)
+    end
+
+    MPI.Waitall(plan.recv_reqs)
+
+    # Step 4: Scatter received values into result
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        offset = plan.recv_offsets[i]
+        buf = plan.recv_bufs[i]
+        for k in eachindex(buf)
+            result_v[offset + k - 1] = buf[k]
+        end
+    end
+
+    MPI.Waitall(plan.send_reqs)
+
+    return VectorMPI{T}(plan.result_partition_hash, plan.result_partition, result_v)
+end
+
+"""
+    get_repartition_plan(x::VectorMPI{T}, p::Vector{Int}) where T
+
+Get a memoized VectorRepartitionPlan for repartitioning `x` to partition `p`.
+The plan is cached based on the structural hash of x and the target partition hash.
+"""
+function get_repartition_plan(x::VectorMPI{T}, p::Vector{Int}) where T
+    target_hash = compute_partition_hash(p)
+    key = (x.structural_hash, target_hash, T)
+    if haskey(_repartition_plan_cache, key)
+        return _repartition_plan_cache[key]::VectorRepartitionPlan{T}
+    end
+    plan = VectorRepartitionPlan(x, p)
+    _repartition_plan_cache[key] = plan
+    return plan
+end
+
+"""
+    repartition(x::VectorMPI{T}, p::Vector{Int}) where T
+
+Redistribute a VectorMPI to a new partition `p`.
+
+The partition `p` must be a valid partition vector of length `nranks + 1` with
+`p[1] == 1` and `p[end] == length(x) + 1`.
+
+Returns a new VectorMPI with the same data but `partition == p`.
+
+# Example
+```julia
+v = VectorMPI([1.0, 2.0, 3.0, 4.0])  # uniform partition
+new_partition = [1, 2, 5]  # rank 0 gets 1 element, rank 1 gets 3
+v_repart = repartition(v, new_partition)
+```
+"""
+function repartition(x::VectorMPI{T}, p::Vector{Int}) where T
+    # Fast path: partition unchanged
+    if x.partition == p
+        return x
+    end
+
+    plan = get_repartition_plan(x, p)
+    return execute_plan!(plan, x)
+end
+
+# ============================================================================
 # Helpers for Distributed Operations (spdiagm, cat, etc.)
 # ============================================================================
 
@@ -399,23 +649,6 @@ function _gather_specific_elements(v::VectorMPI{T}, global_indices::Vector{Int})
     return result
 end
 
-"""
-    get_vector_align_plan(target::VectorMPI{T}, source::VectorMPI{T}) where T
-
-Get a memoized VectorPlan for aligning `source` to `target`'s partition.
-The plan is cached based on the structural hashes of both vectors.
-Uses a separate cache from get_vector_plan to avoid key collisions.
-"""
-function get_vector_align_plan(target::VectorMPI{T}, source::VectorMPI{T}) where T
-    key = (target.structural_hash, source.structural_hash, T)
-    if haskey(_vector_align_plan_cache, key)
-        return _vector_align_plan_cache[key]::VectorPlan{T}
-    end
-    plan = VectorPlan(target.partition, source)
-    _vector_align_plan_cache[key] = plan
-    return plan
-end
-
 # Vector operations: conj, transpose, adjoint
 
 """
@@ -496,8 +729,8 @@ function LinearAlgebra.dot(x::VectorMPI{T}, y::VectorMPI{T}) where T
         local_dot = dot(x.v, y.v)
         return MPI.Allreduce(local_dot, MPI.SUM, comm)
     else
-        # Redistribute y to match x's partition using _align_vector
-        y_aligned = _align_vector(y, x.partition)
+        # Redistribute y to match x's partition using repartition
+        y_aligned = repartition(y, x.partition)
         local_dot = dot(x.v, y_aligned.v)
         return MPI.Allreduce(local_dot, MPI.SUM, comm)
     end
@@ -559,10 +792,9 @@ function Base.:+(u::VectorMPI{T}, v::VectorMPI{T}) where T
     if u.partition == v.partition
         return VectorMPI{T}(u.structural_hash, u.partition, u.v .+ v.v)
     else
-        # Align v to u's partition
-        plan = get_vector_align_plan(u, v)
-        v_aligned = execute_plan!(plan, v)
-        return VectorMPI{T}(u.structural_hash, u.partition, u.v .+ v_aligned)
+        # Align v to u's partition using repartition
+        v_aligned = repartition(v, u.partition)
+        return VectorMPI{T}(u.structural_hash, u.partition, u.v .+ v_aligned.v)
     end
 end
 
@@ -576,10 +808,9 @@ function Base.:-(u::VectorMPI{T}, v::VectorMPI{T}) where T
     if u.partition == v.partition
         return VectorMPI{T}(u.structural_hash, u.partition, u.v .- v.v)
     else
-        # Align v to u's partition
-        plan = get_vector_align_plan(u, v)
-        v_aligned = execute_plan!(plan, v)
-        return VectorMPI{T}(u.structural_hash, u.partition, u.v .- v_aligned)
+        # Align v to u's partition using repartition
+        v_aligned = repartition(v, u.partition)
+        return VectorMPI{T}(u.structural_hash, u.partition, u.v .- v_aligned.v)
     end
 end
 
@@ -831,9 +1062,8 @@ function _prepare_broadcast_arg(v::VectorMPI, ref_partition, comm)
     if v.partition == ref_partition
         return v.v
     else
-        # Align to reference partition using existing alignment infrastructure
-        aligned = _align_vector(v, ref_partition, comm)
-        return aligned
+        # Align to reference partition using repartition
+        return repartition(v, ref_partition).v
     end
 end
 
@@ -857,44 +1087,6 @@ end
 _prepare_broadcast_arg(r::Base.RefValue, ref_partition, comm) = r
 
 _prepare_broadcast_arg(x, ref_partition, comm) = x
-
-"""
-    _get_broadcast_align_plan(target_partition::Vector{Int}, source::VectorMPI{T}) where T
-
-Get or create a cached VectorPlan for aligning `source` to `target_partition`.
-Uses point-to-point Isend/Irecv communication for efficiency.
-"""
-function _get_broadcast_align_plan(target_partition::Vector{Int}, source::VectorMPI{T}) where T
-    target_hash = compute_partition_hash(target_partition)
-    key = (target_hash, source.structural_hash, T)
-
-    if haskey(_vector_align_plan_cache, key)
-        return _vector_align_plan_cache[key]::VectorPlan{T}
-    end
-
-    # Create new plan using existing VectorPlan infrastructure
-    plan = VectorPlan(target_partition, source)
-    _vector_align_plan_cache[key] = plan
-    return plan
-end
-
-"""
-    _align_vector(v::VectorMPI{T}, target_partition, comm) where T
-
-Align a VectorMPI to a target partition, redistributing elements as needed.
-Uses cached communication plans with point-to-point Isend/Irecv for efficiency.
-Returns the local portion of the aligned vector.
-"""
-function _align_vector(v::VectorMPI{T}, target_partition, comm) where T
-    # Get or create cached plan
-    plan = _get_broadcast_align_plan(target_partition, v)
-
-    # Execute the plan (uses Isend/Irecv internally)
-    execute_plan!(plan, v)
-
-    # Return a copy of the gathered data (plan.gathered is reused)
-    return copy(plan.gathered)
-end
 
 """
     Base.similar(bc::Broadcasted{VectorMPIStyle}, ::Type{ElType}) where ElType

@@ -1372,3 +1372,257 @@ function Base.mapslices(f, A::MatrixMPI{T}; dims) where T
         error("dims must be 1 or 2")
     end
 end
+
+# ============================================================================
+# DenseRepartitionPlan: Repartition a MatrixMPI to a new row partition
+# ============================================================================
+
+"""
+    DenseRepartitionPlan{T}
+
+Communication plan for repartitioning a MatrixMPI to a new row partition.
+
+# Fields
+- `send_rank_ids::Vector{Int}`: Ranks we send rows to (0-indexed)
+- `send_row_ranges::Vector{UnitRange{Int}}`: For each rank, range of local rows to send
+- `send_bufs::Vector{Matrix{T}}`: Pre-allocated send buffers
+- `send_reqs::Vector{MPI.Request}`: Pre-allocated send request handles
+- `recv_rank_ids::Vector{Int}`: Ranks we receive rows from (0-indexed)
+- `recv_row_counts::Vector{Int}`: Number of rows to receive from each rank
+- `recv_bufs::Vector{Matrix{T}}`: Pre-allocated receive buffers
+- `recv_reqs::Vector{MPI.Request}`: Pre-allocated receive request handles
+- `recv_dst_ranges::Vector{UnitRange{Int}}`: Destination row ranges in result for each recv
+- `local_src_range::UnitRange{Int}`: Source row range for local copy
+- `local_dst_range::UnitRange{Int}`: Destination row range for local copy
+- `result_row_partition::Vector{Int}`: Target row partition (copy of p)
+- `result_col_partition::Vector{Int}`: Column partition (unchanged from source)
+- `result_structural_hash::Blake3Hash`: Hash of result matrix
+- `result_local_nrows::Int`: Number of rows this rank owns after repartition
+- `ncols::Int`: Number of columns in the matrix
+"""
+mutable struct DenseRepartitionPlan{T}
+    send_rank_ids::Vector{Int}
+    send_row_ranges::Vector{UnitRange{Int}}
+    send_bufs::Vector{Matrix{T}}
+    send_reqs::Vector{MPI.Request}
+    recv_rank_ids::Vector{Int}
+    recv_row_counts::Vector{Int}
+    recv_bufs::Vector{Matrix{T}}
+    recv_reqs::Vector{MPI.Request}
+    recv_dst_ranges::Vector{UnitRange{Int}}
+    local_src_range::UnitRange{Int}
+    local_dst_range::UnitRange{Int}
+    result_row_partition::Vector{Int}
+    result_col_partition::Vector{Int}
+    result_structural_hash::Blake3Hash
+    result_local_nrows::Int
+    ncols::Int
+end
+
+"""
+    DenseRepartitionPlan(A::MatrixMPI{T}, p::Vector{Int}) where T
+
+Create a communication plan to repartition `A` to have row partition `p`.
+The col_partition remains unchanged.
+
+The plan computes:
+1. Which rows to send to each rank based on partition overlap
+2. Which rows to receive from each rank
+3. Pre-allocates all buffers for allocation-free execution
+4. Computes the result structural hash eagerly
+"""
+function DenseRepartitionPlan(A::MatrixMPI{T}, p::Vector{Int}) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+
+    # Source partition info
+    src_start = A.row_partition[rank+1]
+    src_end = A.row_partition[rank+2] - 1
+    local_nrows = max(0, src_end - src_start + 1)
+
+    # Target partition info
+    dst_start = p[rank+1]
+    dst_end = p[rank+2] - 1
+    result_local_nrows = max(0, dst_end - dst_start + 1)
+
+    ncols = A.col_partition[end] - 1
+
+    # Step 1: Determine which rows we send to each rank
+    send_row_ranges_map = Dict{Int, UnitRange{Int}}()
+    for r in 0:(nranks-1)
+        r_start = p[r+1]
+        r_end = p[r+2] - 1
+        if r_end < r_start
+            continue  # rank r has no rows in target partition
+        end
+        # Intersection of our rows with rank r's target
+        overlap_start = max(src_start, r_start)
+        overlap_end = min(src_end, r_end)
+        if overlap_start <= overlap_end
+            # Convert to local row indices in A.A
+            local_start = overlap_start - src_start + 1
+            local_end = overlap_end - src_start + 1
+            send_row_ranges_map[r] = local_start:local_end
+        end
+    end
+
+    # Step 2: Exchange counts via Alltoall
+    send_counts = Int32[haskey(send_row_ranges_map, r) ? length(send_row_ranges_map[r]) : 0 for r in 0:(nranks-1)]
+    recv_counts_raw = MPI.Alltoall(MPI.UBuffer(send_counts, 1), comm)
+
+    # Step 3: Build send/recv structures
+    send_rank_ids = Int[]
+    send_row_ranges = UnitRange{Int}[]
+    recv_rank_ids = Int[]
+    recv_row_counts = Int[]
+    recv_dst_ranges = UnitRange{Int}[]
+
+    local_src_range = 1:0  # empty range
+    local_dst_range = 1:0  # empty range
+
+    # Handle local copy separately
+    if haskey(send_row_ranges_map, rank)
+        local_src_range = send_row_ranges_map[rank]
+        # Compute destination range: where do these rows go in the result?
+        global_start = src_start + local_src_range.start - 1
+        local_dst_start = global_start - dst_start + 1
+        local_dst_end = local_dst_start + length(local_src_range) - 1
+        local_dst_range = local_dst_start:local_dst_end
+    end
+
+    # Build send arrays (excluding local)
+    for r in 0:(nranks-1)
+        if haskey(send_row_ranges_map, r) && r != rank
+            push!(send_rank_ids, r)
+            push!(send_row_ranges, send_row_ranges_map[r])
+        end
+    end
+
+    # Build recv arrays (excluding local)
+    for r in 0:(nranks-1)
+        if recv_counts_raw[r+1] > 0 && r != rank
+            push!(recv_rank_ids, r)
+            push!(recv_row_counts, recv_counts_raw[r+1])
+
+            # Rows from rank r: their source range is [A.row_partition[r+1], A.row_partition[r+2]-1]
+            # intersected with our target range [dst_start, dst_end]
+            r_src_start = A.row_partition[r+1]
+            r_src_end = A.row_partition[r+2] - 1
+            overlap_start = max(r_src_start, dst_start)
+            overlap_end = min(r_src_end, dst_end)
+            # Destination range in our result
+            dst_range_start = overlap_start - dst_start + 1
+            dst_range_end = overlap_end - dst_start + 1
+            push!(recv_dst_ranges, dst_range_start:dst_range_end)
+        end
+    end
+
+    # Pre-allocate buffers
+    send_bufs = [Matrix{T}(undef, length(r), ncols) for r in send_row_ranges]
+    recv_bufs = [Matrix{T}(undef, c, ncols) for c in recv_row_counts]
+    send_reqs = Vector{MPI.Request}(undef, length(send_rank_ids))
+    recv_reqs = Vector{MPI.Request}(undef, length(recv_rank_ids))
+
+    # Compute result structural hash eagerly
+    result_local_size = (result_local_nrows, ncols)
+    result_structural_hash = compute_dense_structural_hash(p, A.col_partition, result_local_size, comm)
+
+    return DenseRepartitionPlan{T}(
+        send_rank_ids, send_row_ranges, send_bufs, send_reqs,
+        recv_rank_ids, recv_row_counts, recv_bufs, recv_reqs, recv_dst_ranges,
+        local_src_range, local_dst_range,
+        copy(p), copy(A.col_partition), result_structural_hash,
+        result_local_nrows, ncols
+    )
+end
+
+"""
+    execute_plan!(plan::DenseRepartitionPlan{T}, A::MatrixMPI{T}) where T
+
+Execute a dense repartition plan to redistribute rows from A to a new partition.
+Returns a new MatrixMPI with the target row partition.
+"""
+function execute_plan!(plan::DenseRepartitionPlan{T}, A::MatrixMPI{T}) where T
+    comm = MPI.COMM_WORLD
+
+    # Allocate result
+    result_A = Matrix{T}(undef, plan.result_local_nrows, plan.ncols)
+
+    # Step 1: Local copy
+    if !isempty(plan.local_src_range) && !isempty(plan.local_dst_range)
+        result_A[plan.local_dst_range, :] = A.A[plan.local_src_range, :]
+    end
+
+    # Step 2: Fill send buffers and send
+    @inbounds for i in eachindex(plan.send_rank_ids)
+        r = plan.send_rank_ids[i]
+        row_range = plan.send_row_ranges[i]
+        buf = plan.send_bufs[i]
+        buf .= @view A.A[row_range, :]
+        plan.send_reqs[i] = MPI.Isend(vec(buf), comm; dest=r, tag=93)
+    end
+
+    # Step 3: Post receives
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        plan.recv_reqs[i] = MPI.Irecv!(vec(plan.recv_bufs[i]), comm; source=plan.recv_rank_ids[i], tag=93)
+    end
+
+    MPI.Waitall(plan.recv_reqs)
+
+    # Step 4: Copy received rows into result
+    @inbounds for i in eachindex(plan.recv_rank_ids)
+        dst_range = plan.recv_dst_ranges[i]
+        buf = plan.recv_bufs[i]
+        result_A[dst_range, :] = buf
+    end
+
+    MPI.Waitall(plan.send_reqs)
+
+    return MatrixMPI{T}(plan.result_structural_hash, plan.result_row_partition, plan.result_col_partition, result_A)
+end
+
+"""
+    get_repartition_plan(A::MatrixMPI{T}, p::Vector{Int}) where T
+
+Get a memoized DenseRepartitionPlan for repartitioning `A` to row partition `p`.
+The plan is cached based on the structural hash of A and the target partition hash.
+"""
+function get_repartition_plan(A::MatrixMPI{T}, p::Vector{Int}) where T
+    target_hash = compute_partition_hash(p)
+    key = (_ensure_hash(A), target_hash, T)
+    if haskey(_repartition_plan_cache, key)
+        return _repartition_plan_cache[key]::DenseRepartitionPlan{T}
+    end
+    plan = DenseRepartitionPlan(A, p)
+    _repartition_plan_cache[key] = plan
+    return plan
+end
+
+"""
+    repartition(A::MatrixMPI{T}, p::Vector{Int}) where T
+
+Redistribute a MatrixMPI to a new row partition `p`.
+The col_partition remains unchanged.
+
+The partition `p` must be a valid partition vector of length `nranks + 1` with
+`p[1] == 1` and `p[end] == size(A, 1) + 1`.
+
+Returns a new MatrixMPI with the same data but `row_partition == p`.
+
+# Example
+```julia
+A = MatrixMPI(randn(6, 4))  # uniform partition
+new_partition = [1, 2, 4, 5, 7]  # 1, 2, 1, 2 rows per rank
+A_repart = repartition(A, new_partition)
+```
+"""
+function repartition(A::MatrixMPI{T}, p::Vector{Int}) where T
+    # Fast path: partition unchanged
+    if A.row_partition == p
+        return A
+    end
+
+    plan = get_repartition_plan(A, p)
+    return execute_plan!(plan, A)
+end
