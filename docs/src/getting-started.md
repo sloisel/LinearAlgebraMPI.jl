@@ -275,6 +275,8 @@ LinearAlgebraMPI uses the MUMPS (MUltifrontal Massively Parallel Solver) library
 - OpenBLAS can parallelize these dense operations
 - This is fine-grained: threads cooperate on the same dense block
 
+**Note on BLAS libraries**: Julia and MUMPS use separate OpenBLAS libraries (`libopenblas64_.dylib` for Julia's ILP64 interface, `libopenblas.dylib` for MUMPS's LP64 interface). Both libraries read `OPENBLAS_NUM_THREADS` at initialization, so this environment variable affects both.
+
 ### Recommended Configuration
 
 For behavior that closely matches Julia's built-in sparse solver (UMFPACK):
