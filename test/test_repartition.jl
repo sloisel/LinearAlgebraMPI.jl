@@ -122,20 +122,31 @@ A_global = sparse(I_idx, J_idx, V_sparse, m_sparse, n_sparse)
 
 A = SparseMatrixMPI{Float64}(A_global)
 
-# Create new partition
-new_sparse_p = LinearAlgebraMPI.uniform_partition(m_sparse, nranks)
-if nranks >= 2
-    new_sparse_p = [1]
+# Create new partition (must differ from uniform to test actual repartition)
+# Uniform for 8 rows, 4 ranks is [1, 3, 5, 7, 9] (2 rows each)
+# Use [1, 4, 6, 8, 9] instead (3, 2, 2, 1 rows per rank)
+new_sparse_p = if nranks == 4
+    [1, 4, 6, 8, 9]
+elseif nranks >= 2
+    # Give first rank one extra row, last rank one fewer
+    p = [1]
+    base = div(m_sparse, nranks)
+    remainder = mod(m_sparse, nranks)
     total = 0
     for r in 0:(nranks-1)
+        count = base + (r < remainder ? 1 : 0)
+        # Shift: first rank gets +1, last rank gets -1
         if r == 0
-            count = 2
-        else
-            count = div(m_sparse - 2, nranks - 1) + (r - 1 < mod(m_sparse - 2, nranks - 1) ? 1 : 0)
+            count += 1
+        elseif r == nranks - 1
+            count -= 1
         end
         total += count
-        push!(new_sparse_p, total + 1)
+        push!(p, total + 1)
     end
+    p
+else
+    LinearAlgebraMPI.uniform_partition(m_sparse, nranks)
 end
 
 A_repart = repartition(A, new_sparse_p)

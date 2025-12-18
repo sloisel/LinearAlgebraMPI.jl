@@ -152,21 +152,6 @@ function reindex_to_union_cached(AT::SparseMatrixCSC{T,Int}, col_to_union_map::V
 end
 
 """
-    reindex_global_to_union_cached(AT, global_to_union_map, union_size)
-
-Optimized reindex using precomputed mapping vector.
-global_to_union_map[global_idx] gives the union index for global column index global_idx.
-For indices not in union, the value should be 0 (but this shouldn't happen for valid inputs).
-"""
-function reindex_global_to_union_cached(AT::SparseMatrixCSC{T,Int}, global_to_union_map::Vector{Int}, union_size::Int) where T
-    if isempty(AT.rowval)
-        return SparseMatrixCSC(union_size, AT.n, AT.colptr, Int[], T[])
-    end
-    new_rowval = [global_to_union_map[r] for r in AT.rowval]
-    return SparseMatrixCSC(union_size, AT.n, AT.colptr, new_rowval, AT.nzval)
-end
-
-"""
     compress_AT_cached(AT, compress_map)
 
 Optimized compress_AT using precomputed mapping vector.
