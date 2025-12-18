@@ -453,9 +453,7 @@ uniform_partition
 Redistribute distributed data to a new partition. Provides plan caching for repeated operations and a fast path when partitions already match (no communication needed).
 
 ```@docs
-repartition(::VectorMPI, ::Vector{Int})
-repartition(::MatrixMPI, ::Vector{Int})
-repartition(::SparseMatrixMPI, ::Vector{Int})
+repartition
 ```
 
 ### Rank-Selective Output
