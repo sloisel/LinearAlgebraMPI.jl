@@ -3,6 +3,11 @@ MUMPS-based distributed sparse factorization.
 
 Uses MUMPS with distributed matrix input (ICNTL(18)=3) for efficient
 parallel direct solve of sparse linear systems.
+
+Analysis caching: The symbolic analysis phase (ordering, symbolic factorization)
+depends only on sparsity structure, not numerical values. We cache the analyzed
+MUMPS object by structural hash, so subsequent factorizations with the same
+structure skip the expensive analysis phase.
 """
 
 using MPI
@@ -41,6 +46,56 @@ const _destroy_list = Int[]
 const _destroy_list_lock = ReentrantLock()
 
 # ============================================================================
+# MUMPS Analysis Cache
+# ============================================================================
+#
+# The symbolic analysis phase (job=1) depends only on sparsity structure, not
+# numerical values. We cache the analyzed MUMPS object by structural hash,
+# allowing subsequent factorizations to skip analysis and only do numeric
+# factorization (job=2).
+#
+# The cache stores MUMPSAnalysisPlan objects, which contain:
+# - A pre-analyzed MUMPS object (ready for job=2)
+# - The COO index arrays (structure is fixed)
+# - Metadata for validation
+
+"""
+    MUMPSAnalysisPlan{T}
+
+Cached MUMPS symbolic analysis for a given sparsity structure.
+Stores a pre-analyzed MUMPS object that can be reused for numeric
+factorization with different values but the same structure.
+"""
+mutable struct MUMPSAnalysisPlan{T}
+    mumps::Any  # Mumps{T,R} after analysis (job=1)
+    irn_loc::Vector{MUMPS_INT}  # Row indices (structure, immutable)
+    jcn_loc::Vector{MUMPS_INT}  # Column indices (structure, immutable)
+    a_loc::Vector{T}  # Value array (updated for each factorization)
+    n::Int
+    symmetric::Bool
+    row_partition::Vector{Int}
+    structural_hash::NTuple{32,UInt8}
+end
+
+# Cache mapping (structural_hash, symmetric, element_type) -> MUMPSAnalysisPlan
+const _mumps_analysis_cache = Dict{Tuple{NTuple{32,UInt8}, Bool, DataType}, Any}()
+
+"""
+    clear_mumps_analysis_cache!()
+
+Clear the MUMPS analysis cache. This is a collective operation that must
+be called on all MPI ranks together.
+"""
+function clear_mumps_analysis_cache!()
+    for (key, plan) in _mumps_analysis_cache
+        # Finalize the cached MUMPS objects
+        plan.mumps._finalized = false
+        MUMPS.finalize!(plan.mumps)
+    end
+    empty!(_mumps_analysis_cache)
+end
+
+# ============================================================================
 # MUMPS Factorization Type
 # ============================================================================
 
@@ -48,10 +103,13 @@ const _destroy_list_lock = ReentrantLock()
     MUMPSFactorizationMPI{T}
 
 Distributed MUMPS factorization result. Can be reused for multiple solves.
+
+Note: The MUMPS object is shared with the analysis cache. The factorization
+does not own the MUMPS object and should not finalize it directly.
 """
 mutable struct MUMPSFactorizationMPI{T}
     id::Int  # Unique ID for finalization tracking
-    mumps::Any  # Mumps{T,R} where R is the real type (Float64 for both real and complex)
+    mumps::Any  # Mumps{T,R} - shared with cache, do not finalize
     irn_loc::Vector{MUMPS_INT}
     jcn_loc::Vector{MUMPS_INT}
     a_loc::Vector{T}
@@ -59,6 +117,7 @@ mutable struct MUMPSFactorizationMPI{T}
     symmetric::Bool
     row_partition::Vector{Int}
     rhs_buffer::Vector{T}
+    owns_mumps::Bool  # Whether this factorization owns the MUMPS object
 end
 
 Base.size(F::MUMPSFactorizationMPI) = (F.n, F.n)
@@ -123,9 +182,11 @@ function _process_finalizers()
         if haskey(_mumps_registry, id)
             F = _mumps_registry[id]
             delete!(_mumps_registry, id)
-            # Actually finalize the MUMPS object
-            F.mumps._finalized = false
-            MUMPS.finalize!(F.mumps)
+            # Only finalize if we own the MUMPS object (not shared with cache)
+            if F.owns_mumps
+                F.mumps._finalized = false
+                MUMPS.finalize!(F.mumps)
+            end
         end
     end
 end
@@ -182,21 +243,29 @@ end
 # ============================================================================
 
 """
-    _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) where T
+    _get_or_create_analysis_plan(A::SparseMatrixMPI{T}, symmetric::Bool) where T
 
-Create and compute a MUMPS factorization of the distributed matrix A.
+Get a cached analysis plan or create a new one. Returns the plan with
+values updated from matrix A.
 """
-function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) where T
+function _get_or_create_analysis_plan(A::SparseMatrixMPI{T}, symmetric::Bool) where T
     comm = MPI.COMM_WORLD
-    rank = MPI.Comm_rank(comm)
 
-    # Process any pending finalizations first (collective operation)
-    _process_finalizers()
+    # Ensure structural hash is computed
+    structural_hash = _ensure_hash(A)
+    cache_key = (structural_hash, symmetric, T)
 
-    # Assign unique ID for this factorization
-    id = _mumps_count[]
-    _mumps_count[] += 1
+    if haskey(_mumps_analysis_cache, cache_key)
+        # Cache hit: reuse existing analysis
+        plan = _mumps_analysis_cache[cache_key]::MUMPSAnalysisPlan{T}
 
+        # Update values from matrix A (structure is already correct)
+        _update_values!(plan, A, symmetric)
+
+        return plan, true  # true = cache hit
+    end
+
+    # Cache miss: create new analysis
     m, n = size(A)
     @assert m == n "Matrix must be square for factorization"
 
@@ -219,6 +288,12 @@ function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) whe
     set_icntl!(mumps, 18, 3; displaylevel=0)   # Distributed matrix input
     set_icntl!(mumps, 20, 0; displaylevel=0)   # Dense RHS
     set_icntl!(mumps, 21, 0; displaylevel=0)   # Centralized solution on host
+    set_icntl!(mumps, 7, 5; displaylevel=0)    # METIS ordering (better fill-in)
+
+    # Set OpenMP threads for MUMPS to match Julia's thread count if OMP_NUM_THREADS not set
+    if !haskey(ENV, "OMP_NUM_THREADS")
+        set_icntl!(mumps, 16, Threads.nthreads(); displaylevel=0)
+    end
 
     # Set matrix dimension
     mumps.n = MUMPS_INT(n)
@@ -235,18 +310,81 @@ function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) whe
     invoke_mumps_unsafe!(mumps)
     _check_mumps_error(mumps, "analysis")
 
+    # Create and cache the analysis plan
+    plan = MUMPSAnalysisPlan{T}(
+        mumps, irn_loc, jcn_loc, a_loc,
+        n, symmetric, copy(A.row_partition), structural_hash
+    )
+    _mumps_analysis_cache[cache_key] = plan
+
+    return plan, false  # false = cache miss
+end
+
+"""
+    _update_values!(plan::MUMPSAnalysisPlan{T}, A::SparseMatrixMPI{T}, symmetric::Bool) where T
+
+Update the values in a cached analysis plan from a new matrix with the same structure.
+"""
+function _update_values!(plan::MUMPSAnalysisPlan{T}, A::SparseMatrixMPI{T}, symmetric::Bool) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+
+    row_start = A.row_partition[rank + 1]
+    AT = A.A.parent
+
+    # Update values in-place (structure must match exactly)
+    idx = 1
+    for local_row in 1:AT.n
+        global_row = row_start + local_row - 1
+        for ptr in AT.colptr[local_row]:(AT.colptr[local_row + 1] - 1)
+            local_col_idx = AT.rowval[ptr]
+            global_col = A.col_indices[local_col_idx]
+
+            if !symmetric || global_row >= global_col
+                plan.a_loc[idx] = AT.nzval[ptr]
+                idx += 1
+            end
+        end
+    end
+end
+
+"""
+    _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) where T
+
+Create and compute a MUMPS factorization of the distributed matrix A.
+Uses cached symbolic analysis when available for the same sparsity structure.
+"""
+function _create_mumps_factorization(A::SparseMatrixMPI{T}, symmetric::Bool) where T
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+
+    # Process any pending finalizations first (collective operation)
+    _process_finalizers()
+
+    # Assign unique ID for this factorization
+    id = _mumps_count[]
+    _mumps_count[] += 1
+
+    # Get or create analysis plan (may be cached)
+    plan, cache_hit = _get_or_create_analysis_plan(A, symmetric)
+
+    # Update value pointer (values may have been updated)
+    plan.mumps.a_loc = pointer(plan.a_loc)
+
     # Factorization phase (job = 2)
-    mumps.job = MUMPS_INT(2)
-    invoke_mumps_unsafe!(mumps)
-    _check_mumps_error(mumps, "factorization")
+    plan.mumps.job = MUMPS_INT(2)
+    invoke_mumps_unsafe!(plan.mumps)
+    _check_mumps_error(plan.mumps, "factorization")
 
     # Pre-allocate RHS buffer on rank 0
-    rhs_buffer = rank == 0 ? zeros(T, n) : T[]
+    rhs_buffer = rank == 0 ? zeros(T, plan.n) : T[]
 
     # Create factorization object with ID
+    # Note: We copy the value array since the plan's array is reused.
+    # The MUMPS object is shared with the cache (owns_mumps=false).
     F = MUMPSFactorizationMPI{T}(
-        id, mumps, irn_loc, jcn_loc, a_loc,
-        n, symmetric, copy(A.row_partition), rhs_buffer
+        id, plan.mumps, plan.irn_loc, plan.jcn_loc, copy(plan.a_loc),
+        plan.n, symmetric, copy(plan.row_partition), rhs_buffer, false
     )
 
     # Register in global registry (prevents GC until removed)
@@ -366,6 +504,10 @@ end
     finalize!(F::MUMPSFactorizationMPI)
 
 Release MUMPS resources. Must be called on all ranks together.
+
+Note: If the MUMPS object is shared with the analysis cache (owns_mumps=false),
+this only removes the factorization from the registry. The MUMPS object itself
+is finalized when `clear_mumps_analysis_cache!()` is called.
 """
 function finalize!(F::MUMPSFactorizationMPI)
     # Check if already finalized (removed from registry)
@@ -376,9 +518,12 @@ function finalize!(F::MUMPSFactorizationMPI)
     # Remove from registry
     delete!(_mumps_registry, F.id)
 
-    # Actually finalize the MUMPS object
-    F.mumps._finalized = false  # Re-enable MUMPS finalization
-    MUMPS.finalize!(F.mumps)
+    # Only finalize the MUMPS object if we own it (not shared with cache)
+    if F.owns_mumps
+        F.mumps._finalized = false  # Re-enable MUMPS finalization
+        MUMPS.finalize!(F.mumps)
+    end
+
     return F
 end
 

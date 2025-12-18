@@ -17,7 +17,7 @@ export mean  # Our mean function for SparseMatrixMPI and VectorMPI
 export io0   # Utility for rank-selective output
 
 # Factorization exports (generic interface, implementation details hidden)
-export solve, solve!, finalize!
+export solve, solve!, finalize!, clear_mumps_analysis_cache!
 
 # Type alias for 256-bit Blake3 hash
 const Blake3Hash = NTuple{32,UInt8}
@@ -124,7 +124,8 @@ const _repartition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}(
 """
     clear_plan_cache!()
 
-Clear all memoized plan caches.
+Clear all memoized plan caches, including the MUMPS analysis cache.
+This is a collective operation that must be called on all MPI ranks together.
 """
 function clear_plan_cache!()
     empty!(_plan_cache)
@@ -134,6 +135,10 @@ function clear_plan_cache!()
     empty!(_repartition_plan_cache)
     if isdefined(@__MODULE__, :_dense_transpose_vector_plan_cache)
         empty!(_dense_transpose_vector_plan_cache)
+    end
+    # Also clear MUMPS analysis cache (defined in mumps_factorization.jl)
+    if isdefined(@__MODULE__, :clear_mumps_analysis_cache!)
+        clear_mumps_analysis_cache!()
     end
 end
 
