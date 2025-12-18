@@ -257,6 +257,70 @@ A = sparse(I, J, V, 100, 100)
 
 Alternatively, use the [local-only construction pattern](#Efficient-Local-Only-Construction) where each rank generates only its own rows.
 
+## MUMPS Solver Threading
+
+LinearAlgebraMPI uses the MUMPS (MUltifrontal Massively Parallel Solver) library for sparse direct solves via `lu()` and `ldlt()`. MUMPS has two independent threading mechanisms that can be tuned for performance.
+
+### Threading Parameters
+
+**OpenMP threads (`OMP_NUM_THREADS`)**
+- Controls MUMPS's algorithm-level parallelism
+- The multifrontal method builds an elimination tree of "frontal matrices"
+- OpenMP threads process independent subtrees in parallel
+- This is coarse-grained: different threads work on different parts of the matrix
+
+**BLAS threads (`OPENBLAS_NUM_THREADS`)**
+- Controls parallelism inside dense matrix operations
+- When MUMPS factors a frontal matrix, it calls BLAS routines (DGEMM, etc.)
+- OpenBLAS can parallelize these dense operations
+- This is fine-grained: threads cooperate on the same dense block
+
+### Recommended Configuration
+
+For behavior that closely matches Julia's built-in sparse solver (UMFPACK):
+
+```bash
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=<number_of_cores>
+```
+
+This configuration uses only BLAS-level threading, which is the same strategy Julia's built-in solver uses.
+
+### Performance Comparison
+
+The following table compares MUMPS (`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=10`) against Julia's built-in sparse solver (also using 10 BLAS threads) on a 2D Laplacian problem. Benchmarks were run on a 2025 M4 MacBook Pro with 10 CPU cores:
+
+| n | Julia (ms) | MUMPS (ms) | Ratio |
+|---|------------|------------|-------|
+| 9 | 0.005 | 0.041 | 8.7x |
+| 100 | 0.021 | 0.070 | 3.3x |
+| 992 | 0.261 | 0.412 | 1.6x |
+| 10,000 | 4.25 | 5.00 | 1.18x |
+| 99,856 | 49.1 | 56.7 | 1.16x |
+| 1,000,000 | 636 | 641 | 1.01x |
+
+Key observations:
+- At small problem sizes, MUMPS has initialization overhead (~0.04ms)
+- At large problem sizes (n ≥ 100,000), MUMPS is within 1-16% of Julia's built-in solver
+- At n = 1,000,000, MUMPS is essentially the same speed (1% slower)
+
+### Default Behavior
+
+Without setting environment variables, both OpenMP and OpenBLAS will attempt to use all available cores, which can lead to thread oversubscription and degraded performance. For predictable results, explicitly set the environment variables before running your program.
+
+### Advanced: Combined Threading
+
+For some problems, combining OpenMP and BLAS threads can be faster:
+
+```bash
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+```
+
+This configuration achieved 14% faster performance than Julia's built-in solver on a 1M DOF 2D Laplacian in testing. However, the optimal configuration depends on your specific problem structure and hardware.
+
+**Important caveat**: `OPENBLAS_NUM_THREADS` is a process-wide setting that affects both MUMPS and Julia's built-in sparse solver (UMFPACK). If you set `OPENBLAS_NUM_THREADS=4` to optimize MUMPS, Julia's built-in solver will also be limited to 4 BLAS threads, potentially slowing it down. This is another reason why `OMP_NUM_THREADS=1` with full BLAS threading is the recommended default—it ensures consistent behavior for all solvers in your program.
+
 ## Next Steps
 
 - See [Examples](@ref) for more detailed usage examples

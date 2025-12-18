@@ -14,6 +14,7 @@ LinearAlgebraMPI.jl provides a high-performance implementation of distributed sp
 - **Scalar multiplication**: Efficient scalar-matrix products
 - **Norms**: Frobenius norm, 1-norm, infinity norm, and general p-norms
 - **Operator norms**: 1-norm and infinity-norm of operators
+- **Direct solvers**: LU and LDLT factorization via MUMPS with configurable threading
 - **Type stability**: Generic implementation supporting `Float64`, `ComplexF64`, and other numeric types
 - **Plan caching**: Communication plans are memoized for repeated operations with the same sparsity pattern
 
