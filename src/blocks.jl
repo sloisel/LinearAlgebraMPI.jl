@@ -125,13 +125,13 @@ function Base.cat(As::SparseMatrixMPI{T}...; dims) where T
             triplets = _gather_rows_from_sparse(A, rows_needed)
 
             # Add triplets with offsets applied
-            for (row_in_block, col_in_block, val) in triplets
-                output_row = row_offsets[bi] + row_in_block
-                local_output_row = output_row - my_out_row_start + 1
-                global_col = col_offset + col_in_block
-                push!(local_I, local_output_row)
-                push!(local_J, global_col)
-                push!(local_V, val)
+            # Use let block to capture loop variables and avoid boxing overhead
+            let row_off = row_offsets[bi], out_start = my_out_row_start, col_off = col_offset
+                for (row_in_block, col_in_block, val) in triplets
+                    push!(local_I, row_off + row_in_block - out_start + 1)
+                    push!(local_J, col_off + col_in_block)
+                    push!(local_V, val)
+                end
             end
         end
     end
@@ -264,12 +264,11 @@ function Base.cat(As::MatrixMPI{T}...; dims) where T
             gathered_rows = _gather_dense_rows(A, rows_needed)
 
             # Place into local matrix (only if we have overlap)
-            if has_overlap
-                for (i, row_in_block) in enumerate(rows_needed)
-                    output_row = row_offsets[bi] + row_in_block
-                    local_row = output_row - my_out_row_start + 1
-                    local_matrix[local_row, col_start:col_end] = gathered_rows[i, :]
-                end
+            # Use block copy instead of element-by-element loop to avoid boxing overhead
+            if has_overlap && !isempty(rows_needed)
+                first_local_row = row_offsets[bi] + first(rows_needed) - my_out_row_start + 1
+                last_local_row = row_offsets[bi] + last(rows_needed) - my_out_row_start + 1
+                local_matrix[first_local_row:last_local_row, col_start:col_end] = gathered_rows
             end
         end
     end
@@ -393,13 +392,12 @@ function _vcat_vectors(vs::VectorMPI{T}...) where T
             # Copy elements from repartitioned vector to output
             first_in_vec = max(1, my_out_start - offset)
             last_in_vec = min(vec_len, my_out_end - offset)
+            n_copy = last_in_vec - first_in_vec + 1
 
-            for idx_in_vec in first_in_vec:last_in_vec
-                global_out_idx = offset + idx_in_vec
-                local_out_idx = global_out_idx - my_out_start + 1
-                local_v_idx = idx_in_vec - my_v_start + 1
-                local_v[local_out_idx] = v_repart.v[local_v_idx]
-            end
+            # Use copyto! instead of element-by-element loop to avoid boxing overhead
+            dst_start = offset + first_in_vec - my_out_start + 1
+            src_start = first_in_vec - my_v_start + 1
+            copyto!(local_v, dst_start, v_repart.v, src_start, n_copy)
         end
     end
 
@@ -512,13 +510,13 @@ function blockdiag(As::SparseMatrixMPI{T}...) where T
         triplets = _gather_rows_from_sparse(A, rows_needed)
 
         # Add triplets with offsets applied
-        for (row_in_block, col_in_block, val) in triplets
-            output_row = row_offsets[k] + row_in_block
-            local_output_row = output_row - my_out_row_start + 1
-            global_col = col_offset + col_in_block
-            push!(local_I, local_output_row)
-            push!(local_J, global_col)
-            push!(local_V, val)
+        # Use let block to capture loop variables and avoid boxing overhead
+        let row_off = row_offsets[k], out_start = my_out_row_start, col_off = col_offset
+            for (row_in_block, col_in_block, val) in triplets
+                push!(local_I, row_off + row_in_block - out_start + 1)
+                push!(local_J, col_off + col_in_block)
+                push!(local_V, val)
+            end
         end
     end
 

@@ -290,10 +290,10 @@ function _get_or_create_analysis_plan(A::SparseMatrixMPI{T}, symmetric::Bool) wh
     set_icntl!(mumps, 21, 0; displaylevel=0)   # Centralized solution on host
     set_icntl!(mumps, 7, 5; displaylevel=0)    # METIS ordering (better fill-in)
 
-    # Set OpenMP threads for MUMPS to match Julia's thread count if OMP_NUM_THREADS not set
-    if !haskey(ENV, "OMP_NUM_THREADS")
-        set_icntl!(mumps, 16, Threads.nthreads(); displaylevel=0)
-    end
+    # Enable OpenMP threading in MUMPS
+    # ICNTL(16) = number of OpenMP threads (0 = use OMP_NUM_THREADS)
+    omp_threads = parse(Int, get(ENV, "OMP_NUM_THREADS", "1"))
+    set_icntl!(mumps, 16, omp_threads; displaylevel=0)
 
     # Set matrix dimension
     mumps.n = MUMPS_INT(n)

@@ -884,30 +884,44 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     # result is (ncols_B, local_nrows_A) = shape of C.AT
     result_AT = plan.AT ⊛ A.A.parent
 
-    # Always compute col_indices and hash from the actual result structure.
-    # NOTE: We cannot cache product_structural_hash because two multiplications with
-    # the same INPUT structural hashes can produce results with DIFFERENT structures.
-    # This happens when the input matrices have the same compressed local structure
-    # but different global positions of nonzeros.
-    result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
-
-    # Build compress_map: compress_map[global_col] = local_col
-    if isempty(result_col_indices)
-        compress_map = Int[]
+    # Use cached col_indices and compress_map if available, otherwise compute and cache
+    if plan.product_col_indices !== nothing
+        result_col_indices = plan.product_col_indices
+        compress_map = plan.product_compress_map
     else
-        max_col = maximum(result_col_indices)
-        compress_map = zeros(Int, max_col)
-        for (local_idx, global_idx) in enumerate(result_col_indices)
-            compress_map[global_idx] = local_idx
+        result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
+
+        # Build compress_map: compress_map[global_col] = local_col
+        if isempty(result_col_indices)
+            compress_map = Int[]
+        else
+            max_col = maximum(result_col_indices)
+            compress_map = zeros(Int, max_col)
+            for (local_idx, global_idx) in enumerate(result_col_indices)
+                compress_map[global_idx] = local_idx
+            end
         end
+
+        # Cache for future use with same structural pattern
+        plan.product_col_indices = result_col_indices
+        plan.product_compress_map = compress_map
+        plan.product_row_partition = A.row_partition
     end
 
     compressed_result_AT = compress_AT_cached(result_AT, compress_map, length(result_col_indices))
-    # Hash computed lazily by _ensure_hash if/when needed for plan caching
-    # This avoids expensive hash computation for results that won't be reused in matrix-matrix multiply
+
+    # Use cached structural hash if available, otherwise compute and cache
+    # This is important for chained operations like (P' * A) * P where the intermediate
+    # result needs a hash for the next multiply's plan lookup
+    result_hash = plan.product_structural_hash
+    if result_hash === nothing
+        # Compute hash for the result structure
+        result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result_AT, MPI.COMM_WORLD)
+        plan.product_structural_hash = result_hash
+    end
 
     # C = A * B has rows from A and columns from B
-    return SparseMatrixMPI{T}(nothing, A.row_partition, B.col_partition, result_col_indices, transpose(compressed_result_AT),
+    return SparseMatrixMPI{T}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(compressed_result_AT),
         nothing)
 end
 
@@ -2563,6 +2577,11 @@ A = spdiagm(0 => v1, 1 => v2)  # Main diagonal and first superdiagonal
 function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
     isempty(kv) && error("spdiagm requires at least one diagonal")
 
+    # Fast path for single main diagonal
+    if length(kv) == 1 && first(kv)[1] == 0
+        return spdiagm(first(kv)[2])
+    end
+
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -2592,7 +2611,7 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
         repartitioned[k] = repartition(v, target)
     end
 
-    # Step 3: Build local triplets (local_row, global_col, value)
+    # Step 3: Build local triplets using vectorized operations
     local_I = Int[]
     local_J = Int[]
     local_V = T[]
@@ -2601,25 +2620,45 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
         vec_len = length(v)
         v_repart = repartitioned[k]
         my_v_start = v_repart.partition[rank+1]
+        my_v_end = v_repart.partition[rank+2] - 1
+        local_v_len = my_v_end - my_v_start + 1
 
-        for local_row_idx in 1:local_nrows
-            global_row = my_row_start + local_row_idx - 1
+        # Compute which local rows have valid diagonal entries
+        # For k >= 0: global_row i -> col i+k, uses v[i]
+        # For k < 0:  global_row i -> col i+k, uses v[i+k]
+        if k >= 0
+            # v[i] goes to (i, i+k), so row = vec_idx, col = vec_idx + k
+            # We have v[my_v_start:my_v_end], these go to rows my_v_start:my_v_end
+            first_row = max(my_row_start, my_v_start)
+            last_row = min(my_row_end, my_v_end)
+        else
+            # v[i] goes to (i-k, i), so row = vec_idx - k, col = vec_idx
+            # Row r uses v[r+k], col = r+k
+            first_row = max(my_row_start, my_v_start - k)
+            last_row = min(my_row_end, my_v_end - k)
+        end
 
+        if first_row <= last_row
+            nentries = last_row - first_row + 1
+            rows = first_row:last_row
+            cols = rows .+ k
+
+            # Filter to valid column range
+            valid = (1 .<= cols .<= n)
+            valid_rows = rows[valid]
+            valid_cols = cols[valid]
+
+            # Local row indices and vector indices
+            local_rows = valid_rows .- my_row_start .+ 1
             if k >= 0
-                vec_idx = global_row
-                col = global_row + k
+                v_indices = valid_rows .- my_v_start .+ 1
             else
-                vec_idx = global_row + k
-                col = vec_idx
+                v_indices = (valid_rows .+ k) .- my_v_start .+ 1
             end
 
-            if 1 <= vec_idx <= vec_len && 1 <= col <= n
-                # Index into repartitioned vector
-                local_v_idx = vec_idx - my_v_start + 1
-                push!(local_I, local_row_idx)
-                push!(local_J, col)
-                push!(local_V, v_repart.v[local_v_idx])
-            end
+            append!(local_I, local_rows)
+            append!(local_J, valid_cols)
+            append!(local_V, v_repart.v[v_indices])
         end
     end
 
@@ -2722,8 +2761,34 @@ v = VectorMPI([1.0, 2.0, 3.0])
 A = spdiagm(v)  # 3×3 diagonal matrix
 ```
 """
-function spdiagm(v::VectorMPI)
-    return spdiagm(0 => v)
+function spdiagm(v::VectorMPI{T}) where T
+    # Ultra-fast path for main diagonal: build CSC structure directly
+    n = length(v)
+    comm = MPI.COMM_WORLD
+    rank = MPI.Comm_rank(comm)
+
+    my_start = v.partition[rank+1]
+    local_n = length(v.v)
+
+    # Build AT (transpose) as CSC directly - no sparse() call needed
+    # AT has size (n_cols, local_n_rows): n global columns, local_n local rows
+    # Column j of AT corresponds to local row j, which has one entry at global column my_start+j-1
+    #
+    # IMPORTANT: AT.rowval stores LOCAL/compressed column indices (1, 2, 3, ...)
+    # col_indices maps these local indices to global column indices
+    colptr = collect(1:(local_n+1))  # Each column has exactly 1 entry
+    rowval = collect(1:local_n)  # LOCAL column indices (compressed)
+    nzval = copy(v.v)
+
+    AT_local = SparseMatrixCSC(n, local_n, colptr, rowval, nzval)
+
+    # col_indices maps local column index -> global column index
+    col_indices = collect(my_start:(my_start + local_n - 1))
+    row_partition = v.partition  # Use same partition as input vector
+    col_partition = v.partition  # Square matrix, same column partition
+
+    return SparseMatrixMPI{T}(nothing, row_partition, col_partition, col_indices,
+                               transpose(AT_local), nothing)
 end
 
 """
