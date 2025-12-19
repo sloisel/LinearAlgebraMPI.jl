@@ -182,11 +182,36 @@ x = F \ b
 finalize!(F)
 ```
 
-## MUMPS Solver Threading
+## Threading
+
+LinearAlgebraMPI has three independent threading mechanisms that affect different parts of the computation:
+
+1. **Julia threads** (`julia -t N`) - Affects the `⊛` operator for local sparse matrix multiplication
+2. **OpenMP threads** (`OMP_NUM_THREADS`) - Affects MUMPS algorithm-level parallelism
+3. **BLAS threads** (`OPENBLAS_NUM_THREADS`) - Affects dense matrix operations in both Julia and MUMPS
+
+### Julia Threads (`-t` flag)
+
+Julia threads affect the `⊛` operator, which performs multithreaded local sparse matrix multiplication. In `C = A ⊛ B`, the matrix B is partitioned column-wise into `nthreads` blocks `[B₁, ..., Bₙ]`, and each block `A * Bₖ` is computed in parallel using Julia's built-in sparse multiplication.
+
+```bash
+julia -t 8 your_script.jl     # Use 8 Julia threads
+julia --threads=auto ...      # Automatically detect available cores
+```
+
+This is used internally by `SparseMatrixMPI` multiplication, where after gathering the required rows from other ranks, the local computation uses `⊛` to exploit multiple cores. The operator automatically limits threads based on matrix size (at least 100 columns per thread) to avoid overhead for small problems.
+
+```julia
+using LinearAlgebraMPI: ⊛
+
+# Direct use (for local SparseMatrixCSC matrices)
+C = A ⊛ B                    # Use all available Julia threads
+C = ⊛(A, B; max_threads=2)   # Limit to 2 threads
+```
+
+### MUMPS Solver Threading
 
 LinearAlgebraMPI uses the MUMPS (MUltifrontal Massively Parallel Solver) library for sparse direct solves via `lu()` and `ldlt()`. MUMPS has two independent threading mechanisms that can be tuned for performance.
-
-### Threading Parameters
 
 **OpenMP threads (`OMP_NUM_THREADS`)**
 - Controls MUMPS's algorithm-level parallelism
@@ -233,15 +258,15 @@ Key observations:
 
 ### Default Behavior
 
-For optimal performance, set threading environment variables **before starting Julia**:
+For optimal performance, set threading parameters **when starting Julia**:
 
 ```bash
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=10  # or your number of CPU cores
-julia your_script.jl
+julia -t 10 your_script.jl      # Julia threads for ⊛ operator
 ```
 
-This is necessary because OpenBLAS creates its thread pool during library initialization, before LinearAlgebraMPI has a chance to configure it. LinearAlgebraMPI attempts to set sensible defaults programmatically, but this may not always take effect if the thread pool is already initialized.
+Environment variables must be set before starting Julia because OpenBLAS creates its thread pool during library initialization. LinearAlgebraMPI attempts to set sensible defaults programmatically, but this may not always take effect if the thread pool is already initialized.
 
 You can also add these to your shell profile (`.bashrc`, `.zshrc`, etc.) or Julia's `startup.jl`:
 
@@ -251,18 +276,23 @@ ENV["OMP_NUM_THREADS"] = "1"
 ENV["OPENBLAS_NUM_THREADS"] = string(Sys.CPU_THREADS)
 ```
 
+Note: Julia threads (`-t`) must be set on the command line; they cannot be changed after Julia starts.
+
 ### Advanced: Combined Threading
 
-For some problems, combining OpenMP and BLAS threads can be faster:
+For some problems, combining multiple threading mechanisms can be faster:
 
 ```bash
 export OMP_NUM_THREADS=4
 export OPENBLAS_NUM_THREADS=4
+julia -t 8 your_script.jl
 ```
 
-This configuration achieved 14% faster performance than Julia's built-in solver on a 1M DOF 2D Laplacian in testing. However, the optimal configuration depends on your specific problem structure and hardware.
+This MUMPS configuration (OMP=4, BLAS=4) achieved 14% faster performance than Julia's built-in solver on a 1M DOF 2D Laplacian in testing. However, the optimal configuration depends on your specific problem structure and hardware.
 
-**Important caveat**: `OPENBLAS_NUM_THREADS` is a process-wide setting that affects both MUMPS and Julia's built-in sparse solver (UMFPACK). If you set `OPENBLAS_NUM_THREADS=4` to optimize MUMPS, Julia's built-in solver will also be limited to 4 BLAS threads, potentially slowing it down. This is another reason why `OMP_NUM_THREADS=1` with full BLAS threading is the recommended default—it ensures consistent behavior for all solvers in your program.
+**Important caveats**:
+- `OPENBLAS_NUM_THREADS` is a process-wide setting that affects both MUMPS and Julia's built-in sparse solver (UMFPACK). If you set `OPENBLAS_NUM_THREADS=4` to optimize MUMPS, Julia's built-in solver will also be limited to 4 BLAS threads.
+- Julia threads primarily benefit `SparseMatrixMPI` multiplication (via the `⊛` operator). For solve-dominated workloads, tuning OMP and BLAS threads is more important.
 
 ## Row-wise Operations with map_rows
 
