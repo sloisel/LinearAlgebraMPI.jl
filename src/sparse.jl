@@ -814,51 +814,6 @@ function execute_plan!(plan::MatrixPlan{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {
     return plan.AT
 end
 """
-    ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads=Threads.nthreads()) where {Tv,Ti}
-
-Multithreaded sparse matrix multiplication. Splits B into column blocks
-and computes `A * B_block` in parallel using Julia's optimized builtin `*`.
-
-# Threading behavior
-- Uses at most `n ÷ 100` threads, where `n = size(B, 2)`, ensuring at least 100 columns per thread
-- Falls back to single-threaded `A * B` when `n < 100` or when threading overhead would dominate
-- The `max_threads` keyword limits the maximum number of threads used
-
-# Examples
-```julia
-using SparseArrays
-A = sprand(1000, 1000, 0.01)
-B = sprand(1000, 500, 0.01)
-C = A ⊛ B                    # Use all available threads (up to n÷100)
-C = ⊛(A, B; max_threads=2)   # Limit to 2 threads
-```
-"""
-function ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads::Int=Threads.nthreads()) where {Tv,Ti}
-    n = size(B, 2)
-    nthreads = min(max_threads, n ÷ 100)
-    if nthreads <= 1
-        return A * B
-    end
-
-    # Column range for thread t: col_start(t):col_end(t)
-    cols_per_thread, remainder = divrem(n, nthreads)
-    @inline col_start(t) = 1 + (t - 1) * cols_per_thread + min(t - 1, remainder)
-    @inline col_end(t) = t * cols_per_thread + min(t, remainder)
-
-    # Storage for block results
-    results = Vector{SparseMatrixCSC{Tv,Ti}}(undef, nthreads)
-
-    # Compute A * B_block in parallel using builtin *
-    Threads.@threads :static for t in 1:nthreads
-        B_block = B[:, col_start(t):col_end(t)]
-        results[t] = A * B_block
-    end
-
-    # Concatenate results horizontally
-    return hcat(results...)
-end
-
-"""
     _compute_symbolic_multiply!(plan::MatrixPlan{T,Ti}, A_parent::SparseMatrixCSC{T,Ti}) where {T,Ti}
 
 Compute the symbolic multiplication for C = plan.AT * A_parent.
@@ -3323,14 +3278,47 @@ end
 # ============================================================================
 
 """
-    Base.:+(A::SparseMatrixMPI{T}, J::UniformScaling) where T
+    IdentityAdditionPlan{T,Ti}
 
-Add a scalar multiple of the identity matrix to A.
-Returns A + λI where J = λI.
+A precomputed plan for adding/subtracting λI to/from a sparse matrix.
+Stores the result structure and diagonal indices for efficient execution.
 
-The matrix must be square for this operation.
+If A already has all diagonal entries, the result has the same structure as A.
+Otherwise, the result may have additional diagonal entries.
 """
-function Base.:+(A::SparseMatrixMPI{T}, J::UniformScaling) where T
+mutable struct IdentityAdditionPlan{T,Ti}
+    # Result matrix structure (colptr and rowval may differ from A if diagonals are added)
+    colptr::Vector{Ti}
+    rowval::Vector{Ti}
+
+    # Indices for execution:
+    # - A_src[k] -> A.nzval index to copy from
+    # - dst[k] -> result.nzval index to copy to
+    A_src::Vector{Ti}
+    dst::Vector{Ti}
+
+    # Diagonal indices in result.nzval (for adding λ)
+    diag_indices::Vector{Ti}
+
+    # Whether structure matches A (no new diagonals needed)
+    same_structure::Bool
+
+    # Result metadata
+    row_partition::Vector{Int}
+    col_partition::Vector{Int}
+    col_indices::Vector{Int}
+
+    # Cached structural hash
+    structural_hash::Blake3Hash
+end
+
+"""
+    IdentityAdditionPlan(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
+
+Create a plan for computing A + λI.
+The plan precomputes the result structure and diagonal indices.
+"""
+function IdentityAdditionPlan(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     m, n = size(A)
     if m != n
         throw(DimensionMismatch("matrix must be square to add UniformScaling"))
@@ -3339,74 +3327,228 @@ function Base.:+(A::SparseMatrixMPI{T}, J::UniformScaling) where T
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
-    λ = J.λ
-    RT = promote_type(T, typeof(λ))
-
     my_row_start = A.row_partition[rank + 1]
     my_row_end = A.row_partition[rank + 2] - 1
     local_nrows = my_row_end - my_row_start + 1
 
-    # Gather diagonal elements we need to modify for our local rows
-    # Each local row i corresponds to global row my_row_start + i - 1
-    # The diagonal element for that row is at column my_row_start + i - 1
-
-    # Build COO format for the result
-    local_I = Int[]
-    local_J = Int[]
-    local_V = RT[]
-
-    AT = A.A.parent  # underlying CSC
+    AT = A.A.parent  # underlying CSC (ncols x local_nrows)
     col_indices = A.col_indices
 
+    # Check if all diagonals already exist in A
+    all_diags_exist = true
     for local_row in 1:local_nrows
         global_row = my_row_start + local_row - 1
-        diag_col = global_row  # Diagonal element
-
-        # Iterate over existing entries in this row
-        found_diag = false
+        found = false
         for nz_idx in AT.colptr[local_row]:(AT.colptr[local_row+1]-1)
-            local_col_idx = AT.rowval[nz_idx]
-            global_col = col_indices[local_col_idx]
-            val = AT.nzval[nz_idx]
-
-            if global_col == diag_col
-                # This is the diagonal - add λ
-                push!(local_I, local_row)
-                push!(local_J, global_col)
-                push!(local_V, RT(val) + RT(λ))
-                found_diag = true
-            else
-                # Non-diagonal - keep as is
-                push!(local_I, local_row)
-                push!(local_J, global_col)
-                push!(local_V, RT(val))
+            if col_indices[AT.rowval[nz_idx]] == global_row
+                found = true
+                break
             end
         end
-
-        # If diagonal wasn't in the sparsity pattern, add it
-        if !found_diag && diag_col <= n
-            push!(local_I, local_row)
-            push!(local_J, diag_col)
-            push!(local_V, RT(λ))
+        if !found && global_row <= n
+            all_diags_exist = false
+            break
         end
     end
 
-    # Build M^T directly as CSC (swap I↔J), then wrap in lazy transpose for CSR
-    # This avoids an unnecessary physical transpose operation
-    AT_local = isempty(local_I) ?
-        SparseMatrixCSC(n, local_nrows, ones(Int, local_nrows + 1), Int[], RT[]) :
-        sparse(local_J, local_I, local_V, n, local_nrows)
+    if all_diags_exist
+        # Fast path: result has same structure as A
+        A_src = Ti.(1:length(AT.nzval))
+        dst = Ti.(1:length(AT.nzval))
 
-    return SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+        # Find diagonal indices
+        diag_indices = Ti[]
+        for local_row in 1:local_nrows
+            global_row = my_row_start + local_row - 1
+            for nz_idx in AT.colptr[local_row]:(AT.colptr[local_row+1]-1)
+                if col_indices[AT.rowval[nz_idx]] == global_row
+                    push!(diag_indices, nz_idx)
+                    break
+                end
+            end
+        end
+
+        # Compute structural hash (same as A since structure unchanged)
+        structural_hash = A.structural_hash
+        if structural_hash === nothing
+            structural_hash = compute_structural_hash(A.row_partition, col_indices, AT, comm)
+        end
+
+        return IdentityAdditionPlan{T,Ti}(
+            AT.colptr, AT.rowval, A_src, dst, diag_indices, true,
+            A.row_partition, A.col_partition, col_indices, structural_hash
+        )
+    else
+        # Slow path: need to add diagonal entries
+        # Build new structure with diagonals
+
+        # First pass: count entries per row including new diagonals
+        new_col_indices_set = Set(col_indices)
+        for local_row in 1:local_nrows
+            global_row = my_row_start + local_row - 1
+            if global_row <= n
+                push!(new_col_indices_set, global_row)
+            end
+        end
+        new_col_indices = sort(collect(new_col_indices_set))
+
+        # Build col_map: old local col -> new local col
+        col_map = zeros(Int, length(col_indices))
+        for (old_idx, global_col) in enumerate(col_indices)
+            col_map[old_idx] = searchsortedfirst(new_col_indices, global_col)
+        end
+
+        # Build new structure
+        colptr = Vector{Ti}(undef, local_nrows + 1)
+        colptr[1] = 1
+
+        for local_row in 1:local_nrows
+            global_row = my_row_start + local_row - 1
+            diag_new_col = searchsortedfirst(new_col_indices, global_row)
+
+            # Count entries: existing + possibly new diagonal
+            count = AT.colptr[local_row+1] - AT.colptr[local_row]
+            has_diag = false
+            for nz_idx in AT.colptr[local_row]:(AT.colptr[local_row+1]-1)
+                if col_indices[AT.rowval[nz_idx]] == global_row
+                    has_diag = true
+                    break
+                end
+            end
+            if !has_diag && global_row <= n
+                count += 1
+            end
+            colptr[local_row + 1] = colptr[local_row] + count
+        end
+
+        nnz_result = colptr[local_nrows + 1] - 1
+        rowval = Vector{Ti}(undef, nnz_result)
+        A_src = Ti[]
+        dst = Ti[]
+        diag_indices = Ti[]
+
+        # Second pass: build rowval and index mappings
+        for local_row in 1:local_nrows
+            global_row = my_row_start + local_row - 1
+            diag_new_col = global_row <= n ? searchsortedfirst(new_col_indices, global_row) : 0
+
+            result_idx = colptr[local_row]
+            has_diag = false
+
+            # Collect (new_col_idx, old_nz_idx or -1 for new diag)
+            entries = Tuple{Int,Int}[]
+            for nz_idx in AT.colptr[local_row]:(AT.colptr[local_row+1]-1)
+                new_col = col_map[AT.rowval[nz_idx]]
+                push!(entries, (new_col, nz_idx))
+                if col_indices[AT.rowval[nz_idx]] == global_row
+                    has_diag = true
+                end
+            end
+            if !has_diag && global_row <= n
+                push!(entries, (diag_new_col, -1))  # -1 marks new diagonal
+            end
+
+            # Sort by new column index
+            sort!(entries, by=x->x[1])
+
+            for (new_col, old_nz_idx) in entries
+                rowval[result_idx] = new_col
+                if old_nz_idx > 0
+                    push!(A_src, old_nz_idx)
+                    push!(dst, result_idx)
+                    if col_indices[AT.rowval[old_nz_idx]] == global_row
+                        push!(diag_indices, result_idx)
+                    end
+                else
+                    # New diagonal entry (will be set to λ, not copied from A)
+                    push!(diag_indices, result_idx)
+                end
+                result_idx += 1
+            end
+        end
+
+        # Compute structural hash
+        temp_nzval = Vector{T}(undef, nnz_result)
+        temp_csc = SparseMatrixCSC(length(new_col_indices), local_nrows, colptr, rowval, temp_nzval)
+        structural_hash = compute_structural_hash(A.row_partition, new_col_indices, temp_csc, comm)
+
+        return IdentityAdditionPlan{T,Ti}(
+            colptr, rowval, A_src, dst, diag_indices, false,
+            A.row_partition, A.col_partition, new_col_indices, structural_hash
+        )
+    end
 end
 
 """
-    Base.:-(A::SparseMatrixMPI{T}, J::UniformScaling) where T
+    _get_identity_addition_plan(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
+
+Get or create a cached identity addition plan for A + λI.
+"""
+function _get_identity_addition_plan(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    _ensure_hash(A)
+    key = (A.structural_hash, T, Ti)
+    if haskey(_identity_addition_plan_cache, key)
+        return _identity_addition_plan_cache[key]::IdentityAdditionPlan{T,Ti}
+    end
+    plan = IdentityAdditionPlan(A)
+    _identity_addition_plan_cache[key] = plan
+    return plan
+end
+
+"""
+    Base.:+(A::SparseMatrixMPI{T,Ti}, J::UniformScaling) where {T,Ti}
+
+Add a scalar multiple of the identity matrix to A using plan-based execution.
+Returns A + λI where J = λI.
+"""
+function Base.:+(A::SparseMatrixMPI{T,Ti}, J::UniformScaling) where {T,Ti}
+    plan = _get_identity_addition_plan(A)
+
+    λ = J.λ
+    RT = promote_type(T, typeof(λ))
+
+    # Allocate result
+    nnz_result = plan.colptr[end] - 1
+    nzval = Vector{RT}(undef, nnz_result)
+
+    if plan.same_structure
+        # Fast path: copy all values, then add λ to diagonals
+        A_nzval = A.A.parent.nzval
+        @inbounds for k in eachindex(plan.A_src)
+            nzval[plan.dst[k]] = A_nzval[plan.A_src[k]]
+        end
+        @inbounds for k in plan.diag_indices
+            nzval[k] += RT(λ)
+        end
+    else
+        # Slow path: zero first, copy from A, then set diagonals
+        fill!(nzval, zero(RT))
+        A_nzval = A.A.parent.nzval
+        @inbounds for k in eachindex(plan.A_src)
+            nzval[plan.dst[k]] = A_nzval[plan.A_src[k]]
+        end
+        # Diagonal indices include both existing and new diagonals
+        # For existing diagonals, we've already copied the value, so just add λ
+        # For new diagonals, value is 0, so adding λ sets it correctly
+        @inbounds for k in plan.diag_indices
+            nzval[k] += RT(λ)
+        end
+    end
+
+    result_csc = SparseMatrixCSC(length(plan.col_indices), length(plan.colptr) - 1,
+                                  plan.colptr, plan.rowval, nzval)
+
+    return SparseMatrixMPI{RT,Ti}(plan.structural_hash, plan.row_partition, plan.col_partition,
+        plan.col_indices, transpose(result_csc), nothing, nothing)
+end
+
+"""
+    Base.:-(A::SparseMatrixMPI{T,Ti}, J::UniformScaling) where {T,Ti}
 
 Subtract a scalar multiple of the identity matrix from A.
 Returns A - λI where J = λI.
 """
-function Base.:-(A::SparseMatrixMPI{T}, J::UniformScaling) where T
+function Base.:-(A::SparseMatrixMPI{T,Ti}, J::UniformScaling) where {T,Ti}
     return A + UniformScaling(-J.λ)
 end
 
@@ -3425,9 +3567,45 @@ end
 
 Subtract a sparse matrix from a scalar multiple of the identity.
 Returns λI - A where J = λI.
+
+This is optimized to avoid creating an intermediate -A matrix.
 """
 function Base.:-(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
-    return (-A) + J
+    plan = _get_identity_addition_plan(A)
+
+    λ = J.λ
+    RT = promote_type(T, typeof(λ))
+
+    # Allocate result
+    nnz_result = plan.colptr[end] - 1
+    nzval = Vector{RT}(undef, nnz_result)
+
+    if plan.same_structure
+        # Fast path: copy negated values, then add λ to diagonals
+        A_nzval = A.A.parent.nzval
+        @inbounds for k in eachindex(plan.A_src)
+            nzval[plan.dst[k]] = -A_nzval[plan.A_src[k]]
+        end
+        @inbounds for k in plan.diag_indices
+            nzval[k] += RT(λ)
+        end
+    else
+        # Slow path: zero first, copy negated from A, then add λ to diagonals
+        fill!(nzval, zero(RT))
+        A_nzval = A.A.parent.nzval
+        @inbounds for k in eachindex(plan.A_src)
+            nzval[plan.dst[k]] = -A_nzval[plan.A_src[k]]
+        end
+        @inbounds for k in plan.diag_indices
+            nzval[k] += RT(λ)
+        end
+    end
+
+    result_csc = SparseMatrixCSC(length(plan.col_indices), length(plan.colptr) - 1,
+                                  plan.colptr, plan.rowval, nzval)
+
+    return SparseMatrixMPI{RT,Ti}(plan.structural_hash, plan.row_partition, plan.col_partition,
+        plan.col_indices, transpose(result_csc), nothing, nothing)
 end
 
 # ============================================================================

@@ -86,9 +86,6 @@ end
         @test occursin("Fail: 0", output)
         @test occursin("Error: 0", output)
     end
-    @testset "Threaded Sparse Multiplication" begin
-        run_mpi_test(joinpath(@__DIR__, "test_threaded_mul.jl"); nprocs=4, expect_success=true)
-    end
     @testset "Mixed Sparse-Dense Operations" begin
         run_mpi_test(joinpath(@__DIR__, "test_new_operations.jl"); nprocs=4, expect_success=true)
     end

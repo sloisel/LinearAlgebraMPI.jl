@@ -11,7 +11,6 @@ import LinearAlgebra: tr, diag, triu, tril, Transpose, Adjoint, norm, opnorm, mu
 export SparseMatrixMPI, MatrixMPI, VectorMPI, clear_plan_cache!, uniform_partition, repartition
 export SparseMatrixCSR  # Type alias for Transpose{SparseMatrixCSC} (CSR storage format)
 export map_rows  # Row-wise map over distributed vectors/matrices
-export ⊛  # Multithreaded sparse matrix multiplication
 export VectorMPI_local, MatrixMPI_local, SparseMatrixMPI_local  # Local constructors
 export mean  # Our mean function for SparseMatrixMPI and VectorMPI
 export io0   # Utility for rank-selective output
@@ -131,6 +130,10 @@ const _diag_hash_cache = Dict{Blake3Hash,Blake3Hash}()
 # Key: (A_hash, B_hash, T, Ti) - use full 256-bit hashes
 const _addition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType,DataType},Any}()
 
+# Cache for memoized IdentityAdditionPlans (for A + λI)
+# Key: (A_hash, T, Ti) - use full 256-bit hash
+const _identity_addition_plan_cache = Dict{Tuple{Blake3Hash,DataType,DataType},Any}()
+
 """
     clear_plan_cache!()
 
@@ -145,6 +148,7 @@ function clear_plan_cache!()
     empty!(_repartition_plan_cache)
     empty!(_diag_hash_cache)
     empty!(_addition_plan_cache)
+    empty!(_identity_addition_plan_cache)
     if isdefined(@__MODULE__, :_dense_transpose_vector_plan_cache)
         empty!(_dense_transpose_vector_plan_cache)
     end
