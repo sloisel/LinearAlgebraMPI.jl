@@ -213,9 +213,9 @@ export OPENBLAS_NUM_THREADS=<number_of_cores>
 
 This configuration uses only BLAS-level threading, which is the same strategy Julia's built-in solver uses.
 
-### Performance Comparison
+### Performance Comparison (Single-Rank)
 
-The following table compares MUMPS (`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=10`) against Julia's built-in sparse solver (also using the same settings) on a 2D Laplacian problem. Benchmarks were run on a 2025 M4 MacBook Pro with 10 CPU cores:
+The following table compares MUMPS (`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=10`) against Julia's built-in sparse solver (also using the same settings) on a 2D Laplacian problem. **This is a single-rank comparison** to establish baseline overhead; multi-rank MPI parallelism provides additional speedup. Benchmarks were run on a 2025 M4 MacBook Pro with 10 CPU cores:
 
 | n | Julia (ms) | MUMPS (ms) | Ratio |
 |---|------------|------------|-------|
