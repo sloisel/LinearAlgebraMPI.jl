@@ -1047,7 +1047,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_rng::UnitRange{Int}, col_rng::
         empty_AT = SparseMatrixCSC(new_ncols, my_local_rows, ones(Int, my_local_rows + 1), Int[], T[])
         hash = compute_structural_hash(new_row_partition, Int[], empty_AT, comm)
         return SparseMatrixMPI{T}(hash, new_row_partition, new_col_partition, Int[],
-                                   transpose(empty_AT), nothing)
+                                   transpose(empty_AT), nothing, nothing)
     end
 
     # Compute new row partition (local computation, no communication)
@@ -1157,7 +1157,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_rng::UnitRange{Int}, col_rng::
     hash = compute_structural_hash(new_row_partition, final_col_indices, new_AT, comm)
 
     return SparseMatrixMPI{T}(hash, new_row_partition, new_col_partition, final_col_indices,
-                               transpose(new_AT), nothing)
+                               transpose(new_AT), nothing, nothing)
 end
 
 # Convenience: A[row_rng, :] - all columns

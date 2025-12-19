@@ -6,7 +6,7 @@ using SparseArrays
 using MUMPS
 import SparseArrays: nnz, issparse, dropzeros, spdiagm, blockdiag
 import LinearAlgebra
-import LinearAlgebra: tr, diag, triu, tril, Transpose, Adjoint, norm, opnorm, mul!, ldlt, BLAS, issymmetric, UniformScaling, dot
+import LinearAlgebra: tr, diag, triu, tril, Transpose, Adjoint, norm, opnorm, mul!, ldlt, BLAS, issymmetric, UniformScaling, dot, Symmetric
 
 export SparseMatrixMPI, MatrixMPI, VectorMPI, clear_plan_cache!, uniform_partition, repartition
 export SparseMatrixCSR  # Type alias for Transpose{SparseMatrixCSC} (CSR storage format)
@@ -414,16 +414,24 @@ end
     LinearAlgebra.issymmetric(A::SparseMatrixMPI{T}) where T
 
 Check if A is symmetric by materializing the transpose and comparing rows.
-Returns true if A == transpose(A).
+Returns true if A == transpose(A). Result is cached for subsequent calls.
 """
 function LinearAlgebra.issymmetric(A::SparseMatrixMPI{T}) where T
+    # Return cached result if available
+    if A.cached_symmetric !== nothing
+        return A.cached_symmetric
+    end
+
     m, n = size(A)
     if m != n
+        A.cached_symmetric = false
         return false
     end
 
     At = SparseMatrixMPI(transpose(A))
-    return _compare_rows_distributed(A, At)
+    result = _compare_rows_distributed(A, At)
+    A.cached_symmetric = result
+    return result
 end
 
 # ============================================================================
@@ -433,11 +441,25 @@ end
 """
     Base.:\\(A::SparseMatrixMPI{T}, b::VectorMPI{T}) where T
 
-Solve A*x = b using LDLT if A is symmetric, otherwise LU.
+Solve A*x = b using LU factorization.
+For symmetric matrices, use `Symmetric(A) \\ b` to use the faster LDLT factorization.
 For repeated solves, compute the factorization once with `lu(A)` or `ldlt(A)`.
 """
 function Base.:\(A::SparseMatrixMPI{T}, b::VectorMPI{T}) where T
-    F = issymmetric(A) ? LinearAlgebra.ldlt(A) : LinearAlgebra.lu(A)
+    F = LinearAlgebra.lu(A)
+    x = F \ b
+    finalize!(F)
+    return x
+end
+
+"""
+    Base.:\\(A::Symmetric{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
+
+Solve A*x = b for a symmetric matrix using LDLT (no symmetry check needed).
+Use `Symmetric(A)` to wrap a known-symmetric matrix and skip the expensive symmetry check.
+"""
+function Base.:\(A::Symmetric{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
+    F = LinearAlgebra.ldlt(parent(A))
     x = F \ b
     finalize!(F)
     return x
@@ -446,11 +468,11 @@ end
 """
     Base.:\\(At::Transpose{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
 
-Solve transpose(A)*x = b using LDLT if transpose(A) is symmetric, otherwise LU.
+Solve transpose(A)*x = b using LU factorization.
 """
 function Base.:\(At::Transpose{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
     A_t = SparseMatrixMPI(At)
-    F = issymmetric(A_t) ? LinearAlgebra.ldlt(A_t) : LinearAlgebra.lu(A_t)
+    F = LinearAlgebra.lu(A_t)
     x = F \ b
     finalize!(F)
     return x
@@ -762,10 +784,10 @@ _get_row_partition(A::MatrixMPI) = A.row_partition
     _local_rows(A::MatrixMPI)
 
 Get an iterator over local rows of a distributed type.
-For VectorMPI, each "row" is a single element (wrapped as a view).
+For VectorMPI, returns the local vector directly (iteration yields scalars).
 For MatrixMPI, each row is a row vector.
 """
-_local_rows(A::VectorMPI) = (view(A.v, i:i) for i in 1:length(A.v))
+_local_rows(A::VectorMPI) = A.v
 _local_rows(A::MatrixMPI) = eachrow(A.A)
 
 """
@@ -864,9 +886,8 @@ function map_rows(f, A...)
     # Get iterators over local rows
     row_iters = map(_local_rows, aligned)
 
-    # Apply f to corresponding rows
-    # Use zip to iterate over corresponding rows from all inputs
-    results = [f(rows...) for rows in zip(row_iters...)]
+    # Apply f to corresponding rows using map for performance
+    results = collect(map(f, row_iters...))
 
     # Determine result type based on what f returned (matching vcat semantics)
     # Need to handle empty results case by communicating type info across ranks
