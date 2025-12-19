@@ -121,14 +121,14 @@ function compute_structural_hash(row_partition::Vector{Int}, col_indices::Vector
 end
 
 """
-    compress_AT(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int}) where T
+    compress_AT(AT::SparseMatrixCSC{T,Ti}, col_indices::Vector{Int}) where {T,Ti}
 
 Compress AT from global column indices to local indices 1:length(col_indices).
 Returns a new SparseMatrixCSC with m = length(col_indices).
 
 The col_indices array provides the local→global mapping: col_indices[local_idx] = global_col.
 """
-function compress_AT(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int}) where T
+function compress_AT(AT::SparseMatrixCSC{T,Ti}, col_indices::Vector{Int}) where {T,Ti}
     if isempty(col_indices)
         return SparseMatrixCSC(0, AT.n, AT.colptr, Int[], T[])
     end
@@ -143,7 +143,7 @@ end
 Optimized reindex using precomputed mapping vector.
 col_to_union_map[local_idx] gives the union index for local column index local_idx.
 """
-function reindex_to_union_cached(AT::SparseMatrixCSC{T,Int}, col_to_union_map::Vector{Int}, union_size::Int) where T
+function reindex_to_union_cached(AT::SparseMatrixCSC{T,Ti}, col_to_union_map::Vector{Int}, union_size::Int) where {T,Ti}
     if isempty(AT.rowval)
         return SparseMatrixCSC(union_size, AT.n, AT.colptr, Int[], T[])
     end
@@ -157,7 +157,7 @@ end
 Optimized compress_AT using precomputed mapping vector.
 compress_map[global_idx] gives the local index for global column index global_idx.
 """
-function compress_AT_cached(AT::SparseMatrixCSC{T,Int}, compress_map::Vector{Int}, local_size::Int) where T
+function compress_AT_cached(AT::SparseMatrixCSC{T,Ti}, compress_map::Vector{Int}, local_size::Int) where {T,Ti}
     if isempty(AT.rowval)
         return SparseMatrixCSC(local_size, AT.n, AT.colptr, Int[], T[])
     end
@@ -182,9 +182,9 @@ Note: AT stores rows in its columns (transpose layout), so:
 - AT column = local row index
 - AT row = local column index (into col_indices)
 """
-function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Int}, col_indices::Vector{Int},
+function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Ti}, col_indices::Vector{Int},
     insertions::Vector{Tuple{Int,Int,T}},
-    row_offset::Int) where T
+    row_offset::Int) where {T,Ti}
     if isempty(insertions)
         return AT, col_indices
     end
@@ -258,16 +258,20 @@ function _rebuild_AT_with_insertions(AT::SparseMatrixCSC{T,Int}, col_indices::Ve
 end
 
 """
-    SparseMatrixMPI{T}
+    SparseMatrixMPI{T,Ti}
 
 A distributed sparse matrix partitioned by rows across MPI ranks.
+
+# Type Parameters
+- `T`: Element type (e.g., `Float64`, `ComplexF64`)
+- `Ti`: Index type (e.g., `Int`, `Int32`), defaults to `Int`
 
 # Fields
 - `structural_hash::Blake3Hash`: 256-bit Blake3 hash of the structural pattern
 - `row_partition::Vector{Int}`: Row partition boundaries, length = nranks + 1
 - `col_partition::Vector{Int}`: Column partition boundaries, length = nranks + 1 (placeholder for transpose)
 - `col_indices::Vector{Int}`: Global column indices that appear in the local part (local→global mapping)
-- `A::SparseMatrixCSR{T,Int}`: Local rows in CSR format for efficient row-wise iteration
+- `A::SparseMatrixCSR{T,Ti}`: Local rows in CSR format for efficient row-wise iteration
 - `cached_transpose`: Cached materialized transpose (bidirectionally linked)
 
 # Invariants
@@ -299,18 +303,18 @@ the global number of columns even if only a few columns have nonzeros locally.
 
 Access the underlying CSC storage via `A.parent` when needed for low-level operations.
 """
-mutable struct SparseMatrixMPI{T} <: AbstractMatrix{T}
+mutable struct SparseMatrixMPI{T,Ti} <: AbstractMatrix{T}
     structural_hash::OptionalBlake3Hash
     row_partition::Vector{Int}
     col_partition::Vector{Int}
     col_indices::Vector{Int}
-    A::SparseMatrixCSR{T,Int}  # Local rows in CSR format (row-major storage)
-    cached_transpose::Union{Nothing,SparseMatrixMPI{T}}
+    A::SparseMatrixCSR{T,Ti}  # Local rows in CSR format (row-major storage)
+    cached_transpose::Union{Nothing,SparseMatrixMPI{T,Ti}}
     cached_symmetric::Union{Nothing,Bool}  # Cache for issymmetric result
 end
 
 """
-    SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int}; comm=MPI.COMM_WORLD, row_partition=..., col_partition=...) where T
+    SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Ti}; comm=MPI.COMM_WORLD, row_partition=..., col_partition=...) where {T,Ti}
 
 Create a SparseMatrixMPI from a global sparse matrix A, partitioning it by rows across MPI ranks.
 
@@ -327,10 +331,10 @@ Each rank extracts only its local rows from `A`, so:
 
 Use `uniform_partition(n, nranks)` to compute custom partitions.
 """
-function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int};
+function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Ti};
     comm::MPI.Comm=MPI.COMM_WORLD,
     row_partition::Vector{Int}=uniform_partition(size(A, 1), MPI.Comm_size(comm)),
-    col_partition::Vector{Int}=uniform_partition(size(A, 2), MPI.Comm_size(comm))) where T
+    col_partition::Vector{Int}=uniform_partition(size(A, 2), MPI.Comm_size(comm))) where {T,Ti}
     rank = MPI.Comm_rank(comm)
 
     # Local row range (1-indexed, Julia style)
@@ -345,8 +349,8 @@ function SparseMatrixMPI{T}(A::SparseMatrixCSC{T,Int};
 end
 
 """
-    SparseMatrixMPI_local(A_local::SparseMatrixCSR{T,Int}; comm=MPI.COMM_WORLD, col_partition=...) where T
-    SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Int}}; comm=MPI.COMM_WORLD, col_partition=...) where T
+    SparseMatrixMPI_local(A_local::SparseMatrixCSR{T,Ti}; comm=MPI.COMM_WORLD, col_partition=...) where {T,Ti}
+    SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Ti}}; comm=MPI.COMM_WORLD, col_partition=...) where {T,Ti}
 
 Create a SparseMatrixMPI from a local sparse matrix on each rank.
 
@@ -354,7 +358,7 @@ Unlike `SparseMatrixMPI{T}(A_global)` which takes a global matrix and partitions
 this constructor takes only the local rows of the matrix that each rank owns.
 The row partition is computed by gathering the local row counts from all ranks.
 
-The input `A_local` must be a `SparseMatrixCSR{T,Int}` (or `Adjoint` of `SparseMatrixCSC{T,Int}`) where:
+The input `A_local` must be a `SparseMatrixCSR{T,Ti}` (or `Adjoint` of `SparseMatrixCSC{T,Ti}`) where:
 - `A_local.parent.n` = number of local rows on this rank
 - `A_local.parent.m` = global number of columns (must match on all ranks)
 - `A_local.parent.rowval` = global column indices
@@ -376,9 +380,9 @@ local_csc = sparse([1, 1, 2], [1, 2, 3], [1.0, 2.0, 3.0], 2, 3)  # 2 local rows,
 A = SparseMatrixMPI_local(SparseMatrixCSR(local_csc))
 ```
 """
-function SparseMatrixMPI_local(A_local::SparseMatrixCSR{T,Int};
+function SparseMatrixMPI_local(A_local::SparseMatrixCSR{T,Ti};
     comm::MPI.Comm=MPI.COMM_WORLD,
-    col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where T
+    col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where {T,Ti}
     nranks = MPI.Comm_size(comm)
 
     AT_local = A_local.parent  # The underlying CSC storage
@@ -415,13 +419,13 @@ function SparseMatrixMPI_local(A_local::SparseMatrixCSR{T,Int};
     A_compressed = transpose(compressed_AT)  # Transpose wrapper for type clarity
 
     # Structural hash computed lazily on first use via _ensure_hash
-    return SparseMatrixMPI{T}(nothing, row_partition, col_partition, col_indices, A_compressed, nothing, nothing)
+    return SparseMatrixMPI{T,Ti}(nothing, row_partition, col_partition, col_indices, A_compressed, nothing, nothing)
 end
 
 # Adjoint version: conjugate values during construction
-function SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Int}};
+function SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Ti}};
     comm::MPI.Comm=MPI.COMM_WORLD,
-    col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where T
+    col_partition::Vector{Int}=uniform_partition(A_local.parent.m, MPI.Comm_size(comm))) where {T,Ti}
     # Convert adjoint to transpose with conjugated values
     AT_parent = A_local.parent
     AT_conj = SparseMatrixCSC(AT_parent.m, AT_parent.n, copy(AT_parent.colptr),
@@ -430,7 +434,7 @@ function SparseMatrixMPI_local(A_local::Adjoint{T,SparseMatrixCSC{T,Int}};
 end
 
 """
-    MatrixPlan{T}
+    MatrixPlan{T,Ti}
 
 A communication plan for gathering rows from an SparseMatrixMPI.
 
@@ -444,9 +448,9 @@ A communication plan for gathering rows from an SparseMatrixMPI.
 - `recv_reqs::Vector{MPI.Request}`: Pre-allocated receive request handles
 - `recv_offsets::Vector{Int}`: Starting offsets into AT.nzval for each recv_rank_ids
 - `local_ranges::Vector{Tuple{UnitRange{Int}, Int}}`: (src_range, dst_offset) for local copies
-- `AT::SparseMatrixCSC{T,Int}`: Transposed matrix structure for gathered rows (values zeroed)
+- `AT::SparseMatrixCSC{T,Ti}`: Transposed matrix structure for gathered rows (values zeroed)
 """
-mutable struct MatrixPlan{T}
+mutable struct MatrixPlan{T,Ti}
     rank_ids::Vector{Int}
     send_ranges::Vector{Vector{UnitRange{Int}}}
     send_bufs::Vector{Vector{T}}
@@ -456,7 +460,7 @@ mutable struct MatrixPlan{T}
     recv_reqs::Vector{MPI.Request}
     recv_offsets::Vector{Int}
     local_ranges::Vector{Tuple{UnitRange{Int},Int}}
-    AT::SparseMatrixCSC{T,Int}
+    AT::SparseMatrixCSC{T,Ti}
     # Cached hash for product result (computed lazily on first execution)
     product_structural_hash::OptionalBlake3Hash
     product_col_indices::Union{Nothing, Vector{Int}}
@@ -465,7 +469,7 @@ mutable struct MatrixPlan{T}
 end
 
 """
-    MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
+    MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Create a communication plan to gather rows specified by row_indices from B.
 Assumes row_indices is sorted.
@@ -475,7 +479,7 @@ The plan proceeds in 3 steps:
 2. Receive requests from other ranks, add to rank_ids, isend structure responses.
 3. Receive structure info, build plan.AT with zeros (sparsity pattern of B[row_indices,:]).
 """
-function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
+function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -728,7 +732,7 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
 
     plan_AT = SparseMatrixCSC(nrows_AT, n_total_cols, combined_colptr, combined_rowval, combined_nzval)
 
-    return MatrixPlan{T}(
+    return MatrixPlan{T,Ti}(
         rank_ids, send_ranges_vec, send_bufs, send_reqs,
         recv_rank_ids, recv_bufs, recv_reqs, recv_offsets_vec,
         local_ranges,
@@ -738,15 +742,15 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T}) where T
 end
 
 """
-    MatrixPlan(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+    MatrixPlan(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Create a memoized communication plan for A * B.
 The plan is cached based on the structural hashes of A and B.
 """
-function MatrixPlan(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
-    key = (_ensure_hash(A), _ensure_hash(B), T)
+function MatrixPlan(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    key = (_ensure_hash(A), _ensure_hash(B), T, Ti)
     if haskey(_plan_cache, key)
-        return _plan_cache[key]::MatrixPlan{T}
+        return _plan_cache[key]::MatrixPlan{T,Ti}
     end
     plan = MatrixPlan(A.col_indices, B)
     _plan_cache[key] = plan
@@ -754,13 +758,13 @@ function MatrixPlan(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
 end
 
 """
-    execute_plan!(plan::MatrixPlan{T}, B::SparseMatrixMPI{T}) where T
+    execute_plan!(plan::MatrixPlan{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Execute a communication plan to gather rows from B into plan.AT.
 After execution, plan.AT contains the values from B for the requested rows.
 This function is allocation-free (all buffers are pre-allocated in the plan).
 """
-function execute_plan!(plan::MatrixPlan{T}, B::SparseMatrixMPI{T}) where T
+function execute_plan!(plan::MatrixPlan{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
 
     # Step 1: Copy local values into plan.AT
@@ -846,11 +850,11 @@ function ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads::
 end
 
 """
-    Base.*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+    Base.*(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Multiply two distributed sparse matrices A * B.
 """
-function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+function Base.:*(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
 
     # Get memoized communication plan and execute it
@@ -907,20 +911,20 @@ function Base.:*(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     end
 
     # C = A * B has rows from A and columns from B
-    return SparseMatrixMPI{T}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(compressed_result_AT),
+    return SparseMatrixMPI{T,Ti}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(compressed_result_AT),
         nothing, nothing)
 end
 
 """
-    Base.+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+    Base.+(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Add two distributed sparse matrices. The result has A's row partition.
 """
-function Base.:+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+function Base.:+(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     B_repart = repartition(B, A.row_partition)
 
     if A.col_indices == B_repart.col_indices
-        return SparseMatrixMPI{T}(nothing, A.row_partition, A.col_partition,
+        return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
             A.col_indices, transpose(A.A.parent + B_repart.A.parent), nothing, nothing)
     end
 
@@ -933,20 +937,20 @@ function Base.:+(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     result = reindex_to_union_cached(A.A.parent, A_map, length(union_cols)) +
              reindex_to_union_cached(B_repart.A.parent, B_map, length(union_cols))
 
-    return SparseMatrixMPI{T}(nothing, A.row_partition, A.col_partition,
+    return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
         union_cols, transpose(result), nothing, nothing)
 end
 
 """
-    Base.-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+    Base.-(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Subtract two distributed sparse matrices. The result has A's row partition.
 """
-function Base.:-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+function Base.:-(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     B_repart = repartition(B, A.row_partition)
 
     if A.col_indices == B_repart.col_indices
-        return SparseMatrixMPI{T}(nothing, A.row_partition, A.col_partition,
+        return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
             A.col_indices, transpose(A.A.parent - B_repart.A.parent), nothing, nothing)
     end
 
@@ -959,12 +963,12 @@ function Base.:-(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
     result = reindex_to_union_cached(A.A.parent, A_map, length(union_cols)) -
              reindex_to_union_cached(B_repart.A.parent, B_map, length(union_cols))
 
-    return SparseMatrixMPI{T}(nothing, A.row_partition, A.col_partition,
+    return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
         union_cols, transpose(result), nothing, nothing)
 end
 
 """
-    TransposePlan{T}
+    TransposePlan{T,Ti}
 
 A communication plan for computing the transpose of an SparseMatrixMPI.
 
@@ -983,12 +987,12 @@ The transpose of A (with row_partition R and col_partition C) will have:
 - `recv_perm::Vector{Vector{Int}}`: For each recv rank, permutation into AT.nzval
 - `local_src_indices::Vector{Int}`: Source indices for local copy
 - `local_dst_indices::Vector{Int}`: Destination indices for local copy
-- `AT::SparseMatrixCSC{T,Int}`: Transposed matrix structure (values zeroed)
+- `AT::SparseMatrixCSC{T,Ti}`: Transposed matrix structure (values zeroed)
 - `row_partition::Vector{Int}`: Row partition for the transposed matrix
 - `col_partition::Vector{Int}`: Col partition for the transposed matrix
 - `col_indices::Vector{Int}`: Column indices for the transposed matrix
 """
-mutable struct TransposePlan{T}
+mutable struct TransposePlan{T,Ti}
     rank_ids::Vector{Int}
     send_indices::Vector{Vector{Int}}
     send_bufs::Vector{Vector{T}}
@@ -999,7 +1003,7 @@ mutable struct TransposePlan{T}
     recv_perm::Vector{Vector{Int}}
     local_src_indices::Vector{Int}
     local_dst_indices::Vector{Int}
-    AT::SparseMatrixCSC{T,Int}
+    AT::SparseMatrixCSC{T,Ti}
     row_partition::Vector{Int}
     col_partition::Vector{Int}
     col_indices::Vector{Int}
@@ -1010,7 +1014,7 @@ mutable struct TransposePlan{T}
 end
 
 """
-    TransposePlan(A::SparseMatrixMPI{T}) where T
+    TransposePlan(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Create a communication plan for computing A^T.
 
@@ -1020,7 +1024,7 @@ The algorithm:
 2. Exchange structure via point-to-point communication.
 3. Build the transposed sparse structure and communication buffers.
 """
-function TransposePlan(A::SparseMatrixMPI{T}) where T
+function TransposePlan(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -1205,7 +1209,7 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
         end
     end
 
-    return TransposePlan{T}(
+    return TransposePlan{T,Ti}(
         rank_ids, send_indices_final, send_bufs, send_reqs,
         recv_rank_ids, recv_bufs, recv_reqs, recv_perm,
         local_src_indices, local_dst_indices,
@@ -1216,7 +1220,7 @@ function TransposePlan(A::SparseMatrixMPI{T}) where T
 end
 
 """
-    execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
+    execute_plan!(plan::TransposePlan{T,Ti}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Execute a transpose plan to compute A^T.
 Returns an SparseMatrixMPI representing the transpose.
@@ -1224,7 +1228,7 @@ Returns an SparseMatrixMPI representing the transpose.
 Note: The returned matrix has its own copy of the sparse data, so the plan
 can be safely reused for subsequent transposes.
 """
-function execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
+function execute_plan!(plan::TransposePlan{T,Ti}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
 
     # Step 1: Copy local values (allocation-free loop)
@@ -1280,12 +1284,12 @@ function execute_plan!(plan::TransposePlan{T}, A::SparseMatrixMPI{T}) where T
         plan.structural_hash = compute_structural_hash(plan.row_partition, plan.col_indices, compressed_result_AT, comm)
     end
 
-    return SparseMatrixMPI{T}(plan.structural_hash, plan.row_partition, plan.col_partition,
+    return SparseMatrixMPI{T,Ti}(plan.structural_hash, plan.row_partition, plan.col_partition,
         plan.col_indices, transpose(compressed_result_AT), nothing, nothing)
 end
 
 """
-    SparseMatrixMPI{T}(At::Transpose{T, SparseMatrixMPI{T}}) where T
+    SparseMatrixMPI{T}(At::Transpose{T, SparseMatrixMPI{T,Ti}}) where {T,Ti}
 
 Materialize a lazy transpose of a SparseMatrixMPI, using cached result if available.
 If the transpose has been computed before, returns the cached result.
@@ -1299,7 +1303,7 @@ At = transpose(A)           # Lazy transpose wrapper
 At_mat = SparseMatrixMPI(At) # Materialize the transpose
 ```
 """
-function SparseMatrixMPI{T}(At::Transpose{T, SparseMatrixMPI{T}}) where T
+function SparseMatrixMPI{T}(At::Transpose{T, SparseMatrixMPI{T,Ti}}) where {T,Ti}
     A = At.parent
     # Check if already cached
     if A.cached_transpose !== nothing
@@ -1318,16 +1322,16 @@ function SparseMatrixMPI{T}(At::Transpose{T, SparseMatrixMPI{T}}) where T
 end
 
 # Convenience: allow SparseMatrixMPI(transpose(A)) without specifying type parameter
-SparseMatrixMPI(At::Transpose{T, SparseMatrixMPI{T}}) where T = SparseMatrixMPI{T}(At)
+SparseMatrixMPI(At::Transpose{T, SparseMatrixMPI{T,Ti}}) where {T,Ti} = SparseMatrixMPI{T}(At)
 
 # VectorPlan constructor for sparse A * x (adds method to VectorPlan from vectors.jl)
 
 """
-    VectorPlan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    VectorPlan(A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
 
 Create a communication plan to gather x[A.col_indices] for matrix-vector multiplication.
 """
-function VectorPlan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+function VectorPlan(A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -1428,12 +1432,12 @@ function VectorPlan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
 end
 
 """
-    get_vector_plan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    get_vector_plan(A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
 
 Get a memoized VectorPlan for A * x.
 The plan is cached based on the structural hashes of A and x.
 """
-function get_vector_plan(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+function get_vector_plan(A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
     key = (_ensure_hash(A), x.structural_hash, T)
     if haskey(_vector_plan_cache, key)
         return _vector_plan_cache[key]::VectorPlan{T}
@@ -1446,7 +1450,7 @@ end
 # Matrix-vector multiplication
 
 """
-    LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
 
 In-place sparse matrix-vector multiplication: y = A * x.
 
@@ -1457,7 +1461,7 @@ The algorithm:
 A.A.parent is already compressed with local indices 1:length(A.col_indices),
 so gathered has length matching A.A.parent.m and can be used directly.
 """
-function LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+function LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
     comm = MPI.COMM_WORLD
 
     # Get memoized plan and execute it
@@ -1473,12 +1477,12 @@ function LinearAlgebra.mul!(y::VectorMPI{T}, A::SparseMatrixMPI{T}, x::VectorMPI
 end
 
 """
-    Base.:*(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    Base.:*(A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
 
 Sparse matrix-vector multiplication returning a new VectorMPI.
 The result has the same row partition as A.
 """
-function Base.:*(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
+function Base.:*(A::SparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
     rank = MPI.Comm_rank(MPI.COMM_WORLD)
     local_rows = A.row_partition[rank+2] - A.row_partition[rank+1]
 
@@ -1502,12 +1506,12 @@ function Base.:*(A::SparseMatrixMPI{T}, x::VectorMPI{T}) where T
 end
 
 """
-    *(vt::Transpose{<:Any, VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
+    *(vt::Transpose{<:Any, VectorMPI{T}}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Compute transpose(v) * A as transpose(transpose(A) * v).
 Returns a transposed VectorMPI.
 """
-function Base.:*(vt::Transpose{<:Any,VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
+function Base.:*(vt::Transpose{<:Any,VectorMPI{T}}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     v = vt.parent
     # transpose(v) * A = transpose(transpose(A) * v)
     A_transposed = SparseMatrixMPI(transpose(A))
@@ -1530,8 +1534,8 @@ end
 
 Base.size(A::SparseMatrixMPI, d::Integer) = size(A)[d]
 
-Base.eltype(::SparseMatrixMPI{T}) where T = T
-Base.eltype(::Type{SparseMatrixMPI{T}}) where T = T
+Base.eltype(::SparseMatrixMPI{T,Ti}) where {T,Ti} = T
+Base.eltype(::Type{SparseMatrixMPI{T,Ti}}) where {T,Ti} = T
 
 # Norms
 
@@ -1621,18 +1625,18 @@ end
 # Lazy transpose support
 
 """
-    Base.transpose(A::SparseMatrixMPI{T}) where T
+    Base.transpose(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Return a lazy transpose wrapper around A.
 """
-Base.transpose(A::SparseMatrixMPI{T}) where T = Transpose(A)
+Base.transpose(A::SparseMatrixMPI{T,Ti}) where {T,Ti} = Transpose(A)
 
 """
-    conj(A::SparseMatrixMPI{T}) where T
+    conj(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Return a new SparseMatrixMPI with conjugated values.
 """
-function Base.conj(A::SparseMatrixMPI{T}) where T
+function Base.conj(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     conj_AT = SparseMatrixCSC(
         A.A.parent.m, A.A.parent.n,
         A.A.parent.colptr,  # share structure (immutable)
@@ -1640,28 +1644,28 @@ function Base.conj(A::SparseMatrixMPI{T}) where T
         conj.(A.A.parent.nzval)  # conjugate values
     )
     # Structural hash is the same since structure didn't change
-    return SparseMatrixMPI{T}(A.structural_hash, A.row_partition, A.col_partition,
+    return SparseMatrixMPI{T,Ti}(A.structural_hash, A.row_partition, A.col_partition,
         A.col_indices, transpose(conj_AT), nothing, nothing)
 end
 
 """
-    Base.adjoint(A::SparseMatrixMPI{T}) where T
+    Base.adjoint(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Return transpose(conj(A)), i.e., the conjugate transpose.
 For real types, this is just transpose (no conjugation needed).
 For complex types, this creates a conjugated copy then transposes.
 """
-Base.adjoint(A::SparseMatrixMPI{T}) where T<:Real = transpose(A)
-Base.adjoint(A::SparseMatrixMPI{T}) where T<:Complex = transpose(conj(A))
+Base.adjoint(A::SparseMatrixMPI{T,Ti}) where {T<:Real,Ti} = transpose(A)
+Base.adjoint(A::SparseMatrixMPI{T,Ti}) where {T<:Complex,Ti} = transpose(conj(A))
 
 # Scalar multiplication
 
 """
-    *(a::Number, A::SparseMatrixMPI{T}) where T
+    *(a::Number, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Scalar times matrix.
 """
-function Base.:*(a::Number, A::SparseMatrixMPI{T}) where T
+function Base.:*(a::Number, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     RT = promote_type(typeof(a), T)
     scaled_AT = SparseMatrixCSC(
         A.A.parent.m, A.A.parent.n,
@@ -1669,40 +1673,40 @@ function Base.:*(a::Number, A::SparseMatrixMPI{T}) where T
         A.A.parent.rowval,
         RT.(a .* A.A.parent.nzval)
     )
-    return SparseMatrixMPI{RT}(A.structural_hash, A.row_partition, A.col_partition,
+    return SparseMatrixMPI{RT,Ti}(A.structural_hash, A.row_partition, A.col_partition,
         A.col_indices, transpose(scaled_AT), nothing, A.cached_symmetric)
 end
 
 """
-    *(A::SparseMatrixMPI{T}, a::Number) where T
+    *(A::SparseMatrixMPI{T,Ti}, a::Number) where {T,Ti}
 
 Matrix times scalar.
 """
-Base.:*(A::SparseMatrixMPI{T}, a::Number) where T = a * A
+Base.:*(A::SparseMatrixMPI{T,Ti}, a::Number) where {T,Ti} = a * A
 
 """
-    -(A::SparseMatrixMPI{T}) where T
+    -(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Unary negation of a sparse matrix.
 """
-Base.:-(A::SparseMatrixMPI{T}) where T = (-1) * A
+Base.:-(A::SparseMatrixMPI{T,Ti}) where {T,Ti} = (-1) * A
 
 # Type alias for transpose of SparseMatrixMPI
-const TransposedSparseMatrixMPI{T} = Transpose{T,SparseMatrixMPI{T}}
+const TransposedSparseMatrixMPI{T,Ti} = Transpose{T,SparseMatrixMPI{T,Ti}}
 
 """
-    *(a::Number, At::TransposedSparseMatrixMPI{T}) where T
+    *(a::Number, At::TransposedSparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Scalar times transposed matrix: a * transpose(A) = transpose(a * A).
 """
-Base.:*(a::Number, At::TransposedSparseMatrixMPI{T}) where T = transpose(a * At.parent)
+Base.:*(a::Number, At::TransposedSparseMatrixMPI{T,Ti}) where {T,Ti} = transpose(a * At.parent)
 
 """
-    *(At::TransposedSparseMatrixMPI{T}, a::Number) where T
+    *(At::TransposedSparseMatrixMPI{T,Ti}, a::Number) where {T,Ti}
 
 Transposed matrix times scalar: transpose(A) * a = transpose(a * A).
 """
-Base.:*(At::TransposedSparseMatrixMPI{T}, a::Number) where T = transpose(a * At.parent)
+Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, a::Number) where {T,Ti} = transpose(a * At.parent)
 
 # Lazy transpose multiplication methods
 
@@ -1712,7 +1716,7 @@ Base.:*(At::TransposedSparseMatrixMPI{T}, a::Number) where T = transpose(a * At.
 Compute transpose(A) * transpose(B) = transpose(B.parent * A.parent) lazily.
 Returns a Transpose wrapper around the product B.parent * A.parent.
 """
-function Base.:*(At::TransposedSparseMatrixMPI{T}, Bt::TransposedSparseMatrixMPI{T}) where T
+function Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, Bt::TransposedSparseMatrixMPI{T,Ti}) where {T,Ti}
     A = At.parent
     B = Bt.parent
     return transpose(B * A)
@@ -1723,7 +1727,7 @@ end
 
 Compute transpose(A) * B by materializing the transpose of A first.
 """
-function Base.:*(At::TransposedSparseMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+function Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     A = At.parent
     A_transposed = SparseMatrixMPI(transpose(A))
     return A_transposed * B
@@ -1734,18 +1738,18 @@ end
 
 Compute A * transpose(B) by materializing the transpose of B first.
 """
-function Base.:*(A::SparseMatrixMPI{T}, Bt::TransposedSparseMatrixMPI{T}) where T
+function Base.:*(A::SparseMatrixMPI{T,Ti}, Bt::TransposedSparseMatrixMPI{T,Ti}) where {T,Ti}
     B = Bt.parent
     B_transposed = SparseMatrixMPI(transpose(B))
     return A * B_transposed
 end
 
 """
-    Base.:*(At::TransposedSparseMatrixMPI{T}, x::VectorMPI{T}) where T
+    Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
 
 Compute transpose(A) * x by materializing the transpose of A first.
 """
-function Base.:*(At::TransposedSparseMatrixMPI{T}, x::VectorMPI{T}) where T
+function Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, x::VectorMPI{T}) where {T,Ti}
     A = At.parent
     A_transposed = SparseMatrixMPI(transpose(A))
     return A_transposed * x
@@ -1756,12 +1760,12 @@ end
 # ============================================================================
 
 """
-    Base.:*(A::SparseMatrixMPI{T}, B::MatrixMPI{T}) where T
+    Base.:*(A::SparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
 
 Compute sparse matrix times dense matrix by column-by-column multiplication.
 Returns a MatrixMPI with the same row partition as A.
 """
-function Base.:*(A::SparseMatrixMPI{T}, B::MatrixMPI{T}) where T
+function Base.:*(A::SparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
     m = size(A, 1)
     n = size(B, 2)
 
@@ -1791,11 +1795,11 @@ function Base.:*(A::SparseMatrixMPI{T}, B::MatrixMPI{T}) where T
 end
 
 """
-    Base.:*(At::TransposedSparseMatrixMPI{T}, B::MatrixMPI{T}) where T
+    Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
 
 Compute transpose(A) * B by materializing the transpose of A first.
 """
-function Base.:*(At::TransposedSparseMatrixMPI{T}, B::MatrixMPI{T}) where T
+function Base.:*(At::TransposedSparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
     A = At.parent
     A_transposed = SparseMatrixMPI(transpose(A))
     return A_transposed * B
@@ -1829,18 +1833,18 @@ issparse(::SparseMatrixMPI) = true
 # ============================================================================
 
 """
-    Base.copy(A::SparseMatrixMPI{T}) where T
+    Base.copy(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Create a deep copy of the distributed sparse matrix.
 """
-function Base.copy(A::SparseMatrixMPI{T}) where T
+function Base.copy(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     new_AT = SparseMatrixCSC(
         A.A.parent.m, A.A.parent.n,
         copy(A.A.parent.colptr),
         copy(A.A.parent.rowval),
         copy(A.A.parent.nzval)
     )
-    return SparseMatrixMPI{T}(
+    return SparseMatrixMPI{T,Ti}(
         A.structural_hash,
         copy(A.row_partition),
         copy(A.col_partition),
@@ -1856,11 +1860,11 @@ end
 # ============================================================================
 
 # Helper function for zero-preserving element-wise operations
-function _map_nzval(f, A::SparseMatrixMPI{T}) where T
+function _map_nzval(f, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     new_nzval = f.(A.A.parent.nzval)
     RT = eltype(new_nzval)
     new_AT = SparseMatrixCSC(A.A.parent.m, A.A.parent.n, A.A.parent.colptr, A.A.parent.rowval, new_nzval)
-    return SparseMatrixMPI{RT}(A.structural_hash, A.row_partition, A.col_partition,
+    return SparseMatrixMPI{RT,Ti}(A.structural_hash, A.row_partition, A.col_partition,
         A.col_indices, transpose(new_AT), nothing, A.cached_symmetric)
 end
 
@@ -2072,11 +2076,11 @@ end
 # ============================================================================
 
 """
-    dropzeros(A::SparseMatrixMPI{T}) where T
+    dropzeros(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Return a copy of A with explicitly stored zeros removed.
 """
-function dropzeros(A::SparseMatrixMPI{T}) where T
+function dropzeros(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
 
     # Use SparseArrays.dropzeros on local AT
@@ -2088,7 +2092,7 @@ function dropzeros(A::SparseMatrixMPI{T}) where T
     # Recompute structural hash since structure changed
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_AT, comm)
 
-    return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
+    return SparseMatrixMPI{T,Ti}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, transpose(new_AT), nothing, nothing)
 end
 
@@ -2167,14 +2171,14 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
 end
 
 """
-    triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
+    triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
 
 Return the upper triangular part of A, starting from the k-th diagonal.
 - k=0: include main diagonal
 - k>0: exclude k-1 diagonals below the k-th superdiagonal
 - k<0: include |k| subdiagonals
 """
-function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
+function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
@@ -2240,19 +2244,19 @@ function triu(A::SparseMatrixMPI{T}, k::Integer=0) where T
 
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, compressed_AT, comm)
 
-    return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
+    return SparseMatrixMPI{T,Ti}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, transpose(compressed_AT), nothing, nothing)
 end
 
 """
-    tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
+    tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
 
 Return the lower triangular part of A, starting from the k-th diagonal.
 - k=0: include main diagonal
 - k>0: include k superdiagonals
 - k<0: exclude |k|-1 diagonals above the |k|-th subdiagonal
 """
-function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
+function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
@@ -2313,7 +2317,7 @@ function tril(A::SparseMatrixMPI{T}, k::Integer=0) where T
 
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, compressed_AT, comm)
 
-    return SparseMatrixMPI{T}(structural_hash, copy(A.row_partition), copy(A.col_partition),
+    return SparseMatrixMPI{T,Ti}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, transpose(compressed_AT), nothing, nothing)
 end
 
@@ -2777,7 +2781,7 @@ function spdiagm(v::VectorMPI{T}) where T
     col_partition = v.partition  # Square matrix, same column partition
 
     # Diagonal matrices are always symmetric
-    return SparseMatrixMPI{T}(nothing, row_partition, col_partition, col_indices,
+    return SparseMatrixMPI{T,Int}(nothing, row_partition, col_partition, col_indices,
                                transpose(AT_local), nothing, true)
 end
 
@@ -2801,12 +2805,12 @@ end
 # ============================================================================
 
 """
-    Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+    Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Compute dense matrix times sparse matrix.
 Uses column-by-column approach with transpose(B)' * transpose(A').
 """
-function Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+function Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     m = size(A, 1)
     n = size(B, 2)
 
@@ -2840,11 +2844,11 @@ function Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T}) where T
 end
 
 """
-    Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+    Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Compute transpose(A) * B where A is dense and B is sparse.
 """
-function Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T}) where T
+function Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     A = At.parent
     n = size(B, 2)
 
@@ -2964,22 +2968,22 @@ function Base.:-(A::SparseMatrixMPI{T}, J::UniformScaling) where T
 end
 
 """
-    Base.:+(J::UniformScaling, A::SparseMatrixMPI{T}) where T
+    Base.:+(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Add a sparse matrix to a scalar multiple of the identity.
 Returns λI + A where J = λI.
 """
-function Base.:+(J::UniformScaling, A::SparseMatrixMPI{T}) where T
+function Base.:+(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     return A + J
 end
 
 """
-    Base.:-(J::UniformScaling, A::SparseMatrixMPI{T}) where T
+    Base.:-(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Subtract a sparse matrix from a scalar multiple of the identity.
 Returns λI - A where J = λI.
 """
-function Base.:-(J::UniformScaling, A::SparseMatrixMPI{T}) where T
+function Base.:-(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     return (-A) + J
 end
 
@@ -2988,7 +2992,7 @@ end
 # ============================================================================
 
 """
-    SparseRepartitionPlan{T}
+    SparseRepartitionPlan{T,Ti}
 
 Communication plan for repartitioning a SparseMatrixMPI to a new row partition.
 The col_partition remains unchanged - only rows are redistributed.
@@ -3015,11 +3019,11 @@ The col_partition remains unchanged - only rows are redistributed.
 - `result_row_partition::Vector{Int}`: Target row partition
 - `result_col_partition::Vector{Int}`: Column partition (unchanged)
 - `result_col_indices::Vector{Int}`: Union of col_indices from received rows
-- `result_AT::SparseMatrixCSC{T,Int}`: Pre-built sparse structure (values to be filled)
+- `result_AT::SparseMatrixCSC{T,Ti}`: Pre-built sparse structure (values to be filled)
 - `result_structural_hash::Blake3Hash`: Pre-computed structural hash
 - `compress_map::Vector{Int}`: global_col -> local_col for result
 """
-mutable struct SparseRepartitionPlan{T}
+mutable struct SparseRepartitionPlan{T,Ti}
     # Send-side
     send_rank_ids::Vector{Int}
     send_local_row_ranges::Vector{UnitRange{Int}}
@@ -3043,13 +3047,13 @@ mutable struct SparseRepartitionPlan{T}
     result_row_partition::Vector{Int}
     result_col_partition::Vector{Int}
     result_col_indices::Vector{Int}
-    result_AT::SparseMatrixCSC{T,Int}
+    result_AT::SparseMatrixCSC{T,Ti}
     result_structural_hash::Blake3Hash
     compress_map::Vector{Int}
 end
 
 """
-    SparseRepartitionPlan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+    SparseRepartitionPlan(A::SparseMatrixMPI{T,Ti}, p::Vector{Int}) where {T,Ti}
 
 Create a communication plan to repartition `A` to have row partition `p`.
 The col_partition remains unchanged.
@@ -3061,7 +3065,7 @@ The plan:
 4. Computes structural hash eagerly
 5. Pre-allocates value buffers
 """
-function SparseRepartitionPlan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+function SparseRepartitionPlan(A::SparseMatrixMPI{T,Ti}, p::Vector{Int}) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -3352,7 +3356,7 @@ function SparseRepartitionPlan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
     send_reqs = Vector{MPI.Request}(undef, length(send_rank_ids))
     recv_reqs = Vector{MPI.Request}(undef, length(recv_rank_ids))
 
-    return SparseRepartitionPlan{T}(
+    return SparseRepartitionPlan{T,Ti}(
         send_rank_ids, send_local_row_ranges, send_nnz_counts_arr, send_bufs, send_reqs,
         recv_rank_ids, recv_nnz_counts, recv_bufs, recv_reqs, recv_value_offsets,
         local_src_row_range, local_value_offset, local_nnz,
@@ -3362,12 +3366,12 @@ function SparseRepartitionPlan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
 end
 
 """
-    execute_plan!(plan::SparseRepartitionPlan{T}, A::SparseMatrixMPI{T}) where T
+    execute_plan!(plan::SparseRepartitionPlan{T,Ti}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
 Execute a sparse repartition plan to redistribute rows from A to a new partition.
 Returns a new SparseMatrixMPI with the target row partition.
 """
-function execute_plan!(plan::SparseRepartitionPlan{T}, A::SparseMatrixMPI{T}) where T
+function execute_plan!(plan::SparseRepartitionPlan{T,Ti}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     src_start = A.row_partition[rank+1]
@@ -3434,7 +3438,7 @@ function execute_plan!(plan::SparseRepartitionPlan{T}, A::SparseMatrixMPI{T}) wh
         result_nzval
     )
 
-    return SparseMatrixMPI{T}(
+    return SparseMatrixMPI{T,Ti}(
         plan.result_structural_hash,
         plan.result_row_partition,
         plan.result_col_partition,
@@ -3446,16 +3450,16 @@ function execute_plan!(plan::SparseRepartitionPlan{T}, A::SparseMatrixMPI{T}) wh
 end
 
 """
-    get_repartition_plan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+    get_repartition_plan(A::SparseMatrixMPI{T,Ti}, p::Vector{Int}) where {T,Ti}
 
 Get a memoized SparseRepartitionPlan for repartitioning `A` to row partition `p`.
 The plan is cached based on the structural hash of A and the target partition hash.
 """
-function get_repartition_plan(A::SparseMatrixMPI{T}, p::Vector{Int}) where T
+function get_repartition_plan(A::SparseMatrixMPI{T,Ti}, p::Vector{Int}) where {T,Ti}
     target_hash = compute_partition_hash(p)
-    key = (_ensure_hash(A), target_hash, T)
+    key = (_ensure_hash(A), target_hash, T, Ti)
     if haskey(_repartition_plan_cache, key)
-        return _repartition_plan_cache[key]::SparseRepartitionPlan{T}
+        return _repartition_plan_cache[key]::SparseRepartitionPlan{T,Ti}
     end
     plan = SparseRepartitionPlan(A, p)
     _repartition_plan_cache[key] = plan

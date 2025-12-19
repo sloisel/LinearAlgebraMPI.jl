@@ -106,8 +106,8 @@ function SparseArrays.SparseMatrixCSC(A::SparseMatrixCSR{Tv,Ti}) where {Tv,Ti}
 end
 
 # Cache for memoized MatrixPlans
-# Key: (A_hash, B_hash, T) - use full 256-bit hashes
-const _plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
+# Key: (A_hash, B_hash, T, Ti) - use full 256-bit hashes
+const _plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType,DataType},Any}()
 
 # Cache for memoized VectorPlans (for A * x)
 const _vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
@@ -119,7 +119,8 @@ const _dense_vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}
 const _dense_transpose_plan_cache = Dict{Tuple{Blake3Hash,DataType},Any}()
 
 # Cache for memoized RepartitionPlans (for repartition)
-const _repartition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType},Any}()
+# Key includes (hash_A, target_hash, T, Ti) for sparse and (hash_A, target_hash, T) for others
+const _repartition_plan_cache = Dict{Any,Any}()
 
 """
     clear_plan_cache!()

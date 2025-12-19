@@ -1022,7 +1022,7 @@ A = SparseMatrixMPI{Float64}(sprand(10, 10, 0.3))
 B = A[3:7, 2:8]  # Returns SparseMatrixMPI submatrix
 ```
 """
-function Base.getindex(A::SparseMatrixMPI{T}, row_rng::UnitRange{Int}, col_rng::UnitRange{Int}) where T
+function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rng::UnitRange{Int}) where {T,Ti}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -1046,7 +1046,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_rng::UnitRange{Int}, col_rng::
         # SparseMatrixCSC(ncols, nrows, colptr, rowval, nzval) - transposed storage
         empty_AT = SparseMatrixCSC(new_ncols, my_local_rows, ones(Int, my_local_rows + 1), Int[], T[])
         hash = compute_structural_hash(new_row_partition, Int[], empty_AT, comm)
-        return SparseMatrixMPI{T}(hash, new_row_partition, new_col_partition, Int[],
+        return SparseMatrixMPI{T,Ti}(hash, new_row_partition, new_col_partition, Int[],
                                    transpose(empty_AT), nothing, nothing)
     end
 
@@ -1156,7 +1156,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_rng::UnitRange{Int}, col_rng::
     # Compute hash (requires Allgather for consistency)
     hash = compute_structural_hash(new_row_partition, final_col_indices, new_AT, comm)
 
-    return SparseMatrixMPI{T}(hash, new_row_partition, new_col_partition, final_col_indices,
+    return SparseMatrixMPI{T,Ti}(hash, new_row_partition, new_col_partition, final_col_indices,
                                transpose(new_AT), nothing, nothing)
 end
 
