@@ -454,12 +454,12 @@ function Base.:\(A::SparseMatrixMPI{T}, b::VectorMPI{T}) where T
 end
 
 """
-    Base.:\\(A::Symmetric{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
+    Base.:\\(A::Symmetric{T,<:SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
 
 Solve A*x = b for a symmetric matrix using LDLT (no symmetry check needed).
 Use `Symmetric(A)` to wrap a known-symmetric matrix and skip the expensive symmetry check.
 """
-function Base.:\(A::Symmetric{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
+function Base.:\(A::Symmetric{T,<:SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
     F = LinearAlgebra.ldlt(parent(A))
     x = F \ b
     finalize!(F)
@@ -467,11 +467,11 @@ function Base.:\(A::Symmetric{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
 end
 
 """
-    Base.:\\(At::Transpose{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
+    Base.:\\(At::Transpose{T,<:SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
 
 Solve transpose(A)*x = b using LU factorization.
 """
-function Base.:\(At::Transpose{T,SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
+function Base.:\(At::Transpose{T,<:SparseMatrixMPI{T}}, b::VectorMPI{T}) where T
     A_t = SparseMatrixMPI(At)
     F = LinearAlgebra.lu(A_t)
     x = F \ b
@@ -499,11 +499,11 @@ function Base.:/(vt::Transpose{T,VectorMPI{T}}, A::SparseMatrixMPI{T}) where T
 end
 
 """
-    Base.:/(vt::Transpose{T,VectorMPI{T}}, At::Transpose{T,SparseMatrixMPI{T}}) where T
+    Base.:/(vt::Transpose{T,VectorMPI{T}}, At::Transpose{T,<:SparseMatrixMPI{T}}) where T
 
 Solve x * transpose(A) = transpose(v), returning x as a transposed VectorMPI.
 """
-function Base.:/(vt::Transpose{T,VectorMPI{T}}, At::Transpose{T,SparseMatrixMPI{T}}) where T
+function Base.:/(vt::Transpose{T,VectorMPI{T}}, At::Transpose{T,<:SparseMatrixMPI{T}}) where T
     v = vt.parent
     A = At.parent
     x = A \ v
