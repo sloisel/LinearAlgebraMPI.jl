@@ -956,47 +956,21 @@ function map_rows(f, A...)
         if isempty(results)
             return VectorMPI_local(Vector{T}(undef, 0))
         end
-        local_v = Vector{T}(undef, length(results))
-        for (i, r) in enumerate(results)
-            local_v[i] = r
-        end
-        return VectorMPI_local(local_v)
+        return VectorMPI_local(collect(T, results))
 
     elseif result_kind == 2
         # f returns a column vector -> VectorMPI (vcat concatenates into longer vector)
         if isempty(results)
             return VectorMPI_local(Vector{T}(undef, 0))
         end
-        total_len = sum(length, results)
-        local_v = Vector{T}(undef, total_len)
-        offset = 0
-        for r in results
-            n = length(r)
-            for j in 1:n
-                local_v[offset + j] = r[j]
-            end
-            offset += n
-        end
-        return VectorMPI_local(local_v)
+        return VectorMPI_local(Vector{T}(vcat(results...)))
 
     elseif result_kind == 3
         # f returns a row vector or matrix -> MatrixMPI (vcat stacks rows)
         if isempty(results)
             return MatrixMPI_local(Matrix{T}(undef, 0, ncols))
         end
-        total_rows = sum(r -> size(r, 1), results)
-        local_A = Matrix{T}(undef, total_rows, ncols)
-        row_offset = 0
-        for r in results
-            nrows = size(r, 1)
-            for i in 1:nrows
-                for j in 1:ncols
-                    local_A[row_offset + i, j] = r[i, j]
-                end
-            end
-            row_offset += nrows
-        end
-        return MatrixMPI_local(local_A)
+        return MatrixMPI_local(Matrix{T}(vcat(results...)))
 
     else
         error("map_rows: f must return a Number, AbstractVector, or AbstractMatrix")
