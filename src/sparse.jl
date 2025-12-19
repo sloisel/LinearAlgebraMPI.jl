@@ -466,6 +466,14 @@ mutable struct MatrixPlan{T,Ti}
     product_col_indices::Union{Nothing, Vector{Int}}
     product_row_partition::Union{Nothing, Vector{Int}}
     product_compress_map::Union{Nothing, Vector{Int}}  # global_col -> local_col mapping for compress_AT
+    # Symbolic multiplication data (computed lazily on first execution)
+    # For C = plan.AT * A.A.parent, these indices satisfy:
+    # C.nzval[Ci[k]] += plan.AT.nzval[Ai[k]] * A.A.parent.nzval[Bi[k]]
+    sym_Ai::Union{Nothing, Vector{Ti}}  # indices into plan.AT.nzval
+    sym_Bi::Union{Nothing, Vector{Ti}}  # indices into A.A.parent.nzval
+    sym_Ci::Union{Nothing, Vector{Ti}}  # indices into result.nzval
+    sym_colptr::Union{Nothing, Vector{Ti}}  # colptr for result
+    sym_rowval::Union{Nothing, Vector{Ti}}  # rowval for result (compressed local indices)
 end
 
 """
@@ -737,7 +745,8 @@ function MatrixPlan(row_indices::Vector{Int}, B::SparseMatrixMPI{T,Ti}) where {T
         recv_rank_ids, recv_bufs, recv_reqs, recv_offsets_vec,
         local_ranges,
         plan_AT,
-        nothing, nothing, nothing, nothing  # product: hash, col_indices, row_partition, compress_map
+        nothing, nothing, nothing, nothing,  # product: hash, col_indices, row_partition, compress_map
+        nothing, nothing, nothing, nothing, nothing  # symbolic multiply: Ai, Bi, Ci, colptr, rowval
     )
 end
 
@@ -850,9 +859,157 @@ function ⊛(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixCSC{Tv,Ti}; max_threads::
 end
 
 """
+    _compute_symbolic_multiply!(plan::MatrixPlan{T,Ti}, A_parent::SparseMatrixCSC{T,Ti}) where {T,Ti}
+
+Compute the symbolic multiplication for C = plan.AT * A_parent.
+Stores in plan: sym_Ai, sym_Bi, sym_Ci, sym_colptr, sym_rowval.
+
+For CSC multiplication C = plan.AT * A_parent where:
+- plan.AT has shape (m, k)
+- A_parent has shape (k, n)
+- C has shape (m, n)
+
+For each column j of C (1 to n):
+  For each nonzero A_parent[p, j] at position p:
+    For each nonzero plan.AT[i, p] in column p:
+      C[i, j] += plan.AT[i, p] * A_parent[p, j]
+"""
+function _compute_symbolic_multiply!(plan::MatrixPlan{T,Ti}, A_parent::SparseMatrixCSC{T,Ti}) where {T,Ti}
+    AT = plan.AT  # shape (m, k)
+    B = A_parent  # shape (k, n), we call it B for clarity in the multiply
+
+    m = AT.m
+    n = B.n
+
+    # First pass: compute symbolic structure of C
+    # For each column j, collect unique row indices that will have nonzeros
+
+    # Use a temporary array to mark which rows have nonzeros in current column
+    row_marker = zeros(Ti, m)  # 0 means not present, >0 means present
+    marker_val = Ti(0)
+
+    # Count nnz per column and collect row indices
+    col_nnz = zeros(Ti, n)
+    all_row_indices = Vector{Ti}[]  # row indices for each column
+
+    for j in 1:n
+        marker_val += 1
+        row_indices_j = Ti[]
+
+        # For each nonzero B[p, j]
+        for bp in B.colptr[j]:(B.colptr[j+1]-1)
+            p = B.rowval[bp]  # column index in AT
+
+            # For each nonzero AT[i, p]
+            for ap in AT.colptr[p]:(AT.colptr[p+1]-1)
+                i = AT.rowval[ap]
+
+                # Mark row i if not already marked for this column
+                if row_marker[i] != marker_val
+                    row_marker[i] = marker_val
+                    push!(row_indices_j, i)
+                end
+            end
+        end
+
+        # Sort row indices for CSC format
+        sort!(row_indices_j)
+        push!(all_row_indices, row_indices_j)
+        col_nnz[j] = length(row_indices_j)
+    end
+
+    # Build colptr
+    colptr = Vector{Ti}(undef, n + 1)
+    colptr[1] = 1
+    for j in 1:n
+        colptr[j+1] = colptr[j] + col_nnz[j]
+    end
+    nnz_C = colptr[n+1] - 1
+
+    # Build rowval
+    rowval = Vector{Ti}(undef, nnz_C)
+    idx = 1
+    for j in 1:n
+        for i in all_row_indices[j]
+            rowval[idx] = i
+            idx += 1
+        end
+    end
+
+    # Build row_to_idx mapping for each column (to find C[i,j] index quickly)
+    # For column j, row_to_idx[i] = index into C.nzval, or 0 if not present
+    row_to_idx = zeros(Ti, m)
+
+    # Second pass: compute index triplets (Ai, Bi, Ci)
+    Ai = Ti[]
+    Bi = Ti[]
+    Ci = Ti[]
+
+    for j in 1:n
+        # Build row_to_idx for this column
+        for idx in colptr[j]:(colptr[j+1]-1)
+            row_to_idx[rowval[idx]] = idx
+        end
+
+        # For each nonzero B[p, j]
+        for bp in B.colptr[j]:(B.colptr[j+1]-1)
+            p = B.rowval[bp]
+
+            # For each nonzero AT[i, p]
+            for ap in AT.colptr[p]:(AT.colptr[p+1]-1)
+                i = AT.rowval[ap]
+                c_idx = row_to_idx[i]
+
+                push!(Ai, ap)
+                push!(Bi, bp)
+                push!(Ci, c_idx)
+            end
+        end
+
+        # Clear row_to_idx for this column
+        for idx in colptr[j]:(colptr[j+1]-1)
+            row_to_idx[rowval[idx]] = 0
+        end
+    end
+
+    # Store in plan
+    plan.sym_Ai = Ai
+    plan.sym_Bi = Bi
+    plan.sym_Ci = Ci
+    plan.sym_colptr = colptr
+    plan.sym_rowval = rowval
+
+    return nothing
+end
+
+"""
+    _execute_symbolic_multiply!(nzval::Vector{T}, plan::MatrixPlan{T,Ti},
+                                 AT_nzval::Vector{T}, B_nzval::Vector{T}) where {T,Ti}
+
+Execute symbolic multiplication: C.nzval = plan.AT * B using precomputed indices.
+The nzval array must be pre-allocated and will be zeroed before accumulation.
+"""
+function _execute_symbolic_multiply!(nzval::Vector{T}, plan::MatrixPlan{T,Ti},
+                                      AT_nzval::Vector{T}, B_nzval::Vector{T}) where {T,Ti}
+    Ai = plan.sym_Ai
+    Bi = plan.sym_Bi
+    Ci = plan.sym_Ci
+
+    # Zero the output
+    fill!(nzval, zero(T))
+
+    # Accumulate: nzval[Ci[k]] += AT_nzval[Ai[k]] * B_nzval[Bi[k]]
+    @inbounds for k in eachindex(Ai)
+        nzval[Ci[k]] += AT_nzval[Ai[k]] * B_nzval[Bi[k]]
+    end
+
+    return nzval
+end
+
+"""
     Base.*(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
-Multiply two distributed sparse matrices A * B.
+Multiply two distributed sparse matrices A * B using symbolic multiplication.
 """
 function Base.:*(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     comm = MPI.COMM_WORLD
@@ -861,30 +1018,19 @@ function Base.:*(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti
     plan = MatrixPlan(A, B)
     execute_plan!(plan, B)
 
-    # Compute local product using: C^T = B^T * A^T = plan.AT * A.A.parent
-    #
-    # A.A.parent has shape (n_gathered, local_nrows_A) with local column indices (compressed)
-    # plan.AT has shape (ncols_B, n_gathered) where n_gathered = length(A.col_indices)
-    #
-    # A.A.parent is already compressed with local indices 1:length(A.col_indices),
-    # so we can use it directly without reindexing.
+    # Compute symbolic multiplication if not already cached
+    # C^T = B^T * A^T = plan.AT * A.A.parent
+    if plan.sym_Ai === nothing
+        _compute_symbolic_multiply!(plan, A.A.parent)
 
-    # C^T = B^T * A^T = (plan.AT) * (A.A.parent)
-    # plan.AT is (ncols_B, n_gathered), A.A.parent is (n_gathered, local_nrows_A)
-    # result is (ncols_B, local_nrows_A) = shape of C.AT
-    result_AT = plan.AT ⊛ A.A.parent
-
-    # Use cached col_indices and compress_map if available, otherwise compute and cache
-    if plan.product_col_indices !== nothing
-        result_col_indices = plan.product_col_indices
-        compress_map = plan.product_compress_map
-    else
-        result_col_indices = isempty(result_AT.rowval) ? Int[] : unique(sort(result_AT.rowval))
-
-        # Build compress_map: compress_map[global_col] = local_col
-        if isempty(result_col_indices)
+        # Compute col_indices and compress_map from symbolic rowval (global column indices)
+        if isempty(plan.sym_rowval)
+            result_col_indices = Int[]
             compress_map = Int[]
         else
+            result_col_indices = unique(sort(Int.(plan.sym_rowval)))
+
+            # Build compress_map: compress_map[global_col] = local_col
             max_col = maximum(result_col_indices)
             compress_map = zeros(Int, max_col)
             for (local_idx, global_idx) in enumerate(result_col_indices)
@@ -892,79 +1038,360 @@ function Base.:*(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti
             end
         end
 
-        # Cache for future use with same structural pattern
+        # Cache col_indices and compress_map
         plan.product_col_indices = result_col_indices
         plan.product_compress_map = compress_map
         plan.product_row_partition = A.row_partition
+
+        # Compress sym_rowval in place: convert global to local indices
+        for k in eachindex(plan.sym_rowval)
+            plan.sym_rowval[k] = compress_map[plan.sym_rowval[k]]
+        end
+
+        # Compute and cache structural hash
+        nnz_result = plan.sym_colptr[end] - 1
+        temp_nzval = Vector{T}(undef, nnz_result)
+        ncols_result = length(plan.sym_colptr) - 1
+        temp_csc = SparseMatrixCSC(length(result_col_indices), ncols_result,
+                                    plan.sym_colptr, plan.sym_rowval, temp_nzval)
+        plan.product_structural_hash = compute_structural_hash(A.row_partition, result_col_indices,
+                                                                temp_csc, comm)
     end
 
-    compressed_result_AT = compress_AT_cached(result_AT, compress_map, length(result_col_indices))
+    # Allocate result nzval and execute symbolic multiplication
+    nnz_result = plan.sym_colptr[end] - 1
+    nzval = Vector{T}(undef, nnz_result)
+    _execute_symbolic_multiply!(nzval, plan, plan.AT.nzval, A.A.parent.nzval)
 
-    # Use cached structural hash if available, otherwise compute and cache
-    # This is important for chained operations like (P' * A) * P where the intermediate
-    # result needs a hash for the next multiply's plan lookup
-    result_hash = plan.product_structural_hash
-    if result_hash === nothing
-        # Compute hash for the result structure
-        result_hash = compute_structural_hash(A.row_partition, result_col_indices, compressed_result_AT, MPI.COMM_WORLD)
-        plan.product_structural_hash = result_hash
-    end
+    # Create result CSC (shares colptr and rowval with plan)
+    ncols_result = length(plan.sym_colptr) - 1
+    result_csc = SparseMatrixCSC(length(plan.product_col_indices), ncols_result,
+                                  plan.sym_colptr, plan.sym_rowval, nzval)
 
     # C = A * B has rows from A and columns from B
-    return SparseMatrixMPI{T,Ti}(result_hash, A.row_partition, B.col_partition, result_col_indices, transpose(compressed_result_AT),
-        nothing, nothing)
+    return SparseMatrixMPI{T,Ti}(plan.product_structural_hash, A.row_partition, B.col_partition,
+        plan.product_col_indices, transpose(result_csc), nothing, nothing)
+end
+
+"""
+    AdditionPlan{T,Ti}
+
+A precomputed plan for adding/subtracting two sparse matrices with identical structure.
+Stores the result structure (colptr, rowval) and index mappings for SIMD-optimized execution.
+
+The plan preserves structural zeros, ensuring predictable output structure for hash caching.
+"""
+mutable struct AdditionPlan{T,Ti}
+    # Result matrix structure (shared, not copied during execution)
+    colptr::Vector{Ti}
+    rowval::Vector{Ti}
+
+    # Index mappings for SIMD execution:
+    # For entries only in A: result.nzval[A_only_dst] = A.nzval[A_only_src]
+    A_only_src::Vector{Ti}
+    A_only_dst::Vector{Ti}
+    # For entries only in B: result.nzval[B_only_dst] = B.nzval[B_only_src]
+    B_only_src::Vector{Ti}
+    B_only_dst::Vector{Ti}
+    # For entries in both: result.nzval[both_dst] = A.nzval[both_A_src] + B.nzval[both_B_src]
+    both_A_src::Vector{Ti}
+    both_B_src::Vector{Ti}
+    both_dst::Vector{Ti}
+
+    # Result metadata
+    row_partition::Vector{Int}
+    col_partition::Vector{Int}
+    col_indices::Vector{Int}
+
+    # Cached structural hash (computed lazily)
+    structural_hash::OptionalBlake3Hash
+end
+
+"""
+    AdditionPlan(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+
+Create a plan for computing A + B (or A - B).
+Assumes B has already been repartitioned to match A's row_partition.
+
+The plan performs symbolic addition to determine the result structure,
+then precomputes index mappings for efficient SIMD execution.
+"""
+function AdditionPlan(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    # Get the local CSC matrices (stored as transpose)
+    # A.A is Transpose{T, SparseMatrixCSC}, so A.A.parent is the CSC
+    A_csc = A.A.parent  # (num_cols x num_local_rows)
+    B_csc = B.A.parent
+
+    nrows_local = A_csc.n  # number of local rows (columns of CSC)
+
+    # Merge column indices
+    union_cols = merge_sorted_unique(A.col_indices, B.col_indices)
+    ncols_union = length(union_cols)
+
+    # Build mappings from A/B col_indices to union_cols
+    A_col_map = build_subset_mapping(A.col_indices, union_cols)
+    B_col_map = build_subset_mapping(B.col_indices, union_cols)
+
+    # Symbolic addition: compute result structure
+    # For each local row (column of CSC), merge the nonzero column indices
+
+    # First pass: count nnz per local row to build colptr
+    colptr = Vector{Ti}(undef, nrows_local + 1)
+    colptr[1] = 1
+
+    for j in 1:nrows_local
+        # Get A's nonzeros in this row (mapped to union space)
+        A_start, A_end = A_csc.colptr[j], A_csc.colptr[j+1] - 1
+        # Get B's nonzeros in this row (mapped to union space)
+        B_start, B_end = B_csc.colptr[j], B_csc.colptr[j+1] - 1
+
+        # Count merged entries (both lists are sorted)
+        count = Ti(0)
+        ai, bi = A_start, B_start
+        while ai <= A_end && bi <= B_end
+            a_col = A_col_map[A_csc.rowval[ai]]
+            b_col = B_col_map[B_csc.rowval[bi]]
+            if a_col < b_col
+                count += 1
+                ai += 1
+            elseif b_col < a_col
+                count += 1
+                bi += 1
+            else  # a_col == b_col
+                count += 1
+                ai += 1
+                bi += 1
+            end
+        end
+        count += (A_end - ai + 1) + (B_end - bi + 1)
+        colptr[j+1] = colptr[j] + count
+    end
+
+    nnz_result = colptr[nrows_local + 1] - 1
+    rowval = Vector{Ti}(undef, nnz_result)
+
+    # Prepare index mapping vectors
+    A_only_src = Ti[]
+    A_only_dst = Ti[]
+    B_only_src = Ti[]
+    B_only_dst = Ti[]
+    both_A_src = Ti[]
+    both_B_src = Ti[]
+    both_dst = Ti[]
+
+    # Second pass: fill rowval and build index mappings
+    for j in 1:nrows_local
+        A_start, A_end = A_csc.colptr[j], A_csc.colptr[j+1] - 1
+        B_start, B_end = B_csc.colptr[j], B_csc.colptr[j+1] - 1
+
+        result_idx = colptr[j]
+        ai, bi = A_start, B_start
+
+        while ai <= A_end && bi <= B_end
+            a_col = A_col_map[A_csc.rowval[ai]]
+            b_col = B_col_map[B_csc.rowval[bi]]
+            if a_col < b_col
+                rowval[result_idx] = a_col
+                push!(A_only_src, ai)
+                push!(A_only_dst, result_idx)
+                result_idx += 1
+                ai += 1
+            elseif b_col < a_col
+                rowval[result_idx] = b_col
+                push!(B_only_src, bi)
+                push!(B_only_dst, result_idx)
+                result_idx += 1
+                bi += 1
+            else  # a_col == b_col
+                rowval[result_idx] = a_col
+                push!(both_A_src, ai)
+                push!(both_B_src, bi)
+                push!(both_dst, result_idx)
+                result_idx += 1
+                ai += 1
+                bi += 1
+            end
+        end
+
+        # Remaining entries from A
+        while ai <= A_end
+            rowval[result_idx] = A_col_map[A_csc.rowval[ai]]
+            push!(A_only_src, ai)
+            push!(A_only_dst, result_idx)
+            result_idx += 1
+            ai += 1
+        end
+
+        # Remaining entries from B
+        while bi <= B_end
+            rowval[result_idx] = B_col_map[B_csc.rowval[bi]]
+            push!(B_only_src, bi)
+            push!(B_only_dst, result_idx)
+            result_idx += 1
+            bi += 1
+        end
+    end
+
+    # Compute structural hash now (at plan time) to avoid computing during execution
+    # Create a temporary CSC to compute hash (values don't matter for structural hash)
+    temp_nzval = Vector{T}(undef, nnz_result)
+    temp_csc = SparseMatrixCSC(length(union_cols), nrows_local, colptr, rowval, temp_nzval)
+    structural_hash = compute_structural_hash(A.row_partition, union_cols, temp_csc, MPI.COMM_WORLD)
+
+    return AdditionPlan{T,Ti}(
+        colptr, rowval,
+        Ti.(A_only_src), Ti.(A_only_dst),
+        Ti.(B_only_src), Ti.(B_only_dst),
+        Ti.(both_A_src), Ti.(both_B_src), Ti.(both_dst),
+        A.row_partition, A.col_partition, union_cols,
+        structural_hash
+    )
+end
+
+"""
+    execute_addition!(nzval::Vector{T}, plan::AdditionPlan{T,Ti}, A_nzval::Vector{T}, B_nzval::Vector{T}) where {T,Ti}
+
+Execute an addition plan: result = A + B. Uses SIMD-optimized loops.
+Writes directly into the provided nzval buffer.
+"""
+function execute_addition!(nzval::Vector{T}, plan::AdditionPlan{T,Ti}, A_nzval::Vector{T}, B_nzval::Vector{T}) where {T,Ti}
+    # Copy A-only entries
+    A_src = plan.A_only_src
+    A_dst = plan.A_only_dst
+    @inbounds @simd for i in eachindex(A_src)
+        nzval[A_dst[i]] = A_nzval[A_src[i]]
+    end
+
+    # Copy B-only entries
+    B_src = plan.B_only_src
+    B_dst = plan.B_only_dst
+    @inbounds @simd for i in eachindex(B_src)
+        nzval[B_dst[i]] = B_nzval[B_src[i]]
+    end
+
+    # Add entries in both
+    both_A = plan.both_A_src
+    both_B = plan.both_B_src
+    both_d = plan.both_dst
+    @inbounds @simd for i in eachindex(both_A)
+        nzval[both_d[i]] = A_nzval[both_A[i]] + B_nzval[both_B[i]]
+    end
+
+    return nzval
+end
+
+"""
+    execute_subtraction!(nzval::Vector{T}, plan::AdditionPlan{T,Ti}, A_nzval::Vector{T}, B_nzval::Vector{T}) where {T,Ti}
+
+Execute a subtraction plan: result = A - B. Uses SIMD-optimized loops.
+Writes directly into the provided nzval buffer.
+"""
+function execute_subtraction!(nzval::Vector{T}, plan::AdditionPlan{T,Ti}, A_nzval::Vector{T}, B_nzval::Vector{T}) where {T,Ti}
+    # Copy A-only entries
+    A_src = plan.A_only_src
+    A_dst = plan.A_only_dst
+    @inbounds @simd for i in eachindex(A_src)
+        nzval[A_dst[i]] = A_nzval[A_src[i]]
+    end
+
+    # Negate B-only entries
+    B_src = plan.B_only_src
+    B_dst = plan.B_only_dst
+    @inbounds @simd for i in eachindex(B_src)
+        nzval[B_dst[i]] = -B_nzval[B_src[i]]
+    end
+
+    # Subtract entries in both
+    both_A = plan.both_A_src
+    both_B = plan.both_B_src
+    both_d = plan.both_dst
+    @inbounds @simd for i in eachindex(both_A)
+        nzval[both_d[i]] = A_nzval[both_A[i]] - B_nzval[both_B[i]]
+    end
+
+    return nzval
+end
+
+"""
+    _get_addition_plan(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+
+Get or create a cached addition plan for A + B.
+B must already be repartitioned to match A's row_partition.
+"""
+function _get_addition_plan(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    key = (A.structural_hash, B.structural_hash, T, Ti)
+    if haskey(_addition_plan_cache, key)
+        return _addition_plan_cache[key]::AdditionPlan{T,Ti}
+    end
+    plan = AdditionPlan(A, B)
+    _addition_plan_cache[key] = plan
+    return plan
 end
 
 """
     Base.+(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
-Add two distributed sparse matrices. The result has A's row partition.
+Add two distributed sparse matrices using plan-based execution.
+Preserves structural zeros for predictable output structure.
+The result has A's row partition.
 """
 function Base.:+(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    # Repartition B to match A's row partition
     B_repart = repartition(B, A.row_partition)
 
-    if A.col_indices == B_repart.col_indices
-        return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
-            A.col_indices, transpose(A.A.parent + B_repart.A.parent), nothing, nothing)
-    end
+    # Ensure both have structural hashes
+    _ensure_hash(A)
+    _ensure_hash(B_repart)
 
-    # Merge sorted col_indices and build mappings via linear scan (no Dict)
-    union_cols = merge_sorted_unique(A.col_indices, B_repart.col_indices)
-    A_map = build_subset_mapping(A.col_indices, union_cols)
-    B_map = build_subset_mapping(B_repart.col_indices, union_cols)
+    # Get or create plan (hash is computed at plan creation time)
+    plan = _get_addition_plan(A, B_repart)
 
-    # Add in union space
-    result = reindex_to_union_cached(A.A.parent, A_map, length(union_cols)) +
-             reindex_to_union_cached(B_repart.A.parent, B_map, length(union_cols))
+    # Allocate result nzval directly (no copy needed)
+    nnz_result = plan.colptr[end] - 1
+    nzval = Vector{T}(undef, nnz_result)
 
-    return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
-        union_cols, transpose(result), nothing, nothing)
+    # Execute addition directly into result buffer
+    execute_addition!(nzval, plan, A.A.parent.nzval, B_repart.A.parent.nzval)
+
+    # Create result - colptr and rowval are shared with plan (immutable)
+    result_csc = SparseMatrixCSC(length(plan.col_indices), length(plan.colptr) - 1,
+                                  plan.colptr, plan.rowval, nzval)
+
+    return SparseMatrixMPI{T,Ti}(plan.structural_hash, plan.row_partition, plan.col_partition,
+        plan.col_indices, transpose(result_csc), nothing, nothing)
 end
 
 """
     Base.-(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
 
-Subtract two distributed sparse matrices. The result has A's row partition.
+Subtract two distributed sparse matrices using plan-based execution.
+Preserves structural zeros for predictable output structure.
+The result has A's row partition.
 """
 function Base.:-(A::SparseMatrixMPI{T,Ti}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    # Repartition B to match A's row partition
     B_repart = repartition(B, A.row_partition)
 
-    if A.col_indices == B_repart.col_indices
-        return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
-            A.col_indices, transpose(A.A.parent - B_repart.A.parent), nothing, nothing)
-    end
+    # Ensure both have structural hashes
+    _ensure_hash(A)
+    _ensure_hash(B_repart)
 
-    # Merge sorted col_indices and build mappings via linear scan (no Dict)
-    union_cols = merge_sorted_unique(A.col_indices, B_repart.col_indices)
-    A_map = build_subset_mapping(A.col_indices, union_cols)
-    B_map = build_subset_mapping(B_repart.col_indices, union_cols)
+    # Get or create plan (hash is computed at plan creation time)
+    plan = _get_addition_plan(A, B_repart)
 
-    # Subtract in union space
-    result = reindex_to_union_cached(A.A.parent, A_map, length(union_cols)) -
-             reindex_to_union_cached(B_repart.A.parent, B_map, length(union_cols))
+    # Allocate result nzval directly (no copy needed)
+    nnz_result = plan.colptr[end] - 1
+    nzval = Vector{T}(undef, nnz_result)
 
-    return SparseMatrixMPI{T,Ti}(nothing, A.row_partition, A.col_partition,
-        union_cols, transpose(result), nothing, nothing)
+    # Execute subtraction directly into result buffer
+    execute_subtraction!(nzval, plan, A.A.parent.nzval, B_repart.A.parent.nzval)
+
+    # Create result - colptr and rowval are shared with plan (immutable)
+    result_csc = SparseMatrixCSC(length(plan.col_indices), length(plan.colptr) - 1,
+                                  plan.colptr, plan.rowval, nzval)
+
+    return SparseMatrixMPI{T,Ti}(plan.structural_hash, plan.row_partition, plan.col_partition,
+        plan.col_indices, transpose(result_csc), nothing, nothing)
 end
 
 """
@@ -2681,6 +3108,11 @@ A = spdiagm(4, 4, 0 => v)  # 4×4 matrix with [1,2] on main diagonal
 function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
     isempty(kv) && error("spdiagm requires at least one diagonal")
 
+    # Fast path for single main diagonal with square matrix matching vector length
+    if length(kv) == 1 && first(kv)[1] == 0 && m == n == length(first(kv)[2])
+        return spdiagm(first(kv)[2])
+    end
+
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -2780,8 +3212,19 @@ function spdiagm(v::VectorMPI{T}) where T
     row_partition = v.partition  # Use same partition as input vector
     col_partition = v.partition  # Square matrix, same column partition
 
+    # Cache the structural hash: diagonal matrices with the same partition always have
+    # the same structure, so we can reuse the hash from a previous diagonal matrix
+    vec_hash = v.structural_hash
+    if haskey(_diag_hash_cache, vec_hash)
+        diag_hash = _diag_hash_cache[vec_hash]
+    else
+        # Compute and cache the hash (needs SparseMatrixCSC, not Transpose)
+        diag_hash = compute_structural_hash(row_partition, col_indices, AT_local, comm)
+        _diag_hash_cache[vec_hash] = diag_hash
+    end
+
     # Diagonal matrices are always symmetric
-    return SparseMatrixMPI{T,Int}(nothing, row_partition, col_partition, col_indices,
+    return SparseMatrixMPI{T,Int}(diag_hash, row_partition, col_partition, col_indices,
                                transpose(AT_local), nothing, true)
 end
 

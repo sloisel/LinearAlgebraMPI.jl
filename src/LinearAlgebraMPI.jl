@@ -122,6 +122,15 @@ const _dense_transpose_plan_cache = Dict{Tuple{Blake3Hash,DataType},Any}()
 # Key includes (hash_A, target_hash, T, Ti) for sparse and (hash_A, target_hash, T) for others
 const _repartition_plan_cache = Dict{Any,Any}()
 
+# Cache for diagonal matrix structural hashes
+# Key: vector's structural hash (which encodes its partition)
+# Value: the structural hash for the corresponding diagonal matrix
+const _diag_hash_cache = Dict{Blake3Hash,Blake3Hash}()
+
+# Cache for memoized AdditionPlans (for A + B and A - B)
+# Key: (A_hash, B_hash, T, Ti) - use full 256-bit hashes
+const _addition_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType,DataType},Any}()
+
 """
     clear_plan_cache!()
 
@@ -134,6 +143,8 @@ function clear_plan_cache!()
     empty!(_dense_vector_plan_cache)
     empty!(_dense_transpose_plan_cache)
     empty!(_repartition_plan_cache)
+    empty!(_diag_hash_cache)
+    empty!(_addition_plan_cache)
     if isdefined(@__MODULE__, :_dense_transpose_vector_plan_cache)
         empty!(_dense_transpose_vector_plan_cache)
     end
