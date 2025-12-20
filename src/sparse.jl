@@ -3142,13 +3142,24 @@ A = spdiagm(v)  # 3×3 diagonal matrix
 ```
 """
 function spdiagm(v::VectorMPI{T}) where T
-    # Ultra-fast path for main diagonal: build CSC structure directly
+    # Ultra-fast path for main diagonal: reuse cached structure when possible
     n = length(v)
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
-
-    my_start = v.partition[rank+1]
     local_n = length(v.v)
+
+    vec_hash = v.structural_hash
+    row_partition = v.partition  # Use same partition as input vector
+    col_partition = v.partition  # Square matrix, same column partition
+
+    if haskey(_diag_structure_cache, vec_hash)
+        # Reuse cached structure
+        cache = _diag_structure_cache[vec_hash]
+        nzval = copy(v.v)
+        AT_local = SparseMatrixCSC(n, local_n, cache.colptr, cache.rowval, nzval)
+        return SparseMatrixMPI{T,Int}(cache.structural_hash, row_partition, col_partition,
+                                       cache.col_indices, transpose(AT_local), nothing, true)
+    end
 
     # Build AT (transpose) as CSC directly - no sparse() call needed
     # AT has size (n_cols, local_n_rows): n global columns, local_n local rows
@@ -3156,6 +3167,7 @@ function spdiagm(v::VectorMPI{T}) where T
     #
     # IMPORTANT: AT.rowval stores LOCAL/compressed column indices (1, 2, 3, ...)
     # col_indices maps these local indices to global column indices
+    my_start = v.partition[rank+1]
     colptr = collect(1:(local_n+1))  # Each column has exactly 1 entry
     rowval = collect(1:local_n)  # LOCAL column indices (compressed)
     nzval = copy(v.v)
@@ -3164,19 +3176,10 @@ function spdiagm(v::VectorMPI{T}) where T
 
     # col_indices maps local column index -> global column index
     col_indices = collect(my_start:(my_start + local_n - 1))
-    row_partition = v.partition  # Use same partition as input vector
-    col_partition = v.partition  # Square matrix, same column partition
 
-    # Cache the structural hash: diagonal matrices with the same partition always have
-    # the same structure, so we can reuse the hash from a previous diagonal matrix
-    vec_hash = v.structural_hash
-    if haskey(_diag_hash_cache, vec_hash)
-        diag_hash = _diag_hash_cache[vec_hash]
-    else
-        # Compute and cache the hash (needs SparseMatrixCSC, not Transpose)
-        diag_hash = compute_structural_hash(row_partition, col_indices, AT_local, comm)
-        _diag_hash_cache[vec_hash] = diag_hash
-    end
+    # Compute and cache the structure
+    diag_hash = compute_structural_hash(row_partition, col_indices, AT_local, comm)
+    _diag_structure_cache[vec_hash] = DiagStructureCache(colptr, rowval, col_indices, diag_hash)
 
     # Diagonal matrices are always symmetric
     return SparseMatrixMPI{T,Int}(diag_hash, row_partition, col_partition, col_indices,
