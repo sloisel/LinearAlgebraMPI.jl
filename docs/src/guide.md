@@ -8,9 +8,15 @@ LinearAlgebraMPI provides three distributed types:
 
 | Type | Description | Storage |
 |------|-------------|---------|
-| `VectorMPI{T}` | Distributed vector | Row-partitioned |
-| `MatrixMPI{T}` | Distributed dense matrix | Row-partitioned |
+| `VectorMPI{T,AV}` | Distributed vector | Row-partitioned |
+| `MatrixMPI{T,AM}` | Distributed dense matrix | Row-partitioned |
 | `SparseMatrixMPI{T,Ti}` | Distributed sparse matrix | Row-partitioned CSR |
+
+The type parameters are:
+- `T`: Element type (`Float64`, `Float32`, `ComplexF64`, etc.)
+- `AV<:AbstractVector{T}`: Underlying storage for vectors (`Vector{T}` for CPU, `MtlVector{T}` for Metal GPU)
+- `AM<:AbstractMatrix{T}`: Underlying storage for dense matrices (`Matrix{T}` for CPU, `MtlMatrix{T}` for Metal GPU)
+- `Ti`: Index type for sparse matrices (typically `Int`)
 
 All types are row-partitioned across MPI ranks, meaning each rank owns a contiguous range of rows.
 
@@ -352,6 +358,86 @@ new_partition = uniform_partition(100, MPI.Comm_size(MPI.COMM_WORLD))
 # Repartition
 v_new = repartition(v, new_partition)
 ```
+
+## GPU Support (Metal)
+
+LinearAlgebraMPI supports GPU acceleration on macOS via Metal.jl. GPU support is optional and loaded as a package extension.
+
+### Setup
+
+Load Metal **before** MPI for proper GPU detection:
+
+```julia
+using Metal  # Load first!
+using MPI
+MPI.Init()
+using LinearAlgebraMPI
+```
+
+### Converting Between CPU and GPU
+
+```julia
+# Create CPU vector
+x_cpu = VectorMPI(Float32.(rand(1000)))
+
+# Convert to GPU
+x_gpu = mtl(x_cpu)  # Returns VectorMPI{Float32, MtlVector{Float32}}
+
+# GPU operations work transparently
+y_gpu = x_gpu + x_gpu  # Native GPU addition
+z_gpu = 2.0f0 * x_gpu  # Native GPU scalar multiply
+
+# Convert back to CPU
+y_cpu = cpu(y_gpu)
+```
+
+### How It Works
+
+The type parameter `AV` (or `AM` for matrices) determines where data lives:
+
+| Type | Storage | Operations |
+|------|---------|------------|
+| `VectorMPI{T, Vector{T}}` | CPU | Native CPU |
+| `VectorMPI{T, MtlVector{T}}` | GPU | Native GPU for vector ops |
+| `MatrixMPI{T, Matrix{T}}` | CPU | Native CPU |
+| `MatrixMPI{T, MtlMatrix{T}}` | GPU | Native GPU |
+
+### MPI Communication
+
+MPI always uses CPU buffers (no Metal-aware MPI exists). GPU data is automatically staged through CPU:
+
+1. GPU vector data copied to CPU staging buffer
+2. MPI communication on CPU buffers
+3. Results copied back to GPU
+
+This is handled transparently - you just use the same operations.
+
+### Sparse Matrix Operations
+
+Sparse matrices (`SparseMatrixMPI`) remain on CPU. When multiplying with GPU vectors:
+
+```julia
+A = SparseMatrixMPI{Float32}(sprand(Float32, 100, 100, 0.1))
+x_gpu = mtl(VectorMPI(Float32.(rand(100))))
+
+# Sparse multiply: x gathered via CPU, multiply on CPU, result copied to GPU
+y_gpu = A * x_gpu  # Returns VectorMPI{Float32, MtlVector{Float32}}
+```
+
+### Supported GPU Operations
+
+| Operation | GPU Support |
+|-----------|-------------|
+| `v + w`, `v - w` | Native GPU |
+| `α * v` (scalar) | Native GPU |
+| `A * x` (sparse) | CPU staging |
+| `A * x` (dense) | CPU staging |
+| `transpose(A) * x` | CPU staging |
+| Broadcasting (`abs.(v)`) | Native GPU |
+
+### Element Types
+
+Metal requires `Float32` - it does not support `Float64`.
 
 ## Cache Management
 

@@ -116,6 +116,16 @@ _create_output_like(::Vector{T}, result::Vector{T}) where T = result
 _create_output_like(ref::AV, result::Vector{T}) where {T,AV<:AbstractVector{T}} =
     copyto!(similar(ref, length(result)), result)
 
+# Helper to get CPU copy of vector data (no-op for CPU, copy for GPU)
+# Used for MPI communication which always requires CPU buffers
+_ensure_cpu(v::Vector) = v
+_ensure_cpu(v::AbstractVector) = Array(v)
+
+# Helper to copy CPU data to destination buffer (no-op if same, copy if different)
+# Used after MPI communication to transfer results back to GPU if needed
+_copy_to_output!(dst::Vector{T}, src::Vector{T}) where T = (dst === src || copyto!(dst, src); dst)
+_copy_to_output!(dst::AV, src::Vector{T}) where {T,AV<:AbstractVector{T}} = copyto!(dst, src)
+
 """
     VectorPlan{T,AV}
 
@@ -281,72 +291,26 @@ function VectorPlan(target_partition::Vector{Int}, source::VectorMPI{T,AV}) wher
 end
 
 """
-    execute_plan!(plan::VectorPlan{T,Vector{T}}, x::VectorMPI{T,Vector{T}}) where T
-
-Execute a vector communication plan to gather elements from x (CPU path).
-Returns plan.gathered containing x[A.col_indices] for the associated matrix A.
-"""
-function execute_plan!(plan::VectorPlan{T,Vector{T}}, x::VectorMPI{T,Vector{T}}) where T
-    comm = MPI.COMM_WORLD
-
-    # Step 1: Copy local values (allocation-free loop)
-    @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
-        plan.gathered[plan.local_dst_indices[i]] = x.v[plan.local_src_indices[i]]
-    end
-
-    # Step 2: Fill send buffers and send (allocation-free loops)
-    @inbounds for i in eachindex(plan.send_rank_ids)
-        r = plan.send_rank_ids[i]
-        send_idx = plan.send_indices[i]
-        buf = plan.send_bufs[i]
-        for k in eachindex(send_idx)
-            buf[k] = x.v[send_idx[k]]
-        end
-        plan.send_reqs[i] = MPI.Isend(buf, comm; dest=r, tag=21)
-    end
-
-    # Step 3: Receive values
-    @inbounds for i in eachindex(plan.recv_rank_ids)
-        plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=21)
-    end
-
-    MPI.Waitall(plan.recv_reqs)
-
-    # Step 4: Scatter received values into gathered (allocation-free loops)
-    @inbounds for i in eachindex(plan.recv_rank_ids)
-        perm = plan.recv_perm[i]
-        buf = plan.recv_bufs[i]
-        for k in eachindex(perm)
-            plan.gathered[perm[k]] = buf[k]
-        end
-    end
-
-    MPI.Waitall(plan.send_reqs)
-
-    return plan.gathered
-end
-
-"""
     execute_plan!(plan::VectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
 
-Execute a vector communication plan to gather elements from x (GPU path with CPU staging).
+Execute a vector communication plan to gather elements from x.
 Returns plan.gathered containing x[A.col_indices] for the associated matrix A.
 
-For GPU vectors, data is staged through CPU buffers for MPI communication.
+Works uniformly for CPU and GPU vectors - MPI communication always uses CPU
+buffers, with automatic staging for GPU arrays.
 """
-function execute_plan!(plan::VectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV<:AbstractVector{T}}
-    # For non-Vector types (GPU arrays), use CPU staging
+function execute_plan!(plan::VectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
     comm = MPI.COMM_WORLD
 
-    # Get CPU view of GPU data for sending
-    x_cpu = Array(x.v)
+    # Get CPU data for MPI operations (no-op for CPU, copy for GPU)
+    x_cpu = _ensure_cpu(x.v)
 
     # Step 1: Copy local values to CPU staging buffer
     @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
         plan.gathered_cpu[plan.local_dst_indices[i]] = x_cpu[plan.local_src_indices[i]]
     end
 
-    # Step 2: Fill send buffers from CPU data and send
+    # Step 2: Fill send buffers and send
     @inbounds for i in eachindex(plan.send_rank_ids)
         r = plan.send_rank_ids[i]
         send_idx = plan.send_indices[i]
@@ -375,8 +339,8 @@ function execute_plan!(plan::VectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV<:
 
     MPI.Waitall(plan.send_reqs)
 
-    # Step 5: Copy CPU staging buffer to GPU gathered buffer
-    copyto!(plan.gathered, plan.gathered_cpu)
+    # Step 5: Copy to output buffer (no-op if CPU, copy if GPU)
+    _copy_to_output!(plan.gathered, plan.gathered_cpu)
 
     return plan.gathered
 end

@@ -493,72 +493,26 @@ function DenseMatrixVectorPlan(A::MatrixMPI{T,AM}, x::VectorMPI{T,AV}) where {T,
 end
 
 """
-    execute_plan!(plan::DenseMatrixVectorPlan{T,Vector{T}}, x::VectorMPI{T,Vector{T}}) where T
-
-Execute a dense vector communication plan to gather elements from x (CPU path).
-Returns plan.gathered containing x[1:ncols] for the associated matrix.
-"""
-function execute_plan!(plan::DenseMatrixVectorPlan{T,Vector{T}}, x::VectorMPI{T,Vector{T}}) where T
-    comm = MPI.COMM_WORLD
-
-    # Step 1: Copy local values
-    @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
-        plan.gathered[plan.local_dst_indices[i]] = x.v[plan.local_src_indices[i]]
-    end
-
-    # Step 2: Fill send buffers and send
-    @inbounds for i in eachindex(plan.send_rank_ids)
-        r = plan.send_rank_ids[i]
-        send_idx = plan.send_indices[i]
-        buf = plan.send_bufs[i]
-        for k in eachindex(send_idx)
-            buf[k] = x.v[send_idx[k]]
-        end
-        plan.send_reqs[i] = MPI.Isend(buf, comm; dest=r, tag=31)
-    end
-
-    # Step 3: Receive values
-    @inbounds for i in eachindex(plan.recv_rank_ids)
-        plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=31)
-    end
-
-    MPI.Waitall(plan.recv_reqs)
-
-    # Step 4: Scatter received values into gathered
-    @inbounds for i in eachindex(plan.recv_rank_ids)
-        perm = plan.recv_perm[i]
-        buf = plan.recv_bufs[i]
-        for k in eachindex(perm)
-            plan.gathered[perm[k]] = buf[k]
-        end
-    end
-
-    MPI.Waitall(plan.send_reqs)
-
-    return plan.gathered
-end
-
-"""
     execute_plan!(plan::DenseMatrixVectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
 
-Execute a dense vector communication plan to gather elements from x (GPU path with CPU staging).
+Execute a dense vector communication plan to gather elements from x.
 Returns plan.gathered containing x[1:ncols] for the associated matrix.
 
-For GPU vectors, data is staged through CPU buffers for MPI communication.
+Works uniformly for CPU and GPU vectors - MPI communication always uses CPU
+buffers, with automatic staging for GPU arrays.
 """
-function execute_plan!(plan::DenseMatrixVectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV<:AbstractVector{T}}
-    # For non-Vector types (GPU arrays), use CPU staging
+function execute_plan!(plan::DenseMatrixVectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
     comm = MPI.COMM_WORLD
 
-    # Get CPU view of GPU data for sending
-    x_cpu = Array(x.v)
+    # Get CPU data for MPI operations (no-op for CPU, copy for GPU)
+    x_cpu = _ensure_cpu(x.v)
 
     # Step 1: Copy local values to CPU staging buffer
     @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
         plan.gathered_cpu[plan.local_dst_indices[i]] = x_cpu[plan.local_src_indices[i]]
     end
 
-    # Step 2: Fill send buffers from CPU data and send
+    # Step 2: Fill send buffers and send
     @inbounds for i in eachindex(plan.send_rank_ids)
         r = plan.send_rank_ids[i]
         send_idx = plan.send_indices[i]
@@ -587,8 +541,8 @@ function execute_plan!(plan::DenseMatrixVectorPlan{T,AV}, x::VectorMPI{T,AV}) wh
 
     MPI.Waitall(plan.send_reqs)
 
-    # Step 5: Copy CPU staging buffer to GPU gathered buffer
-    copyto!(plan.gathered, plan.gathered_cpu)
+    # Step 5: Copy to output buffer (no-op if CPU, copy if GPU)
+    _copy_to_output!(plan.gathered, plan.gathered_cpu)
 
     return plan.gathered
 end
@@ -609,9 +563,6 @@ function get_dense_vector_plan(A::MatrixMPI{T,AM}, x::VectorMPI{T,AV}) where {T,
     return plan
 end
 
-# Helper to get CPU buffer for dense multiply (dense matrices stay on CPU until GPU BLAS available)
-_dense_gathered_cpu_buffer(plan::DenseMatrixVectorPlan{T,Vector{T}}) where T = plan.gathered
-_dense_gathered_cpu_buffer(plan::DenseMatrixVectorPlan{T,AV}) where {T,AV} = plan.gathered_cpu
 
 """
     LinearAlgebra.mul!(y::VectorMPI{T,AV}, A::MatrixMPI{T,AM}, x::VectorMPI{T,AV}) where {T,AM,AV}
@@ -628,9 +579,8 @@ function LinearAlgebra.mul!(y::VectorMPI{T,AV}, A::MatrixMPI{T,AM}, x::VectorMPI
     # Check if matrix is on GPU
     if AM <: Matrix
         # Matrix is on CPU - use CPU buffer for multiply
-        gathered_cpu = _dense_gathered_cpu_buffer(plan)
         y_local_cpu = Vector{T}(undef, length(y.v))
-        LinearAlgebra.mul!(y_local_cpu, A.A, gathered_cpu)
+        LinearAlgebra.mul!(y_local_cpu, A.A, plan.gathered_cpu)
         copyto!(y.v, y_local_cpu)
     else
         # Matrix is on GPU - use GPU gathered buffer directly
@@ -665,9 +615,8 @@ function Base.:*(A::MatrixMPI{T,AM}, x::VectorMPI{T,AV}) where {T,AM,AV}
     # Check if matrix is on GPU
     if AM <: Matrix
         # Matrix is on CPU - compute on CPU, then copy to GPU if needed
-        gathered_cpu = _dense_gathered_cpu_buffer(plan)
         y_local_cpu = Vector{T}(undef, local_rows)
-        LinearAlgebra.mul!(y_local_cpu, A.A, gathered_cpu)
+        LinearAlgebra.mul!(y_local_cpu, A.A, plan.gathered_cpu)
         y_v = _create_output_like(x.v, y_local_cpu)
     else
         # Matrix is on GPU - use GPU gathered buffer directly
@@ -1143,77 +1092,26 @@ function DenseTransposeVectorPlan(A::MatrixMPI{T}, x::VectorMPI{T,AV}) where {T,
     )
 end
 
-# Helper to get CPU buffer for DenseTransposeVectorPlan (may stage from GPU)
-function _transpose_gathered_cpu_buffer(plan::DenseTransposeVectorPlan{T,Vector{T}}) where T
-    return plan.gathered  # Already CPU
-end
-
-function _transpose_gathered_cpu_buffer(plan::DenseTransposeVectorPlan{T,AV}) where {T,AV<:AbstractVector{T}}
-    return plan.gathered_cpu  # Return CPU staging buffer for GPU arrays
-end
-
-"""
-    execute_plan!(plan::DenseTransposeVectorPlan{T,Vector{T}}, x::VectorMPI{T,Vector{T}}) where T
-
-Execute the transpose vector plan for CPU vectors - direct copy, no staging.
-"""
-function execute_plan!(plan::DenseTransposeVectorPlan{T,Vector{T}}, x::VectorMPI{T,Vector{T}}) where T
-    comm = MPI.COMM_WORLD
-
-    # Copy local values directly
-    @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
-        plan.gathered[plan.local_dst_indices[i]] = x.v[plan.local_src_indices[i]]
-    end
-
-    # Fill send buffers and send
-    @inbounds for i in eachindex(plan.send_rank_ids)
-        r = plan.send_rank_ids[i]
-        send_idx = plan.send_indices[i]
-        buf = plan.send_bufs[i]
-        for k in eachindex(send_idx)
-            buf[k] = x.v[send_idx[k]]
-        end
-        plan.send_reqs[i] = MPI.Isend(buf, comm; dest=r, tag=51)
-    end
-
-    # Receive values
-    @inbounds for i in eachindex(plan.recv_rank_ids)
-        plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=51)
-    end
-
-    MPI.Waitall(plan.recv_reqs)
-
-    # Scatter received values into gathered
-    @inbounds for i in eachindex(plan.recv_rank_ids)
-        perm = plan.recv_perm[i]
-        buf = plan.recv_bufs[i]
-        for k in eachindex(perm)
-            plan.gathered[perm[k]] = buf[k]
-        end
-    end
-
-    MPI.Waitall(plan.send_reqs)
-
-    return plan.gathered
-end
-
 """
     execute_plan!(plan::DenseTransposeVectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
 
-Execute the transpose vector plan for GPU vectors - uses CPU staging.
+Execute the transpose vector plan to gather x elements.
+
+Works uniformly for CPU and GPU vectors - MPI communication always uses CPU
+buffers, with automatic staging for GPU arrays.
 """
-function execute_plan!(plan::DenseTransposeVectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV<:AbstractVector{T}}
+function execute_plan!(plan::DenseTransposeVectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
     comm = MPI.COMM_WORLD
 
-    # Copy GPU data to CPU for MPI operations
-    x_cpu = Array(x.v)
+    # Get CPU data for MPI operations (no-op for CPU, copy for GPU)
+    x_cpu = _ensure_cpu(x.v)
 
-    # Copy local values to CPU staging buffer
+    # Step 1: Copy local values to CPU staging buffer
     @inbounds for i in eachindex(plan.local_src_indices, plan.local_dst_indices)
         plan.gathered_cpu[plan.local_dst_indices[i]] = x_cpu[plan.local_src_indices[i]]
     end
 
-    # Fill send buffers from CPU copy and send
+    # Step 2: Fill send buffers and send
     @inbounds for i in eachindex(plan.send_rank_ids)
         r = plan.send_rank_ids[i]
         send_idx = plan.send_indices[i]
@@ -1224,14 +1122,14 @@ function execute_plan!(plan::DenseTransposeVectorPlan{T,AV}, x::VectorMPI{T,AV})
         plan.send_reqs[i] = MPI.Isend(buf, comm; dest=r, tag=51)
     end
 
-    # Receive values
+    # Step 3: Receive values to CPU buffers
     @inbounds for i in eachindex(plan.recv_rank_ids)
         plan.recv_reqs[i] = MPI.Irecv!(plan.recv_bufs[i], comm; source=plan.recv_rank_ids[i], tag=51)
     end
 
     MPI.Waitall(plan.recv_reqs)
 
-    # Scatter received values into CPU staging buffer
+    # Step 4: Scatter received values into CPU staging buffer
     @inbounds for i in eachindex(plan.recv_rank_ids)
         perm = plan.recv_perm[i]
         buf = plan.recv_bufs[i]
@@ -1242,8 +1140,8 @@ function execute_plan!(plan::DenseTransposeVectorPlan{T,AV}, x::VectorMPI{T,AV})
 
     MPI.Waitall(plan.send_reqs)
 
-    # Copy CPU staging buffer to GPU buffer
-    copyto!(plan.gathered, plan.gathered_cpu)
+    # Step 5: Copy to output buffer (no-op if CPU, copy if GPU)
+    _copy_to_output!(plan.gathered, plan.gathered_cpu)
 
     return plan.gathered
 end
@@ -1286,7 +1184,7 @@ function Base.:*(At::Transpose{T,<:MatrixMPI{T}}, x::VectorMPI{T,AV}) where {T,A
     execute_plan!(plan, x)
 
     # Use CPU buffer for computation (matrix is on CPU)
-    gathered_cpu = _transpose_gathered_cpu_buffer(plan)
+    gathered_cpu = plan.gathered_cpu
 
     # Local computation: transpose(A.A) * local_gathered
     # A.A has shape (local_nrows, ncols), gathered has shape (nrows,)

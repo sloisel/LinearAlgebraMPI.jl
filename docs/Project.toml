@@ -1,7 +1,14 @@
 [deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LinearAlgebraMPI = "5bdd2be4-ae34-42ef-8b36-f4c85d48f377"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
 
+[sources]
+LinearAlgebraMPI = {path = "/Users/sebastienloisel/Library/CloudStorage/Dropbox/2023/Spectral Barrier Method/julia/LinearAlgebraMPI.jl"}
+
 [compat]
+Adapt = "4"
 Documenter = "1"
+KernelAbstractions = "0.9"
