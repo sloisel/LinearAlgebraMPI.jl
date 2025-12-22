@@ -148,7 +148,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, i::Integer, j::Integer) where T
     # Owner extracts the value into the buffer
     if rank == owner
         local_row = i - A.row_partition[owner + 1] + 1
-        AT = A.A.parent  # The underlying CSC storage
+        AT = _get_csc(A)  # The underlying CSC storage
 
         # Find j in col_indices using binary search (col_indices is sorted)
         local_col_idx = searchsortedfirst(A.col_indices, j)
@@ -224,7 +224,7 @@ function Base.setindex!(A::SparseMatrixMPI{T}, val, i::Integer, j::Integer) wher
     needs_col_expansion = false
     if i_own_row
         local_row = i - A.row_partition[owner + 1] + 1
-        AT = A.A.parent
+        AT = _get_csc(A)
 
         local_col_idx = searchsortedfirst(A.col_indices, j)
         if local_col_idx <= length(A.col_indices) && A.col_indices[local_col_idx] == j
@@ -250,12 +250,15 @@ function Base.setindex!(A::SparseMatrixMPI{T}, val, i::Integer, j::Integer) wher
         row_offset = A.row_partition[rank + 1]
         received_mods = [(i, j, convert(T, val))]
         new_AT, new_col_indices = _rebuild_AT_with_insertions(
-            A.A.parent, A.col_indices, received_mods, row_offset
+            _get_csc(A), A.col_indices, received_mods, row_offset
         )
 
-        # Update the struct fields
+        # Update the struct fields with explicit CSR arrays
         A.col_indices = new_col_indices
-        A.A = transpose(new_AT)
+        A.rowptr = new_AT.colptr
+        A.colval = new_AT.rowval
+        A.nzval = new_AT.nzval
+        A.ncols_compressed = length(new_col_indices)
     end
 
     # Step 4: Invalidate structural hash (will be recomputed lazily on next use)
@@ -1046,8 +1049,9 @@ function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rn
         # SparseMatrixCSC(ncols, nrows, colptr, rowval, nzval) - transposed storage
         empty_AT = SparseMatrixCSC(new_ncols, my_local_rows, ones(Int, my_local_rows + 1), Int[], T[])
         hash = compute_structural_hash(new_row_partition, Int[], empty_AT, comm)
-        return SparseMatrixMPI{T,Ti}(hash, new_row_partition, new_col_partition, Int[],
-                                   transpose(empty_AT), nothing, nothing)
+        return SparseMatrixMPI{T,Ti,Vector{T}}(hash, new_row_partition, new_col_partition, Int[],
+                                   empty_AT.colptr, empty_AT.rowval, empty_AT.nzval,
+                                   my_local_rows, 0, nothing, nothing)
     end
 
     # Compute new row partition (local computation, no communication)
@@ -1073,7 +1077,7 @@ function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rn
         local_row_end = intersect_end - my_row_start + 1
 
         # A.A is transpose(AT) where AT is CSC with columns = local rows
-        AT = A.A.parent  # SparseMatrixCSC with columns = local rows
+        AT = _get_csc(A)  # SparseMatrixCSC with columns = local rows
 
         # Build new sparse structure for the extracted rows
         # AT has columns for each local row, rows indexed by compressed col_indices
@@ -1154,10 +1158,12 @@ function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rn
     end
 
     # Compute hash (requires Allgather for consistency)
-    hash = compute_structural_hash(new_row_partition, final_col_indices, new_AT, comm)
+    hash = compute_structural_hash(new_row_partition, final_col_indices, new_AT.colptr, new_AT.rowval, comm)
 
-    return SparseMatrixMPI{T,Ti}(hash, new_row_partition, new_col_partition, final_col_indices,
-                               transpose(new_AT), nothing, nothing)
+    # Use explicit CSR arrays for the new struct format
+    return SparseMatrixMPI{T,Ti,Vector{T}}(hash, new_row_partition, new_col_partition, final_col_indices,
+                               new_AT.colptr, new_AT.rowval, new_AT.nzval, local_nrows,
+                               length(final_col_indices), nothing, nothing)
 end
 
 # Convenience: A[row_rng, :] - all columns
@@ -1211,10 +1217,10 @@ function Base.getindex(A::SparseMatrixMPI{T}, ::Colon, k::Integer) where T
     local_col = zeros(T, local_nrows)
 
     if has_col && local_nrows > 0
-        # A.A.parent is CSC with shape (length(col_indices), local_nrows)
-        # Row indices in A.A.parent.rowval are local column indices
-        # Column indices in A.A.parent are local row indices
-        parent = A.A.parent
+        # _get_csc(A) is CSC with shape (length(col_indices), local_nrows)
+        # Row indices in _get_csc(A).rowval are local column indices
+        # Column indices in _get_csc(A) are local row indices
+        parent = _get_csc(A)
         for local_row in 1:local_nrows
             # Iterate over nonzeros in this row (stored as column in parent)
             for idx in parent.colptr[local_row]:(parent.colptr[local_row+1]-1)
@@ -1272,7 +1278,7 @@ function Base.setindex!(A::SparseMatrixMPI{T}, val::Number, row_rng::UnitRange{I
         local_row_start = intersect_start - my_row_start + 1
         local_row_end = intersect_end - my_row_start + 1
 
-        AT = A.A.parent
+        AT = _get_csc(A)
         col_rng_start = first(col_rng)
         col_rng_end = last(col_rng)
 
@@ -1371,7 +1377,7 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::SparseMatrixMPI{T}, row_rng:
     if partitions_match
         # Fast path: direct local extraction
         if num_rows_needed > 0 && intersect_start <= intersect_end
-            src_AT = src.A.parent
+            src_AT = _get_csc(src)
             src_my_start = src.row_partition[rank + 1]
 
             for src_local_row in 1:num_rows_needed
@@ -1441,7 +1447,7 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::SparseMatrixMPI{T}, row_rng:
         send_col_indices = Dict{Int, Vector{Int}}()
         send_values = Dict{Int, Vector{T}}()
 
-        src_AT = src.A.parent
+        src_AT = _get_csc(src)
 
         for r in 0:(nranks-1)
             rng = send_row_ranges[r + 1]
@@ -1570,7 +1576,7 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::SparseMatrixMPI{T}, row_rng:
     # First, zero out existing entries in the target region (within owned rows)
     # This ensures src's sparsity pattern replaces the old one
     if intersect_start <= intersect_end
-        AT = A.A.parent
+        AT = _get_csc(A)
         local_row_start = intersect_start - my_row_start + 1
         local_row_end = intersect_end - my_row_start + 1
         col_rng_start = first(col_rng)
@@ -1593,10 +1599,14 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::SparseMatrixMPI{T}, row_rng:
     if !isempty(insertions)
         row_offset = A.row_partition[rank + 1]
         new_AT, new_col_indices = _rebuild_AT_with_insertions(
-            A.A.parent, A.col_indices, insertions, row_offset
+            _get_csc(A), A.col_indices, insertions, row_offset
         )
         A.col_indices = new_col_indices
-        A.A = transpose(new_AT)
+        # Update explicit CSR arrays from the new CSC
+        A.rowptr = new_AT.colptr
+        A.colval = new_AT.rowval
+        A.nzval = new_AT.nzval
+        A.ncols_compressed = length(new_col_indices)
     end
 
     # Invalidate structural hash (will be recomputed lazily on next use)
@@ -2045,7 +2055,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_idx::VectorMPI{Int}, col_idx::
 
     # Prepare to send row data
     my_A_row_start = A.row_partition[rank + 1]
-    AT = A.A.parent
+    AT = _get_csc(A)
 
     # Helper function to extract a row from sparse matrix
     function extract_sparse_row(local_row::Int, cols::Vector{Int}, col_lookup::Dict{Int,Int})
@@ -2625,10 +2635,14 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::MatrixMPI{T}, row_idx::Vecto
     if !isempty(insertions)
         row_offset = A.row_partition[rank + 1]
         new_AT, new_col_indices = _rebuild_AT_with_insertions(
-            A.A.parent, A.col_indices, insertions, row_offset
+            _get_csc(A), A.col_indices, insertions, row_offset
         )
         A.col_indices = new_col_indices
-        A.A = transpose(new_AT)
+        # Update explicit CSR arrays from the new CSC
+        A.rowptr = new_AT.colptr
+        A.colval = new_AT.rowval
+        A.nzval = new_AT.nzval
+        A.ncols_compressed = length(new_col_indices)
     end
 
     # Invalidate structural hash (will be recomputed lazily on next use)
@@ -3187,7 +3201,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_idx::VectorMPI{Int}, col_rng::
     data_send_reqs = MPI.Request[]
     data_send_bufs = Dict{Int, Matrix{T}}()
     my_A_start = A.row_partition[rank + 1]
-    local_A = A.A.parent
+    local_A = _get_csc(A)
     col_indices = A.col_indices
 
     for r in 0:(nranks-1)
@@ -3346,7 +3360,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_rng::UnitRange{Int}, col_idx::
     data_send_reqs = MPI.Request[]
     data_send_bufs = Dict{Int, Matrix{T}}()
     my_A_start = A.row_partition[rank + 1]
-    local_A = A.A.parent
+    local_A = _get_csc(A)
     col_indices = A.col_indices
 
     # Build column index lookup
@@ -3493,7 +3507,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, row_idx::VectorMPI{Int}, j::Int) w
     val_send_reqs = MPI.Request[]
     val_send_bufs = Dict{Int, Vector{T}}()
     my_A_start = A.row_partition[rank + 1]
-    local_A = A.A.parent
+    local_A = _get_csc(A)
     col_indices = A.col_indices
     local_j_idx = findfirst(==(j), col_indices)
 
@@ -3589,7 +3603,7 @@ function Base.getindex(A::SparseMatrixMPI{T}, i::Int, col_idx::VectorMPI{Int}) w
     if rank == owner
         my_A_start = A.row_partition[rank + 1]
         local_row = i - my_A_start + 1
-        local_A = A.A.parent
+        local_A = _get_csc(A)
         col_indices = A.col_indices
 
         row_data = zeros(T, length(col_indices_result))
@@ -4246,10 +4260,14 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::MatrixMPI{T}, row_idx::Vecto
     if !isempty(insertions)
         row_offset = A.row_partition[rank + 1]
         new_AT, new_col_indices = _rebuild_AT_with_insertions(
-            A.A.parent, A.col_indices, insertions, row_offset
+            _get_csc(A), A.col_indices, insertions, row_offset
         )
         A.col_indices = new_col_indices
-        A.A = transpose(new_AT)
+        # Update explicit CSR arrays from the new CSC
+        A.rowptr = new_AT.colptr
+        A.colval = new_AT.rowval
+        A.nzval = new_AT.nzval
+        A.ncols_compressed = length(new_col_indices)
     end
 
     # Invalidate structural hash (will be recomputed lazily on next use)
@@ -4415,10 +4433,14 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::MatrixMPI{T}, row_rng::UnitR
     if !isempty(insertions)
         row_offset = A.row_partition[rank + 1]
         new_AT, new_col_indices = _rebuild_AT_with_insertions(
-            A.A.parent, A.col_indices, insertions, row_offset
+            _get_csc(A), A.col_indices, insertions, row_offset
         )
         A.col_indices = new_col_indices
-        A.A = transpose(new_AT)
+        # Update explicit CSR arrays from the new CSC
+        A.rowptr = new_AT.colptr
+        A.colval = new_AT.rowval
+        A.nzval = new_AT.nzval
+        A.ncols_compressed = length(new_col_indices)
     end
 
     # Invalidate structural hash (will be recomputed lazily on next use)
@@ -4566,10 +4588,14 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::VectorMPI{T}, row_idx::Vecto
     if !isempty(insertions)
         row_offset = A.row_partition[rank + 1]
         new_AT, new_col_indices = _rebuild_AT_with_insertions(
-            A.A.parent, A.col_indices, insertions, row_offset
+            _get_csc(A), A.col_indices, insertions, row_offset
         )
         A.col_indices = new_col_indices
-        A.A = transpose(new_AT)
+        # Update explicit CSR arrays from the new CSC
+        A.rowptr = new_AT.colptr
+        A.colval = new_AT.rowval
+        A.nzval = new_AT.nzval
+        A.ncols_compressed = length(new_col_indices)
     end
 
     # Invalidate structural hash (will be recomputed lazily on next use)
@@ -4631,10 +4657,14 @@ function Base.setindex!(A::SparseMatrixMPI{T}, src::VectorMPI{T}, i::Integer, co
         if !isempty(insertions)
             row_offset = A.row_partition[rank + 1]
             new_AT, new_col_indices = _rebuild_AT_with_insertions(
-                A.A.parent, A.col_indices, insertions, row_offset
+                _get_csc(A), A.col_indices, insertions, row_offset
             )
             A.col_indices = new_col_indices
-            A.A = transpose(new_AT)
+            # Update explicit CSR arrays from the new CSC
+            A.rowptr = new_AT.colptr
+            A.colval = new_AT.rowval
+            A.nzval = new_AT.nzval
+            A.ncols_compressed = length(new_col_indices)
         end
     end
 

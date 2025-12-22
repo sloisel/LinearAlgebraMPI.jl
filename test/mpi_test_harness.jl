@@ -17,6 +17,7 @@ function Test.record(ts::QuietTestSet, res)
         c[:fail] += 1
     elseif res isa Test.Error
         c[:error] += 1
+        println("TEST ERROR: ", res)
     elseif res isa Test.Broken
         c[:broken] += 1
     elseif res isa Test.Skip

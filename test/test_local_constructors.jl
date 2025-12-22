@@ -162,18 +162,18 @@ S_original = sparse(I_orig, J_orig, V_orig, 12, 10)
 
 S_from_global = SparseMatrixMPI{Float64}(S_original)
 
-# Extract local part (A is Transpose{T, SparseMatrixCSC})
+# Extract local part - using explicit CSR arrays
 # Need to convert back to global indices
-AT_compressed = S_from_global.A.parent
 col_indices = S_from_global.col_indices
 
-# Rebuild rowval with global indices
+# Rebuild CSC from explicit arrays with global indices
+# The CSC has shape (ncols_compressed, nrows_local) - swapped for transpose view
 AT_uncompressed = SparseMatrixCSC(
     size(S_original, 2),  # original global ncols
-    AT_compressed.n,
-    copy(AT_compressed.colptr),
-    [col_indices[r] for r in AT_compressed.rowval],
-    copy(AT_compressed.nzval)
+    S_from_global.nrows_local,  # number of local rows
+    copy(S_from_global.rowptr),  # becomes colptr in CSC
+    [col_indices[r] for r in S_from_global.colval],  # map local to global indices
+    copy(S_from_global.nzval)
 )
 
 # Rebuild from local

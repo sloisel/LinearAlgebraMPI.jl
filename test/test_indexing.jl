@@ -81,17 +81,17 @@ end
 function gather_to_root(A::SparseMatrixMPI{T}) where T
     m, ncols = size(A)
     # Convert local sparse to dense, send rows
-    # Note: local_A has shape (length(col_indices), local_nrows) with compressed columns
+    # Note: CSR has shape (nrows_local, ncols_compressed) with compressed columns
     local_nrows = A.row_partition[rank+2] - A.row_partition[rank+1]
     local_dense = zeros(T, local_nrows, ncols)  # Start with zeros
-    local_A = A.A.parent  # CSC with shape (length(col_indices), local_nrows)
     col_indices = A.col_indices  # Maps local col index -> global col index
 
-    # Extract values using the sparse matrix interface
+    # Extract values using the CSR arrays (rowptr, colval, nzval)
     for i in 1:local_nrows
-        for local_j in 1:length(col_indices)
+        for idx in A.rowptr[i]:(A.rowptr[i+1]-1)
+            local_j = A.colval[idx]
             global_j = col_indices[local_j]
-            local_dense[i, global_j] = local_A[local_j, i]
+            local_dense[i, global_j] = A.nzval[idx]
         end
     end
 

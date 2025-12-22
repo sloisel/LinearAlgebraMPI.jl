@@ -218,10 +218,10 @@ function extract_local_coo(A::SparseMatrixMPI{T}; symmetric::Bool=false) where T
     a_loc = T[]
     nzval_perm = Int[]
 
-    # A.A.parent is the underlying CSC storage
-    # Columns in A.A.parent correspond to local rows
+    # _get_csc(A) reconstructs the underlying CSC storage from explicit arrays
+    # Columns in the CSC correspond to local rows (CSR stored as transpose of CSC)
     # A.col_indices maps local column indices to global
-    AT = A.A.parent
+    AT = _get_csc(A)
 
     for local_row in 1:AT.n  # AT.n = number of local rows
         global_row = row_start + local_row - 1
@@ -334,7 +334,8 @@ Uses cached nzval_perm for fast vectorized copy.
 """
 function _update_values!(plan::MUMPSAnalysisPlan{T}, A::SparseMatrixMPI{T}, symmetric::Bool) where T
     # Fast vectorized copy using cached permutation
-    plan.a_loc .= A.A.parent.nzval[plan.nzval_perm]
+    nzval_cpu = _ensure_cpu(A.nzval)
+    plan.a_loc .= nzval_cpu[plan.nzval_perm]
 end
 
 """

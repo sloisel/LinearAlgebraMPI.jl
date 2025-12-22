@@ -115,6 +115,8 @@ end
 _create_output_like(::Vector{T}, result::Vector{T}) where T = result
 _create_output_like(ref::AV, result::Vector{T}) where {T,AV<:AbstractVector{T}} =
     copyto!(similar(ref, length(result)), result)
+# When result is already the same type as reference, return as-is (e.g., both GPU)
+_create_output_like(::AV, result::AV) where {T,AV<:AbstractVector{T}} = result
 
 # Helper to get CPU copy of vector data (no-op for CPU, copy for GPU)
 # Used for MPI communication which always requires CPU buffers

@@ -27,13 +27,14 @@ function gather_sparse(Adist::SparseMatrixMPI{T}) where T
 
     my_row_start = Adist.row_partition[rank + 1]
     col_indices = Adist.col_indices
-    for local_row in 1:size(Adist.A.parent, 2)
+    # Use explicit CSR arrays: rowptr, colval, nzval
+    for local_row in 1:Adist.nrows_local
         global_row = my_row_start + local_row - 1
-        for idx in Adist.A.parent.colptr[local_row]:(Adist.A.parent.colptr[local_row + 1] - 1)
+        for idx in Adist.rowptr[local_row]:(Adist.rowptr[local_row + 1] - 1)
             push!(my_I, global_row)
-            local_col = Adist.A.parent.rowval[idx]
+            local_col = Adist.colval[idx]
             push!(my_J, col_indices[local_col])  # map local to global
-            push!(my_V, Adist.A.parent.nzval[idx])
+            push!(my_V, Adist.nzval[idx])
         end
     end
 

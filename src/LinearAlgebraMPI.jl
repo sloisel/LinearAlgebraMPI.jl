@@ -114,14 +114,16 @@ const _plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType,DataType},Any}()
 
 # Cache for memoized VectorPlans (for A * x)
 # Key: (A_hash, x_hash, T, AV) - includes array type for GPU support
-const _vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType,DataType},Any}()
+# Uses Type instead of DataType to support GPU UnionAll types like MtlVector{Float32}
+const _vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,Type,Type},Any}()
 
 # Cache for memoized DenseMatrixVectorPlans (for MatrixMPI * VectorMPI)
 # Key: (A_hash, x_hash, T, AM, AV) - includes matrix and vector array types for GPU support
-const _dense_vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,DataType,DataType,DataType},Any}()
+# Uses Type instead of DataType to support GPU UnionAll types like MtlMatrix{Float32}
+const _dense_vector_plan_cache = Dict{Tuple{Blake3Hash,Blake3Hash,Type,Type,Type},Any}()
 
 # Cache for memoized DenseTransposePlans (for transpose(MatrixMPI))
-const _dense_transpose_plan_cache = Dict{Tuple{Blake3Hash,DataType},Any}()
+const _dense_transpose_plan_cache = Dict{Tuple{Blake3Hash,Type},Any}()
 
 # Cache for memoized RepartitionPlans (for repartition)
 # Key includes (hash_A, target_hash, T, Ti) for sparse and (hash_A, target_hash, T) for others
@@ -299,7 +301,7 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
 
     # Now send the actual row data from B
     # For each row, we send: (num_entries, col_indices..., values...)
-    BT = B.A.parent  # underlying CSC (columns = local rows of B)
+    BT = _get_csc(B)  # underlying CSC (columns = local rows of B)
     B_row_start = B.row_partition[rank + 1]
 
     # Prepare send buffers: pack row data
@@ -360,7 +362,7 @@ function _compare_rows_distributed(A::SparseMatrixMPI{T}, B::SparseMatrixMPI{T})
 
     # Receive row data and compare with A's local rows
     local_match = true
-    AT = A.A.parent
+    AT = _get_csc(A)
     A_row_start = A.row_partition[rank + 1]
 
     # First handle rows we own in both A and B (rank == rank case)
@@ -561,7 +563,7 @@ end
 # ============================================================================
 
 """
-    _ensure_hash(A::SparseMatrixMPI{T}) -> Blake3Hash
+    _ensure_hash(A::SparseMatrixMPI) -> Blake3Hash
 
 Ensure that the structural hash is computed. If `A.structural_hash` is `nothing`,
 compute it and cache it in the struct. Returns the hash.
@@ -569,9 +571,9 @@ compute it and cache it in the struct. Returns the hash.
 Note: This function calls `compute_structural_hash` which uses MPI.Allgather,
 so all ranks must call this together.
 """
-function _ensure_hash(A::SparseMatrixMPI{T})::Blake3Hash where T
+function _ensure_hash(A::SparseMatrixMPI)::Blake3Hash
     if A.structural_hash === nothing
-        A.structural_hash = compute_structural_hash(A.row_partition, A.col_indices, A.A.parent, MPI.COMM_WORLD)
+        A.structural_hash = compute_structural_hash(A.row_partition, A.col_indices, A.rowptr, A.colval, MPI.COMM_WORLD)
     end
     return A.structural_hash
 end
@@ -700,7 +702,7 @@ function SparseArrays.SparseMatrixCSC(A::SparseMatrixMPI{T}) where T
     my_row_start = A.row_partition[rank+1]
 
     # Extract local triplets (I, J, V)
-    AT = A.A.parent  # underlying CSC storage
+    AT = _get_csc(A)  # underlying CSC storage
     local_nnz = nnz(AT)
 
     local_I = Vector{Int}(undef, local_nnz)
