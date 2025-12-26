@@ -27,7 +27,7 @@ cat(A, B, C, D; dims=(2,2)) # 2×2 block matrix [A B; C D]
 This is a distributed implementation that only gathers the rows each rank needs
 for its local output, rather than gathering all data to all ranks.
 """
-function Base.cat(As::SparseMatrixMPI{T}...; dims) where T
+function Base.cat(As::SparseMatrixMPI{T,Ti,AV}...; dims) where {T,Ti,AV}
     isempty(As) && error("cat requires at least one matrix")
     length(As) == 1 && return copy(As[1])
 
@@ -142,7 +142,19 @@ function Base.cat(As::SparseMatrixMPI{T}...; dims) where T
         SparseMatrixCSC(total_cols, local_nrows, ones(Int, local_nrows + 1), Int[], T[]) :
         sparse(local_J, local_I, local_V, total_cols, local_nrows)
 
-    return SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+    result = SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+
+    # Convert to GPU if inputs were GPU (GPU→CPU for MPI, then CPU→GPU for result)
+    if AV !== Vector{T}
+        nzval_target = copyto!(similar(As[1].nzval, length(result.nzval)), result.nzval)
+        rowptr_target = _to_target_backend(result.rowptr, AV)
+        colval_target = _to_target_backend(result.colval, AV)
+        return SparseMatrixMPI{T,Ti,AV}(
+            result.structural_hash, result.row_partition, result.col_partition, result.col_indices,
+            result.rowptr, result.colval, nzval_target, result.nrows_local, result.ncols_compressed,
+            nothing, result.cached_symmetric, rowptr_target, colval_target)
+    end
+    return result
 end
 
 # ============================================================================
@@ -452,7 +464,7 @@ Returns a SparseMatrixMPI.
 This is a distributed implementation that only gathers the rows each rank needs
 for its local output, rather than gathering all data to all ranks.
 """
-function blockdiag(As::SparseMatrixMPI{T}...) where T
+function blockdiag(As::SparseMatrixMPI{T,Ti,AV}...) where {T,Ti,AV}
     isempty(As) && error("blockdiag requires at least one matrix")
     length(As) == 1 && return copy(As[1])
 
@@ -526,5 +538,17 @@ function blockdiag(As::SparseMatrixMPI{T}...) where T
         SparseMatrixCSC(total_cols, local_nrows, ones(Int, local_nrows + 1), Int[], T[]) :
         sparse(local_J, local_I, local_V, total_cols, local_nrows)
 
-    return SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+    result = SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+
+    # Convert to GPU if inputs were GPU (GPU→CPU for MPI, then CPU→GPU for result)
+    if AV !== Vector{T}
+        nzval_target = copyto!(similar(As[1].nzval, length(result.nzval)), result.nzval)
+        rowptr_target = _to_target_backend(result.rowptr, AV)
+        colval_target = _to_target_backend(result.colval, AV)
+        return SparseMatrixMPI{T,Ti,AV}(
+            result.structural_hash, result.row_partition, result.col_partition, result.col_indices,
+            result.rowptr, result.colval, nzval_target, result.nrows_local, result.ncols_compressed,
+            nothing, result.cached_symmetric, rowptr_target, colval_target)
+    end
+    return result
 end
