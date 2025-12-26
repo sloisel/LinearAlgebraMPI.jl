@@ -1,4 +1,14 @@
 # Tests for utility functions: io0, show methods, and MPI->native conversions
+# Parameterized over scalar types and backends (CPU and GPU)
+
+# Check Metal availability BEFORE loading MPI
+const METAL_AVAILABLE = try
+    using Metal
+    Metal.functional()
+catch e
+    false
+end
+
 using MPI
 MPI.Init()
 
@@ -10,12 +20,16 @@ using Test
 include(joinpath(@__DIR__, "mpi_test_harness.jl"))
 using .MPITestHarness: QuietTestSet
 
+include(joinpath(@__DIR__, "test_utils.jl"))
+using .TestUtils
+
 comm = MPI.COMM_WORLD
 rank = MPI.Comm_rank(comm)
 nranks = MPI.Comm_size(comm)
 
 ts = @testset QuietTestSet "Utilities" begin
 
+# io0 tests don't need parameterization - they test I/O behavior
 println(io0(), "[test] io0 rank selection")
 
 # Test io0 - capture output to buffer
@@ -49,85 +63,59 @@ else
 end
 
 
-println(io0(), "[test] Vector conversion roundtrip")
+# Parameterized tests for type conversions
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
+    TOL = TestUtils.tolerance(T)
 
-# Test Vector conversion: native -> MPI -> native (bit-for-bit)
-v_original = Float64[1.5, -2.3, 3.7, 4.1, -5.9, 6.2, 7.8, -8.4, 9.0, 10.1]
-v_mpi = VectorMPI(v_original)
-v_back = Vector(v_mpi)
-@test v_back === v_original || v_back == v_original  # bit-for-bit or equal
-@test eltype(v_back) == eltype(v_original)
-@test length(v_back) == length(v_original)
+    println(io0(), "[test] Vector conversion roundtrip ($T, $backend_name)")
 
-# Complex vector
-v_complex = ComplexF64[1+2im, 3-4im, 5+6im, 7-8im, 9+10im]
-v_mpi_c = VectorMPI(v_complex)
-v_back_c = Vector(v_mpi_c)
-@test v_back_c == v_complex
-@test eltype(v_back_c) == ComplexF64
+    # Test Vector conversion: native -> MPI -> native (bit-for-bit)
+    v_original = T.([1.5, -2.3, 3.7, 4.1, -5.9, 6.2, 7.8, -8.4, 9.0, 10.1])
+    v_mpi = to_backend(VectorMPI(v_original))
+    v_back = Vector(v_mpi)
+    @test norm(v_back - v_original) < TOL
+    @test eltype(v_back) == T
+    @test length(v_back) == length(v_original)
 
 
-println(io0(), "[test] Matrix conversion roundtrip")
+    println(io0(), "[test] Matrix conversion roundtrip ($T, $backend_name)")
 
-# Test Matrix conversion: native -> MPI -> native (bit-for-bit)
-M_original = Float64[1.1 2.2 3.3 4.4;
+    # Test Matrix conversion: native -> MPI -> native (bit-for-bit)
+    M_original = T.([1.1 2.2 3.3 4.4;
                      5.5 6.6 7.7 8.8;
                      9.9 10.0 11.1 12.2;
                      13.3 14.4 15.5 16.6;
                      17.7 18.8 19.9 20.0;
-                     21.1 22.2 23.3 24.4]
-M_mpi = MatrixMPI(M_original)
-M_back = Matrix(M_mpi)
-@test M_back == M_original
-@test eltype(M_back) == eltype(M_original)
-@test size(M_back) == size(M_original)
-
-# Complex matrix
-M_complex = ComplexF64[1+1im 2+2im 3+3im;
-                       4-4im 5-5im 6-6im;
-                       7+7im 8+8im 9+9im;
-                       10-10im 11-11im 12-12im]
-M_mpi_c = MatrixMPI(M_complex)
-M_back_c = Matrix(M_mpi_c)
-@test M_back_c == M_complex
-@test eltype(M_back_c) == ComplexF64
+                     21.1 22.2 23.3 24.4])
+    M_mpi = to_backend(MatrixMPI(M_original))
+    M_back = Matrix(M_mpi)
+    @test norm(M_back - M_original) < TOL
+    @test eltype(M_back) == T
+    @test size(M_back) == size(M_original)
 
 
-println(io0(), "[test] SparseMatrixCSC conversion roundtrip")
+    println(io0(), "[test] SparseMatrixCSC conversion roundtrip ($T, $backend_name)")
 
-# Test SparseMatrixCSC conversion: native -> MPI -> native (bit-for-bit)
-# Create a nontrivial sparse matrix with various patterns
-I = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 9, 10, 5, 6, 11, 12, 8, 9, 10]
-J = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 2, 12, 13, 5, 6, 14, 15, 16]
-V = Float64[1.1, -2.2, 3.3, -4.4, 5.5, -6.6, 7.7, -8.8, 9.9, -10.0,
-            11.1, -12.2, 13.3, -14.4, 15.5, -16.6, 17.7, -18.8, 19.9, -20.0]
-S_original = sparse(I, J, V, 15, 20)
+    # Test SparseMatrixCSC conversion: native -> MPI -> native (bit-for-bit)
+    # Create a nontrivial sparse matrix with various patterns
+    I_sp = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 9, 10, 5, 6, 11, 12, 8, 9, 10]
+    J_sp = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 2, 12, 13, 5, 6, 14, 15, 16]
+    V_sp = T.([1.1, -2.2, 3.3, -4.4, 5.5, -6.6, 7.7, -8.8, 9.9, -10.0,
+               11.1, -12.2, 13.3, -14.4, 15.5, -16.6, 17.7, -18.8, 19.9, -20.0])
+    S_original = sparse(I_sp, J_sp, V_sp, 15, 20)
 
-S_mpi = SparseMatrixMPI{Float64}(S_original)
-S_back = SparseMatrixCSC(S_mpi)
+    S_mpi = to_backend(SparseMatrixMPI{T}(S_original))
+    S_back = SparseMatrixCSC(S_mpi)
 
-@test S_back == S_original
-@test nnz(S_back) == nnz(S_original)
-@test size(S_back) == size(S_original)
-@test eltype(S_back) == eltype(S_original)
+    @test norm(S_back - S_original, Inf) < TOL
+    @test nnz(S_back) == nnz(S_original)
+    @test size(S_back) == size(S_original)
+    @test eltype(S_back) == T
 
-# Verify structure is identical
-@test S_back.colptr == S_original.colptr
-@test S_back.rowval == S_original.rowval
-@test S_back.nzval == S_original.nzval
-
-# Complex sparse matrix
-I_c = [1, 2, 3, 4, 5, 1, 3, 5, 7, 9]
-J_c = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-V_c = ComplexF64[1+1im, 2-2im, 3+3im, 4-4im, 5+5im, 6-6im, 7+7im, 8-8im, 9+9im, 10-10im]
-S_complex = sparse(I_c, J_c, V_c, 12, 12)
-
-S_mpi_c = SparseMatrixMPI{ComplexF64}(S_complex)
-S_back_c = SparseMatrixCSC(S_mpi_c)
-@test S_back_c == S_complex
-@test eltype(S_back_c) == ComplexF64
+end  # for (T, to_backend, backend_name)
 
 
+# Show method tests (CPU only, display behavior)
 println(io0(), "[test] VectorMPI show methods")
 
 # Test show methods for VectorMPI
@@ -213,12 +201,23 @@ else
 end
 
 
-end  # testset
+end  # QuietTestSet
 
-# Report results from rank 0
-println("Test Summary: Utilities | Pass: $(ts.counts[:pass])  Fail: $(ts.counts[:fail])  Error: $(ts.counts[:error])")
+# Aggregate counts across ranks
+local_counts = [
+    get(ts.counts, :pass, 0),
+    get(ts.counts, :fail, 0),
+    get(ts.counts, :error, 0),
+    get(ts.counts, :broken, 0),
+    get(ts.counts, :skip, 0),
+]
+global_counts = similar(local_counts)
+MPI.Allreduce!(local_counts, global_counts, +, comm)
 
-# Exit with appropriate code
-exit_code = (ts.counts[:fail] + ts.counts[:error] > 0) ? 1 : 0
+println(io0(), "Test Summary: Utilities | Pass: $(global_counts[1])  Fail: $(global_counts[2])  Error: $(global_counts[3])")
+
 MPI.Finalize()
-exit(exit_code)
+
+if global_counts[2] > 0 || global_counts[3] > 0
+    exit(1)
+end

@@ -1,85 +1,88 @@
+# Tests for matrix addition with different sparsity patterns
+# Parameterized over scalar types and backends (CPU and GPU)
+
+# Check Metal availability BEFORE loading MPI
+const METAL_AVAILABLE = try
+    using Metal
+    Metal.functional()
+catch e
+    false
+end
+
 using Test
 using MPI
+MPI.Init()
+
 using LinearAlgebraMPI
 using LinearAlgebraMPI: SparseMatrixMPI, VectorMPI, io0, clear_plan_cache!
 using SparseArrays
 using LinearAlgebra
 
-# Initialize MPI
-if !MPI.Initialized()
-    MPI.Init()
-end
+include(joinpath(@__DIR__, "mpi_test_harness.jl"))
+using .MPITestHarness: QuietTestSet
+
+include(joinpath(@__DIR__, "test_utils.jl"))
+using .TestUtils
 
 comm = MPI.COMM_WORLD
 rank = MPI.Comm_rank(comm)
 nranks = MPI.Comm_size(comm)
 
-println(io0(), "[TEST] Testing matrix addition with different sparsity patterns (nranks=$nranks)")
+ts = @testset QuietTestSet "Addition Different Sparsity" begin
 
-# This test reproduces a bug where adding matrices with different sparsity patterns
-# can fail due to cached MatrixPlan having stale local_ranges
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
+    TOL = TestUtils.tolerance(T)
 
-@testset "Addition with different sparsity patterns" begin
-    # Create two matrices with different sparsity patterns
-    # A has nonzeros in different positions than B
+    println(io0(), "[test] Matrix addition with different sparsity patterns ($T, $backend_name)")
+
+    # This test reproduces a bug where adding matrices with different sparsity patterns
+    # can fail due to cached MatrixPlan having stale local_ranges
 
     n = 8
 
     # Matrix A: tridiagonal pattern
     A_native = spdiagm(n, n,
-        -1 => ones(n-1),
-        0 => 2*ones(n),
-        1 => ones(n-1)
+        -1 => T.(ones(n-1)),
+        0 => T.(2*ones(n)),
+        1 => T.(ones(n-1))
     )
 
     # Matrix B: different pattern (only diagonal and one off-diagonal)
     B_native = spdiagm(n, n,
-        0 => 3*ones(n),
-        2 => 0.5*ones(n-2)  # Different off-diagonal than A
+        0 => T.(3*ones(n)),
+        2 => T.(0.5*ones(n-2))  # Different off-diagonal than A
     )
 
-    A_mpi = SparseMatrixMPI{Float64}(A_native)
-    B_mpi = SparseMatrixMPI{Float64}(B_native)
-
-    println(io0(), "[TEST] A nnz: $(nnz(A_native)), B nnz: $(nnz(B_native))")
+    A_mpi = to_backend(SparseMatrixMPI{T}(A_native))
+    B_mpi = to_backend(SparseMatrixMPI{T}(B_native))
 
     # Test A + B
-    println(io0(), "[TEST] Computing A + B...")
     C_mpi = A_mpi + B_mpi
     C_native = SparseMatrixCSC(C_mpi)
     C_expected = A_native + B_native
 
-    @test norm(C_native - C_expected) < 1e-10
-    println(io0(), "[TEST] A + B passed")
+    @test norm(C_native - C_expected) < TOL
 
-    # Now test with matrices produced from multiplication (like in f2)
-    # This is closer to the actual failing case
+
+    println(io0(), "[test] D' * W * D products ($T, $backend_name)")
 
     # Create D operators similar to fem1d
-    dx = spdiagm(n, n, 0 => -ones(n), 1 => ones(n-1))
-    dx[end, end] = 0  # Boundary
-    id = spdiagm(n, n, 0 => ones(n))  # Identity matrix with Float64
+    dx = spdiagm(n, n, 0 => T.(-ones(n)), 1 => T.(ones(n-1)))
+    dx[end, end] = zero(T)  # Boundary
+    id = spdiagm(n, n, 0 => T.(ones(n)))  # Identity matrix
 
-    D_dx = SparseMatrixMPI{Float64}(dx)
-    D_id = SparseMatrixMPI{Float64}(id)
+    D_dx = to_backend(SparseMatrixMPI{T}(dx))
+    D_id = to_backend(SparseMatrixMPI{T}(id))
 
     # Create a diagonal weight matrix
-    w = ones(n) * 0.5
-    W = SparseMatrixMPI{Float64}(spdiagm(n, n, 0 => w))
-
-    println(io0(), "[TEST] Computing D' * W * D products...")
+    w = T.(ones(n) * 0.5)
+    W = to_backend(SparseMatrixMPI{T}(spdiagm(n, n, 0 => w)))
 
     # Compute products with different structure
-    # M1 = id' * W * dx (structure of dx)
-    # M2 = dx' * W * id (structure of dx')
     M1 = D_id' * W * D_dx
     M2 = D_dx' * W * D_id
 
-    println(io0(), "[TEST] M1 nnz: $(nnz(SparseMatrixCSC(M1)))")
-    println(io0(), "[TEST] M2 nnz: $(nnz(SparseMatrixCSC(M2)))")
-
     # This addition previously failed with BoundsError due to cached plan issue
-    println(io0(), "[TEST] Computing M1 + M2 (this is where the bug occurred)...")
     M_sum = M1 + M2
     M_sum_native = SparseMatrixCSC(M_sum)
 
@@ -88,71 +91,80 @@ println(io0(), "[TEST] Testing matrix addition with different sparsity patterns 
     M2_expected = dx' * spdiagm(n, n, 0 => w) * id
     M_sum_expected = M1_expected + M2_expected
 
-    @test norm(M_sum_native - M_sum_expected) < 1e-10
-    println(io0(), "[TEST] M1 + M2 passed")
+    @test norm(M_sum_native - M_sum_expected) < TOL
 
-    # Also test the accumulation pattern used in Hessian assembly
-    println(io0(), "[TEST] Testing Hessian-style accumulation...")
+
+    println(io0(), "[test] Hessian-style accumulation ($T, $backend_name)")
+
+    # Recreate matrices for this test
+    D_dx2 = to_backend(SparseMatrixMPI{T}(dx))
+    D_id2 = to_backend(SparseMatrixMPI{T}(id))
+    W2 = to_backend(SparseMatrixMPI{T}(spdiagm(n, n, 0 => w)))
 
     # Start with one product
-    H = D_dx' * W * D_dx
-    H_native_start = SparseMatrixCSC(H)
+    H = D_dx2' * W2 * D_dx2
 
     # Add another product with different structure
-    H = H + D_id' * W * D_id
-    H_native_step2 = SparseMatrixCSC(H)
+    H = H + D_id2' * W2 * D_id2
 
     # Add cross terms (this pattern caused the original bug)
-    cross1 = D_dx' * W * D_id
-    cross2 = D_id' * W * D_dx
+    cross1 = D_dx2' * W2 * D_id2
+    cross2 = D_id2' * W2 * D_dx2
     cross_sum = cross1 + cross2
     H = H + cross_sum
     H_native_final = SparseMatrixCSC(H)
 
     # Compute expected
-    H_expected = dx' * spdiagm(n,n,0=>w) * dx +
-                 id' * spdiagm(n,n,0=>w) * id +
-                 dx' * spdiagm(n,n,0=>w) * id +
-                 id' * spdiagm(n,n,0=>w) * dx
+    W_diag = spdiagm(n, n, 0 => w)
+    H_expected = dx' * W_diag * dx +
+                 id' * W_diag * id +
+                 dx' * W_diag * id +
+                 id' * W_diag * dx
 
-    @test norm(H_native_final - H_expected) < 1e-10
-    println(io0(), "[TEST] Hessian-style accumulation passed")
+    @test norm(H_native_final - H_expected) < TOL
 
-    # Test the exact pattern from MultiGridBarrierMPI that triggered the bug
-    # The bug occurred when:
-    # 1. We compute foo * dx (structure A)
-    # 2. We compute dx' * foo (structure B, different from A)
-    # 3. We add A + B
-    println(io0(), "[TEST] Testing exact bug-triggering pattern...")
 
-    # Create fresh diagonal matrix each time (different values to ensure different matrices)
-    foo1 = SparseMatrixMPI{Float64}(spdiagm(n, n, 0 => 0.3 * ones(n)))
-    foo2 = SparseMatrixMPI{Float64}(spdiagm(n, n, 0 => 0.7 * ones(n)))
+    println(io0(), "[test] Exact bug-triggering pattern ($T, $backend_name)")
+
+    # Create fresh diagonal matrices each time
+    foo1 = to_backend(SparseMatrixMPI{T}(spdiagm(n, n, 0 => T.(0.3 * ones(n)))))
+    foo2 = to_backend(SparseMatrixMPI{T}(spdiagm(n, n, 0 => T.(0.7 * ones(n)))))
+    D_dx3 = to_backend(SparseMatrixMPI{T}(dx))
 
     # Compute products: these have DIFFERENT sparsity patterns
-    # prod1 = foo1 * dx has structure of dx
-    # prod2 = dx' * foo2 has structure of dx'
-    prod1 = foo1 * D_dx
-    prod2 = D_dx' * foo2
-
-    prod1_native = SparseMatrixCSC(prod1)
-    prod2_native = SparseMatrixCSC(prod2)
-
-    println(io0(), "[TEST] prod1 (foo*dx) nnz: $(nnz(prod1_native))")
-    println(io0(), "[TEST] prod2 (dx'*foo) nnz: $(nnz(prod2_native))")
+    prod1 = foo1 * D_dx3
+    prod2 = D_dx3' * foo2
 
     # This is where the bug occurred - adding matrices with different structure
-    println(io0(), "[TEST] Adding prod1 + prod2...")
     sum_result = prod1 + prod2
     sum_native = SparseMatrixCSC(sum_result)
 
     # Expected
-    foo1_native = spdiagm(n, n, 0 => 0.3 * ones(n))
-    foo2_native = spdiagm(n, n, 0 => 0.7 * ones(n))
+    foo1_native = spdiagm(n, n, 0 => T.(0.3 * ones(n)))
+    foo2_native = spdiagm(n, n, 0 => T.(0.7 * ones(n)))
     sum_expected = foo1_native * dx + dx' * foo2_native
 
-    @test norm(sum_native - sum_expected) < 1e-10
-    println(io0(), "[TEST] Exact pattern test passed")
-end
+    @test norm(sum_native - sum_expected) < TOL
 
-println(io0(), "[TEST] All tests completed successfully")
+end  # for (T, to_backend, backend_name)
+
+end  # QuietTestSet
+
+# Aggregate counts across ranks
+local_counts = [
+    get(ts.counts, :pass, 0),
+    get(ts.counts, :fail, 0),
+    get(ts.counts, :error, 0),
+    get(ts.counts, :broken, 0),
+    get(ts.counts, :skip, 0),
+]
+global_counts = similar(local_counts)
+MPI.Allreduce!(local_counts, global_counts, +, comm)
+
+println(io0(), "Test Summary: Addition Different Sparsity | Pass: $(global_counts[1])  Fail: $(global_counts[2])  Error: $(global_counts[3])")
+
+MPI.Finalize()
+
+if global_counts[2] > 0 || global_counts[3] > 0
+    exit(1)
+end

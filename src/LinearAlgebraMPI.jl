@@ -638,9 +638,12 @@ function Base.Vector(v::VectorMPI{T}) where T
     # Compute counts per rank
     counts = Int32[v.partition[r+2] - v.partition[r+1] for r in 0:nranks-1]
 
+    # Ensure local data is on CPU for MPI (GPU arrays not supported by MPI.jl)
+    v_cpu = _ensure_cpu(v.v)
+
     # Use Allgatherv to gather the full vector
     full_v = Vector{T}(undef, length(v))
-    MPI.Allgatherv!(v.v, MPI.VBuffer(full_v, counts), comm)
+    MPI.Allgatherv!(v_cpu, MPI.VBuffer(full_v, counts), comm)
 
     return full_v
 end
@@ -665,7 +668,8 @@ function Base.Matrix(A::MatrixMPI{T}) where T
     full_M = Matrix{T}(undef, m, n)
 
     # Flatten local matrix (column-major order)
-    local_flat = vec(A.A)
+    # Ensure data is on CPU for MPI (GPU arrays not supported by MPI.jl)
+    local_flat = _ensure_cpu(vec(A.A))
 
     # Gather all flattened matrices
     full_flat = Vector{T}(undef, m * n)

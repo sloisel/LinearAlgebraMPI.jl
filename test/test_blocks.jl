@@ -1,413 +1,389 @@
+# MPI test for block matrix operations (cat, blockdiag)
+# This file is executed under mpiexec by runtests.jl
+# Parameterized over scalar types and backends (CPU/GPU)
+
+# Check Metal availability BEFORE loading MPI
+const METAL_AVAILABLE = try
+    using Metal
+    Metal.functional()
+catch e
+    false
+end
+
 using MPI
+MPI.Init()
+
 using LinearAlgebraMPI
 using SparseArrays
+using LinearAlgebra: norm
 using Test
-using Random
-
-MPI.Init()
 
 include(joinpath(@__DIR__, "mpi_test_harness.jl"))
 using .MPITestHarness: QuietTestSet
+
+include(joinpath(@__DIR__, "test_utils.jl"))
+using .TestUtils
 
 comm = MPI.COMM_WORLD
 rank = MPI.Comm_rank(comm)
 nranks = MPI.Comm_size(comm)
 
-# Use fixed seed for reproducibility across ranks
-Random.seed!(42)
+# Helper to create deterministic sparse test matrices
+function make_sparse(::Type{T}, m, n, pattern::Symbol=:diagonal) where T
+    if pattern == :diagonal
+        # Simple diagonal pattern
+        k = min(m, n)
+        I = collect(1:k)
+        J = collect(1:k)
+        V = T <: Complex ? T.(1:k) .+ im .* T.(k:-1:1) : T.(1:k)
+        return sparse(I, J, V, m, n)
+    elseif pattern == :tridiagonal
+        I = Int[]
+        J = Int[]
+        V = T[]
+        for i in 1:min(m, n)
+            push!(I, i); push!(J, i)
+            push!(V, T <: Complex ? T(2) + im * T(0.1) : T(2))
+            if i > 1 && i <= n
+                push!(I, i); push!(J, i-1)
+                push!(V, T <: Complex ? T(-0.5) + im * T(0.2) : T(-0.5))
+            end
+            if i < m && i < n
+                push!(I, i); push!(J, i+1)
+                push!(V, T <: Complex ? T(-0.5) - im * T(0.2) : T(-0.5))
+            end
+        end
+        return sparse(I, J, V, m, n)
+    elseif pattern == :scattered
+        # Scattered non-zeros for more interesting sparsity
+        I = Int[]
+        J = Int[]
+        V = T[]
+        for i in 1:m
+            for j in 1:n
+                if (i + j) % 3 == 0
+                    push!(I, i); push!(J, j)
+                    push!(V, T <: Complex ? T(i + j) + im * T(i - j) : T(i + j))
+                end
+            end
+        end
+        return isempty(I) ? spzeros(T, m, n) : sparse(I, J, V, m, n)
+    end
+end
 
-# Helper to gather SparseMatrixMPI back to global SparseMatrixCSC for comparison
-function gather_sparse(Adist::SparseMatrixMPI{T}) where T
-    m, n = size(Adist)
-
-    # Collect local triplets
-    my_I = Int[]
-    my_J = Int[]
-    my_V = T[]
-
-    my_row_start = Adist.row_partition[rank + 1]
-    col_indices = Adist.col_indices
-    # Use explicit CSR arrays: rowptr, colval, nzval
-    for local_row in 1:Adist.nrows_local
-        global_row = my_row_start + local_row - 1
-        for idx in Adist.rowptr[local_row]:(Adist.rowptr[local_row + 1] - 1)
-            push!(my_I, global_row)
-            local_col = Adist.colval[idx]
-            push!(my_J, col_indices[local_col])  # map local to global
-            push!(my_V, Adist.nzval[idx])
+# Helper to create deterministic dense test matrices
+function make_dense(::Type{T}, m, n) where T
+    A = zeros(T, m, n)
+    for i in 1:m, j in 1:n
+        if T <: Complex
+            A[i, j] = T(i + j) + im * T(i - j)
+        else
+            A[i, j] = T(i + j)
         end
     end
-
-    # Gather counts
-    local_nnz = Int32(length(my_I))
-    all_nnz = MPI.Allgather(local_nnz, comm)
-
-    # Gather triplets
-    total_nnz = sum(all_nnz)
-    all_I = Vector{Int}(undef, total_nnz)
-    all_J = Vector{Int}(undef, total_nnz)
-    all_V = Vector{T}(undef, total_nnz)
-
-    MPI.Allgatherv!(my_I, MPI.VBuffer(all_I, all_nnz), comm)
-    MPI.Allgatherv!(my_J, MPI.VBuffer(all_J, all_nnz), comm)
-    MPI.Allgatherv!(my_V, MPI.VBuffer(all_V, all_nnz), comm)
-
-    return sparse(all_I, all_J, all_V, m, n)
+    A
 end
 
-# Helper to gather VectorMPI back to global Vector
-function gather_vector(v::VectorMPI{T}) where T
-    n = length(v)
-    my_start = v.partition[rank + 1]
-    my_end = v.partition[rank + 2] - 1
-    local_count = my_end - my_start + 1
-
-    all_counts = MPI.Allgather(Int32(local_count), comm)
-    full_v = Vector{T}(undef, sum(all_counts))
-    MPI.Allgatherv!(v.v, MPI.VBuffer(full_v, all_counts), comm)
-
-    return full_v
-end
-
-# Generate random sparse matrices with given dimensions and density
-function make_random_sparse(m, n, density=0.3)
-    return sprand(m, n, density)
+# Helper to create deterministic test vectors
+function make_vector(::Type{T}, n) where T
+    if T <: Complex
+        T.(1:n) .+ im .* T.(n:-1:1)
+    else
+        T.(1:n)
+    end
 end
 
 ts = @testset QuietTestSet "Block Matrices" begin
 
-println(io0(), "[test] cat dims=1 (vcat)")
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
+    TOL = TestUtils.tolerance(T)
 
-# Create random matrices to stack vertically (same number of columns)
-A = make_random_sparse(8, 10)
-B = make_random_sparse(6, 10)
-C = make_random_sparse(4, 10)
+    println(io0(), "[test] cat dims=1 (vcat) ($T, $backend_name)")
 
-# Reference: Julia's cat
-ref = cat(A, B, C; dims=1)
+    # Create sparse matrices to stack vertically (same number of columns)
+    A = make_sparse(T, 8, 10, :scattered)
+    B = make_sparse(T, 6, 10, :diagonal)
+    C = make_sparse(T, 4, 10, :tridiagonal)
 
-# MPI version
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
-Cdist = SparseMatrixMPI{Float64}(C)
+    # Reference: Julia's cat
+    ref = cat(A, B, C; dims=1)
 
-result_dist = cat(Adist, Bdist, Cdist; dims=1)
-result = gather_sparse(result_dist)
+    # MPI version
+    Adist = to_backend(SparseMatrixMPI{T}(A))
+    Bdist = to_backend(SparseMatrixMPI{T}(B))
+    Cdist = to_backend(SparseMatrixMPI{T}(C))
 
-@test result == ref
+    result_dist = cat(Adist, Bdist, Cdist; dims=1)
+    result = SparseMatrixCSC(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
 
-println(io0(), "[test] cat dims=2 (hcat)")
 
-# Create random matrices to stack horizontally (same number of rows)
-A = make_random_sparse(10, 8)
-B = make_random_sparse(10, 6)
-C = make_random_sparse(10, 4)
+    println(io0(), "[test] cat dims=2 (hcat) ($T, $backend_name)")
 
-# Reference
-ref = cat(A, B, C; dims=2)
+    # Create sparse matrices to stack horizontally (same number of rows)
+    A = make_sparse(T, 10, 8, :scattered)
+    B = make_sparse(T, 10, 6, :diagonal)
+    C = make_sparse(T, 10, 4, :tridiagonal)
 
-# MPI version
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
-Cdist = SparseMatrixMPI{Float64}(C)
+    # Reference
+    ref = cat(A, B, C; dims=2)
 
-result_dist = cat(Adist, Bdist, Cdist; dims=2)
-result = gather_sparse(result_dist)
+    # MPI version
+    Adist = to_backend(SparseMatrixMPI{T}(A))
+    Bdist = to_backend(SparseMatrixMPI{T}(B))
+    Cdist = to_backend(SparseMatrixMPI{T}(C))
 
-@test result == ref
+    result_dist = cat(Adist, Bdist, Cdist; dims=2)
+    result = SparseMatrixCSC(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
 
-println(io0(), "[test] cat dims=(2,2) block matrix")
 
-# Create 4 matrices for 2x2 block
-# Block layout: [A B; C D]
-# A and C must have same #cols, B and D must have same #cols
-# A and B must have same #rows, C and D must have same #rows
-A = make_random_sparse(8, 6)
-B = make_random_sparse(8, 5)
-C = make_random_sparse(7, 6)
-D = make_random_sparse(7, 5)
+    println(io0(), "[test] cat dims=(2,2) block matrix ($T, $backend_name)")
 
-# Reference: build block matrix manually
-ref = [A B; C D]
+    # Create 4 matrices for 2x2 block
+    # Block layout: [A B; C D]
+    A = make_sparse(T, 8, 6, :scattered)
+    B = make_sparse(T, 8, 5, :diagonal)
+    C = make_sparse(T, 7, 6, :tridiagonal)
+    D = make_sparse(T, 7, 5, :scattered)
 
-# MPI version (row-major order: A, B, C, D)
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
-Cdist = SparseMatrixMPI{Float64}(C)
-Ddist = SparseMatrixMPI{Float64}(D)
+    # Reference: build block matrix manually
+    ref = [A B; C D]
 
-result_dist = cat(Adist, Bdist, Cdist, Ddist; dims=(2, 2))
-result = gather_sparse(result_dist)
+    # MPI version (row-major order: A, B, C, D)
+    Adist = to_backend(SparseMatrixMPI{T}(A))
+    Bdist = to_backend(SparseMatrixMPI{T}(B))
+    Cdist = to_backend(SparseMatrixMPI{T}(C))
+    Ddist = to_backend(SparseMatrixMPI{T}(D))
 
-@test result == ref
+    result_dist = cat(Adist, Bdist, Cdist, Ddist; dims=(2, 2))
+    result = SparseMatrixCSC(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
 
-println(io0(), "[test] cat dims=(3,2) block matrix")
 
-# 3 rows, 2 columns of blocks
-# [A B]
-# [C D]
-# [E F]
-A = make_random_sparse(5, 7)
-B = make_random_sparse(5, 4)
-C = make_random_sparse(6, 7)
-D = make_random_sparse(6, 4)
-E = make_random_sparse(4, 7)
-F = make_random_sparse(4, 4)
+    println(io0(), "[test] cat dims=(3,2) block matrix ($T, $backend_name)")
 
-# Reference
-ref = [A B; C D; E F]
+    # 3 rows, 2 columns of blocks
+    # [A B]
+    # [C D]
+    # [E F]
+    A = make_sparse(T, 5, 7, :scattered)
+    B = make_sparse(T, 5, 4, :diagonal)
+    C = make_sparse(T, 6, 7, :tridiagonal)
+    D = make_sparse(T, 6, 4, :scattered)
+    E = make_sparse(T, 4, 7, :diagonal)
+    F = make_sparse(T, 4, 4, :tridiagonal)
 
-# MPI version
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
-Cdist = SparseMatrixMPI{Float64}(C)
-Ddist = SparseMatrixMPI{Float64}(D)
-Edist = SparseMatrixMPI{Float64}(E)
-Fdist = SparseMatrixMPI{Float64}(F)
+    # Reference
+    ref = [A B; C D; E F]
 
-result_dist = cat(Adist, Bdist, Cdist, Ddist, Edist, Fdist; dims=(3, 2))
-result = gather_sparse(result_dist)
+    # MPI version
+    Adist = to_backend(SparseMatrixMPI{T}(A))
+    Bdist = to_backend(SparseMatrixMPI{T}(B))
+    Cdist = to_backend(SparseMatrixMPI{T}(C))
+    Ddist = to_backend(SparseMatrixMPI{T}(D))
+    Edist = to_backend(SparseMatrixMPI{T}(E))
+    Fdist = to_backend(SparseMatrixMPI{T}(F))
 
-@test result == ref
+    result_dist = cat(Adist, Bdist, Cdist, Ddist, Edist, Fdist; dims=(3, 2))
+    result = SparseMatrixCSC(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
 
-println(io0(), "[test] cat dims=(2,3) block matrix")
 
-# 2 rows, 3 columns of blocks
-# [A B C]
-# [D E F]
-A = make_random_sparse(6, 5)
-B = make_random_sparse(6, 4)
-C = make_random_sparse(6, 3)
-D = make_random_sparse(5, 5)
-E = make_random_sparse(5, 4)
-F = make_random_sparse(5, 3)
+    println(io0(), "[test] cat dims=(2,3) block matrix ($T, $backend_name)")
 
-# Reference
-ref = [A B C; D E F]
+    # 2 rows, 3 columns of blocks
+    # [A B C]
+    # [D E F]
+    A = make_sparse(T, 6, 5, :scattered)
+    B = make_sparse(T, 6, 4, :diagonal)
+    C = make_sparse(T, 6, 3, :tridiagonal)
+    D = make_sparse(T, 5, 5, :diagonal)
+    E = make_sparse(T, 5, 4, :scattered)
+    F = make_sparse(T, 5, 3, :diagonal)
 
-# MPI version
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
-Cdist = SparseMatrixMPI{Float64}(C)
-Ddist = SparseMatrixMPI{Float64}(D)
-Edist = SparseMatrixMPI{Float64}(E)
-Fdist = SparseMatrixMPI{Float64}(F)
+    # Reference
+    ref = [A B C; D E F]
 
-result_dist = cat(Adist, Bdist, Cdist, Ddist, Edist, Fdist; dims=(2, 3))
-result = gather_sparse(result_dist)
+    # MPI version
+    Adist = to_backend(SparseMatrixMPI{T}(A))
+    Bdist = to_backend(SparseMatrixMPI{T}(B))
+    Cdist = to_backend(SparseMatrixMPI{T}(C))
+    Ddist = to_backend(SparseMatrixMPI{T}(D))
+    Edist = to_backend(SparseMatrixMPI{T}(E))
+    Fdist = to_backend(SparseMatrixMPI{T}(F))
 
-@test result == ref
+    result_dist = cat(Adist, Bdist, Cdist, Ddist, Edist, Fdist; dims=(2, 3))
+    result = SparseMatrixCSC(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
 
-println(io0(), "[test] VectorMPI vcat")
 
-v1 = rand(10)
-v2 = rand(8)
-v3 = rand(12)
+    println(io0(), "[test] VectorMPI vcat ($T, $backend_name)")
 
-ref = vcat(v1, v2, v3)
+    v1 = make_vector(T, 10)
+    v2 = make_vector(T, 8) .* T(2)
+    v3 = make_vector(T, 12) .* T(3)
 
-v1dist = VectorMPI(v1)
-v2dist = VectorMPI(v2)
-v3dist = VectorMPI(v3)
+    ref = vcat(v1, v2, v3)
 
-result_dist = vcat(v1dist, v2dist, v3dist)
-result = gather_vector(result_dist)
+    v1dist = to_backend(VectorMPI(v1))
+    v2dist = to_backend(VectorMPI(v2))
+    v3dist = to_backend(VectorMPI(v3))
 
-@test result == ref
+    result_dist = vcat(v1dist, v2dist, v3dist)
+    result = Vector(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
 
-println(io0(), "[test] VectorMPI hcat")
 
-# Create vectors with same length
-v1 = rand(10)
-v2 = rand(10)
-v3 = rand(10)
+    println(io0(), "[test] VectorMPI hcat ($T, $backend_name)")
 
-ref = hcat(v1, v2, v3)
+    # Create vectors with same length
+    v1 = make_vector(T, 10)
+    v2 = make_vector(T, 10) .* T(2)
+    v3 = make_vector(T, 10) .* T(3)
 
-v1dist = VectorMPI(v1)
-v2dist = VectorMPI(v2)
-v3dist = VectorMPI(v3)
+    ref = hcat(v1, v2, v3)
 
-result_dist = hcat(v1dist, v2dist, v3dist)
+    v1dist = to_backend(VectorMPI(v1))
+    v2dist = to_backend(VectorMPI(v2))
+    v3dist = to_backend(VectorMPI(v3))
 
-# Result should be MatrixMPI - verify local data is correct
-expected_local = hcat(v1dist.v, v2dist.v, v3dist.v)
-@test result_dist.A == expected_local
-@test size(result_dist) == (10, 3)
+    result_dist = hcat(v1dist, v2dist, v3dist)
 
+    # Result should be MatrixMPI
+    @test size(result_dist) == (10, 3)
+    result_full = Matrix(result_dist)
+    @test norm(result_full - ref, Inf) < TOL
 
-println(io0(), "[test] ComplexF64 cat")
 
-A = sprand(ComplexF64, 8, 6, 0.3)
-B = sprand(ComplexF64, 8, 5, 0.3)
-C = sprand(ComplexF64, 7, 6, 0.3)
-D = sprand(ComplexF64, 7, 5, 0.3)
+    println(io0(), "[test] blockdiag ($T, $backend_name)")
 
-ref = [A B; C D]
+    A = make_sparse(T, 8, 6, :scattered)
+    B = make_sparse(T, 5, 7, :diagonal)
+    C = make_sparse(T, 4, 3, :tridiagonal)
 
-Adist = SparseMatrixMPI{ComplexF64}(A)
-Bdist = SparseMatrixMPI{ComplexF64}(B)
-Cdist = SparseMatrixMPI{ComplexF64}(C)
-Ddist = SparseMatrixMPI{ComplexF64}(D)
+    ref = blockdiag(A, B, C)
 
-result_dist = cat(Adist, Bdist, Cdist, Ddist; dims=(2, 2))
-result = gather_sparse(result_dist)
+    Adist = to_backend(SparseMatrixMPI{T}(A))
+    Bdist = to_backend(SparseMatrixMPI{T}(B))
+    Cdist = to_backend(SparseMatrixMPI{T}(C))
 
-@test result == ref
+    result_dist = blockdiag(Adist, Bdist, Cdist)
+    result = SparseMatrixCSC(result_dist)
 
+    @test norm(result - ref, Inf) < TOL
+    @test size(result) == (8 + 5 + 4, 6 + 7 + 3)
 
-println(io0(), "[test] blockdiag")
 
-A = make_random_sparse(8, 6)
-B = make_random_sparse(5, 7)
-C = make_random_sparse(4, 3)
+    println(io0(), "[test] MatrixMPI vcat ($T, $backend_name)")
 
-ref = blockdiag(A, B, C)
+    # Create dense matrices to stack vertically
+    A_dense = make_dense(T, 8, 10)
+    B_dense = make_dense(T, 6, 10) .* T(2)
+    C_dense = make_dense(T, 4, 10) .* T(3)
 
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
-Cdist = SparseMatrixMPI{Float64}(C)
+    ref = vcat(A_dense, B_dense, C_dense)
 
-result_dist = blockdiag(Adist, Bdist, Cdist)
-result = gather_sparse(result_dist)
+    Adist = to_backend(MatrixMPI(A_dense))
+    Bdist = to_backend(MatrixMPI(B_dense))
+    Cdist = to_backend(MatrixMPI(C_dense))
 
-@test result == ref
-@test size(result) == (8 + 5 + 4, 6 + 7 + 3)
+    result_dist = vcat(Adist, Bdist, Cdist)
 
+    @test size(result_dist) == size(ref)
+    @test size(result_dist, 2) == 10  # columns preserved
+    result_full = Matrix(result_dist)
+    @test norm(result_full - ref, Inf) < TOL
 
-println(io0(), "[test] blockdiag ComplexF64")
 
-A = sprand(ComplexF64, 6, 5, 0.3)
-B = sprand(ComplexF64, 4, 8, 0.3)
+    println(io0(), "[test] MatrixMPI hcat ($T, $backend_name)")
 
-ref = blockdiag(A, B)
+    # Create dense matrices to stack horizontally
+    A_dense = make_dense(T, 10, 8)
+    B_dense = make_dense(T, 10, 6) .* T(2)
+    C_dense = make_dense(T, 10, 4) .* T(3)
 
-Adist = SparseMatrixMPI{ComplexF64}(A)
-Bdist = SparseMatrixMPI{ComplexF64}(B)
+    ref = hcat(A_dense, B_dense, C_dense)
 
-result_dist = blockdiag(Adist, Bdist)
-result = gather_sparse(result_dist)
+    Adist = to_backend(MatrixMPI(A_dense))
+    Bdist = to_backend(MatrixMPI(B_dense))
+    Cdist = to_backend(MatrixMPI(C_dense))
 
-@test result == ref
+    result_dist = hcat(Adist, Bdist, Cdist)
 
+    @test size(result_dist) == size(ref)
+    result_full = Matrix(result_dist)
+    @test norm(result_full - ref, Inf) < TOL
 
-println(io0(), "[test] MatrixMPI vcat")
 
-# Create random dense matrices to stack vertically
-A_dense = rand(8, 10)
-B_dense = rand(6, 10)
-C_dense = rand(4, 10)
+    println(io0(), "[test] MatrixMPI cat dims=(2,2) ($T, $backend_name)")
 
-ref = vcat(A_dense, B_dense, C_dense)
+    # Create 4 matrices for 2x2 block [A B; C D]
+    A_dense = make_dense(T, 8, 6)
+    B_dense = make_dense(T, 8, 5) .* T(2)
+    C_dense = make_dense(T, 7, 6) .* T(3)
+    D_dense = make_dense(T, 7, 5) .* T(4)
 
-Adist = MatrixMPI(A_dense)
-Bdist = MatrixMPI(B_dense)
-Cdist = MatrixMPI(C_dense)
+    ref = [A_dense B_dense; C_dense D_dense]
 
-result_dist = vcat(Adist, Bdist, Cdist)
+    Adist = to_backend(MatrixMPI(A_dense))
+    Bdist = to_backend(MatrixMPI(B_dense))
+    Cdist = to_backend(MatrixMPI(C_dense))
+    Ddist = to_backend(MatrixMPI(D_dense))
 
-@test size(result_dist) == size(ref)
-@test size(result_dist, 2) == 10  # columns preserved
+    result_dist = cat(Adist, Bdist, Cdist, Ddist; dims=(2, 2))
 
-# Verify local data matches expected rows from ref
-my_row_start = result_dist.row_partition[rank + 1]
-my_row_end = result_dist.row_partition[rank + 2] - 1
-@test result_dist.A == ref[my_row_start:my_row_end, :]
+    @test size(result_dist) == size(ref)
+    result_full = Matrix(result_dist)
+    @test norm(result_full - ref, Inf) < TOL
 
 
-println(io0(), "[test] MatrixMPI hcat")
+    println(io0(), "[test] VectorMPI cat with tuple dims ($T, $backend_name)")
 
-# Create random dense matrices to stack horizontally
-A_dense = rand(10, 8)
-B_dense = rand(10, 6)
-C_dense = rand(10, 4)
+    # Test dims=(n,1) same as vcat
+    v1 = make_vector(T, 10)
+    v2 = make_vector(T, 8) .* T(2)
+    v3 = make_vector(T, 12) .* T(3)
 
-ref = hcat(A_dense, B_dense, C_dense)
+    ref = vcat(v1, v2, v3)
 
-Adist = MatrixMPI(A_dense)
-Bdist = MatrixMPI(B_dense)
-Cdist = MatrixMPI(C_dense)
+    v1dist = to_backend(VectorMPI(v1))
+    v2dist = to_backend(VectorMPI(v2))
+    v3dist = to_backend(VectorMPI(v3))
 
-result_dist = hcat(Adist, Bdist, Cdist)
+    result_dist = cat(v1dist, v2dist, v3dist; dims=(3, 1))
+    result = Vector(result_dist)
 
-@test size(result_dist) == size(ref)
+    @test norm(result - ref, Inf) < TOL
 
-# Verify local data matches expected rows from ref
-my_row_start = result_dist.row_partition[rank + 1]
-my_row_end = result_dist.row_partition[rank + 2] - 1
-@test result_dist.A == ref[my_row_start:my_row_end, :]
+    # Test dims=(1,n) same as hcat
+    v1 = make_vector(T, 10)
+    v2 = make_vector(T, 10) .* T(2)
+    v3 = make_vector(T, 10) .* T(3)
 
+    v1dist = to_backend(VectorMPI(v1))
+    v2dist = to_backend(VectorMPI(v2))
+    v3dist = to_backend(VectorMPI(v3))
 
-println(io0(), "[test] MatrixMPI cat dims=(2,2)")
+    result_dist = cat(v1dist, v2dist, v3dist; dims=(1, 3))
 
-# Create 4 matrices for 2x2 block [A B; C D]
-A_dense = rand(8, 6)
-B_dense = rand(8, 5)
-C_dense = rand(7, 6)
-D_dense = rand(7, 5)
+    @test size(result_dist) == (10, 3)
 
-ref = [A_dense B_dense; C_dense D_dense]
+    # Test dims=(1,1) with single vector
+    v_single = make_vector(T, 15)
+    v_single_dist = to_backend(VectorMPI(v_single))
+    result_single = cat(v_single_dist; dims=(1, 1))
+    result_gathered = Vector(result_single)
 
-Adist = MatrixMPI(A_dense)
-Bdist = MatrixMPI(B_dense)
-Cdist = MatrixMPI(C_dense)
-Ddist = MatrixMPI(D_dense)
+    @test norm(result_gathered - v_single, Inf) < TOL
 
-result_dist = cat(Adist, Bdist, Cdist, Ddist; dims=(2, 2))
-
-@test size(result_dist) == size(ref)
-
-# Verify local data matches expected rows from ref
-my_row_start = result_dist.row_partition[rank + 1]
-my_row_end = result_dist.row_partition[rank + 2] - 1
-@test result_dist.A == ref[my_row_start:my_row_end, :]
-
-
-println(io0(), "[test] VectorMPI cat with tuple dims")
-
-# Test dims=(n,1) same as vcat
-v1 = rand(10)
-v2 = rand(8)
-v3 = rand(12)
-
-ref = vcat(v1, v2, v3)
-
-v1dist = VectorMPI(v1)
-v2dist = VectorMPI(v2)
-v3dist = VectorMPI(v3)
-
-result_dist = cat(v1dist, v2dist, v3dist; dims=(3, 1))
-result = gather_vector(result_dist)
-
-@test result == ref
-
-# Test dims=(1,n) same as hcat
-v1 = rand(10)
-v2 = rand(10)
-v3 = rand(10)
-
-v1dist = VectorMPI(v1)
-v2dist = VectorMPI(v2)
-v3dist = VectorMPI(v3)
-
-result_dist = cat(v1dist, v2dist, v3dist; dims=(1, 3))
-
-@test size(result_dist) == (10, 3)
-
-# Test dims=(1,1) with single vector
-v_single = rand(15)
-v_single_dist = VectorMPI(v_single)
-result_single = cat(v_single_dist; dims=(1, 1))
-result_gathered = gather_vector(result_single)
-
-@test result_gathered == v_single
-
+end  # for configs
 
 end  # QuietTestSet
 

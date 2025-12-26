@@ -2554,10 +2554,10 @@ function Base.:*(A::SparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results
+    # Build local matrix from column results (columns[k].v may be GPU array)
     local_result = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = columns[k].v
+        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
     end
 
     return MatrixMPI_local(local_result)
@@ -3201,6 +3201,9 @@ function _gather_rows_from_sparse(A::SparseMatrixMPI{T}, global_rows::AbstractVe
     triplet_counts_to_send = Dict{Int,Int}()
     triplets_to_send = Dict{Int,Vector{Tuple{Int32,Int32,T}}}()
 
+    # Ensure nzval is on CPU for scalar indexing (GPU arrays don't support scalar indexing)
+    nzval_cpu = _ensure_cpu(A.nzval)
+
     for r in 0:(nranks-1)
         if recv_counts[r+1] > 0 && r != rank
             requested_rows = row_recv_bufs[r]
@@ -3212,7 +3215,7 @@ function _gather_rows_from_sparse(A::SparseMatrixMPI{T}, global_rows::AbstractVe
                 for nz_idx in A.rowptr[local_row]:(A.rowptr[local_row+1]-1)
                     local_col = A.colval[nz_idx]
                     global_col = A.col_indices[local_col]
-                    val = A.nzval[nz_idx]
+                    val = nzval_cpu[nz_idx]
                     push!(triplets, (Int32(global_row), Int32(global_col), val))
                 end
             end
@@ -3275,7 +3278,7 @@ function _gather_rows_from_sparse(A::SparseMatrixMPI{T}, global_rows::AbstractVe
             for nz_idx in A.rowptr[local_row]:(A.rowptr[local_row+1]-1)
                 local_col = A.colval[nz_idx]
                 global_col = A.col_indices[local_col]
-                val = A.nzval[nz_idx]
+                val = nzval_cpu[nz_idx]
                 push!(result, (global_row, global_col, val))
             end
         end
@@ -3659,10 +3662,10 @@ function Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results
+    # Build local matrix from column results (columns[k].v may be GPU array)
     local_result = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = columns[k].v
+        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
     end
 
     return MatrixMPI_local(local_result)
@@ -3691,10 +3694,10 @@ function Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results
+    # Build local matrix from column results (columns[k].v may be GPU array)
     local_result = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = columns[k].v
+        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
     end
 
     return MatrixMPI_local(local_result)
@@ -3938,11 +3941,13 @@ function Base.:+(A::SparseMatrixMPI{T,Ti}, J::UniformScaling) where {T,Ti}
     nnz_result = plan.colptr[end] - 1
     nzval = Vector{RT}(undef, nnz_result)
 
+    # Ensure A.nzval is on CPU for scalar indexing
+    A_nzval_cpu = Array(A.nzval)
+
     if plan.same_structure
         # Fast path: copy all values, then add λ to diagonals
-        A_nzval = A.nzval
         @inbounds for k in eachindex(plan.A_src)
-            nzval[plan.dst[k]] = A_nzval[plan.A_src[k]]
+            nzval[plan.dst[k]] = A_nzval_cpu[plan.A_src[k]]
         end
         @inbounds for k in plan.diag_indices
             nzval[k] += RT(λ)
@@ -3950,9 +3955,8 @@ function Base.:+(A::SparseMatrixMPI{T,Ti}, J::UniformScaling) where {T,Ti}
     else
         # Slow path: zero first, copy from A, then set diagonals
         fill!(nzval, zero(RT))
-        A_nzval = A.nzval
         @inbounds for k in eachindex(plan.A_src)
-            nzval[plan.dst[k]] = A_nzval[plan.A_src[k]]
+            nzval[plan.dst[k]] = A_nzval_cpu[plan.A_src[k]]
         end
         # Diagonal indices include both existing and new diagonals
         # For existing diagonals, we've already copied the value, so just add λ
@@ -4009,11 +4013,13 @@ function Base.:-(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     nnz_result = plan.colptr[end] - 1
     nzval = Vector{RT}(undef, nnz_result)
 
+    # Ensure A.nzval is on CPU for scalar indexing
+    A_nzval_cpu = Array(A.nzval)
+
     if plan.same_structure
         # Fast path: copy negated values, then add λ to diagonals
-        A_nzval = A.nzval
         @inbounds for k in eachindex(plan.A_src)
-            nzval[plan.dst[k]] = -A_nzval[plan.A_src[k]]
+            nzval[plan.dst[k]] = -A_nzval_cpu[plan.A_src[k]]
         end
         @inbounds for k in plan.diag_indices
             nzval[k] += RT(λ)
@@ -4021,9 +4027,8 @@ function Base.:-(J::UniformScaling, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     else
         # Slow path: zero first, copy negated from A, then add λ to diagonals
         fill!(nzval, zero(RT))
-        A_nzval = A.nzval
         @inbounds for k in eachindex(plan.A_src)
-            nzval[plan.dst[k]] = -A_nzval[plan.A_src[k]]
+            nzval[plan.dst[k]] = -A_nzval_cpu[plan.A_src[k]]
         end
         @inbounds for k in plan.diag_indices
             nzval[k] += RT(λ)

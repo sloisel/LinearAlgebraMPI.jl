@@ -1,6 +1,6 @@
 # MPI test for dense matrix (MatrixMPI) operations
 # This file is executed under mpiexec by runtests.jl
-# Parameterized over scalar types (CPU only - dense GPU ops use BLAS which doesn't support Metal)
+# Parameterized over scalar types and backends (CPU and GPU)
 
 # Check Metal availability BEFORE loading MPI
 const METAL_AVAILABLE = try
@@ -46,7 +46,7 @@ end
 
 ts = @testset QuietTestSet "Dense Matrix" begin
 
-for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
     TOL = TestUtils.tolerance(T)
 
     println(io0(), "[test] MatrixMPI construction ($T, $backend_name)")
@@ -374,8 +374,8 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
 end  # for (T, to_backend, backend_name)
 
 
-# mapslices tests - CPU only (complex function calls)
-for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
+# mapslices tests
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
     TOL = TestUtils.tolerance(T)
 
     println(io0(), "[test] mapslices dims=2 row-wise ($T, $backend_name)")

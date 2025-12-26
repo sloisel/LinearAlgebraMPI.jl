@@ -107,11 +107,13 @@ end
     tolerance(T)
 
 Return appropriate tolerance for type T.
+Float32 tolerance is looser (1e-4) to accommodate accumulated errors
+in matrix operations like transpose(A) * B.
 """
 tolerance(::Type{Float64}) = 1e-12
 tolerance(::Type{ComplexF64}) = 1e-12
-tolerance(::Type{Float32}) = 1e-5
-tolerance(::Type{ComplexF32}) = 1e-5
+tolerance(::Type{Float32}) = 1e-4
+tolerance(::Type{ComplexF32}) = 1e-4
 
 """
     to_cpu(x)

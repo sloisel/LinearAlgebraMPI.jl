@@ -1,6 +1,6 @@
 # Tests for extended SparseMatrixMPI API
 # This file is executed under mpiexec by runtests.jl
-# Parameterized over scalar types (CPU only - API tests)
+# Parameterized over scalar types and backends (CPU and GPU)
 
 # Check Metal availability BEFORE loading MPI
 const METAL_AVAILABLE = try
@@ -30,8 +30,7 @@ nranks = MPI.Comm_size(comm)
 
 ts = @testset QuietTestSet "Sparse API" begin
 
-# Most API tests run on CPU only (complex reductions, broadcasting, etc.)
-for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
     TOL = TestUtils.tolerance(T)
 
     println(io0(), "[test] Structural queries ($T, $backend_name)")
@@ -43,7 +42,7 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
                       T.([1.0, 2.0, 3.0, 4.0, 5.0, -1.0, -2.0, -3.0, -4.0, -5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
                       n, n)
     ref_nnz = nnz(A_global)
-    Adist = SparseMatrixMPI{T}(A_global)
+    Adist = to_backend(SparseMatrixMPI{T}(A_global))
 
     dist_nnz = nnz(Adist)
     dist_issparse = issparse(Adist)
@@ -58,6 +57,9 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     b_size = size(B)
     @test b_nnz == ref_nnz
     @test b_size == size(A_global)
+
+    # Recreate Adist for subsequent tests (copy may have different structure)
+    Adist = to_backend(SparseMatrixMPI{T}(A_global))
 
 
     println(io0(), "[test] Element-wise operations ($T, $backend_name)")
@@ -114,17 +116,14 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
 
     col_sums = sum(Adist; dims=1)
     ref_col_sums = vec(sum(A_global; dims=1))
-    counts1 = Int32[col_sums.partition[r+2] - col_sums.partition[r+1] for r in 0:nranks-1]
-    full_col_sums = similar(col_sums.v, sum(counts1))
-    MPI.Allgatherv!(col_sums.v, MPI.VBuffer(full_col_sums, counts1), comm)
+    # Gather results via Vector() which handles CPU staging
+    full_col_sums = Vector(col_sums)
     err1 = norm(full_col_sums - ref_col_sums)
     @test err1 < TOL
 
     row_sums = sum(Adist; dims=2)
     ref_row_sums = vec(sum(A_global; dims=2))
-    counts2 = Int32[row_sums.partition[r+2] - row_sums.partition[r+1] for r in 0:nranks-1]
-    full_row_sums = similar(row_sums.v, sum(counts2))
-    MPI.Allgatherv!(row_sums.v, MPI.VBuffer(full_row_sums, counts2), comm)
+    full_row_sums = Vector(row_sums)
     err2 = norm(full_row_sums - ref_row_sums)
     @test err2 < TOL
 
@@ -134,7 +133,7 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     A_with_zeros = copy(A_global)
     A_with_zeros[1, 1] = zero(T)
     ref_nnz_zeros = nnz(A_with_zeros)
-    Adist_zeros = SparseMatrixMPI{T}(A_with_zeros)
+    Adist_zeros = to_backend(SparseMatrixMPI{T}(A_with_zeros))
     B = dropzeros(Adist_zeros)
     b_nnz = nnz(B)
     @test b_nnz <= ref_nnz_zeros
@@ -144,25 +143,19 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
 
     d = diag(Adist)
     ref_d = diag(A_global)
-    counts_d = Int32[d.partition[r+2] - d.partition[r+1] for r in 0:nranks-1]
-    full_d = similar(d.v, sum(counts_d))
-    MPI.Allgatherv!(d.v, MPI.VBuffer(full_d, counts_d), comm)
+    full_d = Vector(d)
     err1 = norm(full_d - ref_d)
     @test err1 < TOL
 
     d1 = diag(Adist, 1)
     ref_d1 = diag(A_global, 1)
-    counts_d1 = Int32[d1.partition[r+2] - d1.partition[r+1] for r in 0:nranks-1]
-    full_d1 = similar(d1.v, sum(counts_d1))
-    MPI.Allgatherv!(d1.v, MPI.VBuffer(full_d1, counts_d1), comm)
+    full_d1 = Vector(d1)
     err2 = norm(full_d1 - ref_d1)
     @test err2 < TOL
 
     dm1 = diag(Adist, -1)
     ref_dm1 = diag(A_global, -1)
-    counts_dm1 = Int32[dm1.partition[r+2] - dm1.partition[r+1] for r in 0:nranks-1]
-    full_dm1 = similar(dm1.v, sum(counts_dm1))
-    MPI.Allgatherv!(dm1.v, MPI.VBuffer(full_dm1, counts_dm1), comm)
+    full_dm1 = Vector(dm1)
     err3 = norm(full_dm1 - ref_dm1)
     @test err3 < TOL
 
@@ -194,7 +187,7 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     println(io0(), "[test] VectorMPI extensions ($T, $backend_name)")
 
     v_global = T.(collect(1.0:Float64(n)))
-    v = VectorMPI(v_global)
+    v = to_backend(VectorMPI(v_global))
 
     abs_sum = sum(abs(v))
     @test abs_sum ≈ sum(abs.(v_global)) atol=TOL
@@ -214,38 +207,38 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     println(io0(), "[test] spdiagm ($T, $backend_name)")
 
     v_global = T.(collect(1.0:5.0))
-    v = VectorMPI(v_global)
-    A = spdiagm(v)
+    v_spd = to_backend(VectorMPI(v_global))
+    A_spd = spdiagm(v_spd)
     ref_A = spdiagm(v_global)
-    a_nnz = nnz(A)
-    a_sum = sum(A)
-    a_tr = tr(A)
+    a_nnz = nnz(A_spd)
+    a_sum = sum(A_spd)
+    a_tr = tr(A_spd)
     @test a_nnz == nnz(ref_A)
     @test a_sum ≈ sum(ref_A) atol=TOL
     @test a_tr ≈ tr(ref_A) atol=TOL
 
     v1_global = T.(collect(1.0:4.0))
     v2_global = T.(collect(10.0:12.0))
-    v1 = VectorMPI(v1_global)
-    v2 = VectorMPI(v2_global)
-    B = spdiagm(0 => v1, 1 => v2)
+    v1 = to_backend(VectorMPI(v1_global))
+    v2 = to_backend(VectorMPI(v2_global))
+    B_spd = spdiagm(0 => v1, 1 => v2)
     ref_B = spdiagm(0 => v1_global, 1 => v2_global)
-    b_nnz = nnz(B)
-    b_sum = sum(B)
+    b_nnz = nnz(B_spd)
+    b_sum = sum(B_spd)
     @test b_nnz == nnz(ref_B)
     @test b_sum ≈ sum(ref_B) atol=TOL
 
-    C = spdiagm(6, 6, 0 => v1)
+    C_spd = spdiagm(6, 6, 0 => v1)
     ref_C = spdiagm(6, 6, v1_global)
-    c_nnz = nnz(C)
-    c_size = size(C)
+    c_nnz = nnz(C_spd)
+    c_size = size(C_spd)
     @test c_nnz == nnz(ref_C)
     @test c_size == (6, 6)
 
-    D = spdiagm(-1 => v2)
+    D_spd = spdiagm(-1 => v2)
     ref_D = spdiagm(-1 => v2_global)
-    d_nnz = nnz(D)
-    d_sum = sum(D)
+    d_nnz = nnz(D_spd)
+    d_sum = sum(D_spd)
     @test d_nnz == nnz(ref_D)
     @test d_sum ≈ sum(ref_D) atol=TOL
 
@@ -254,8 +247,8 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
 
     v_global = T.(collect(1.0:10.0))
     w_global = T.(collect(11.0:20.0))
-    v = VectorMPI(v_global)
-    w = VectorMPI(w_global)
+    v = to_backend(VectorMPI(v_global))
+    w = to_backend(VectorMPI(w_global))
 
     vw_add = v .+ w
     vw_add_sum = sum(vw_add)
@@ -288,23 +281,23 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     compound_sum = sum(compound)
     @test compound_sum ≈ sum(v_global .* T(2.0) .+ w_global .^ 2) atol=TOL
 
-    dest = VectorMPI(zeros(T, 10))
+    dest = to_backend(VectorMPI(zeros(T, 10)))
     dest .= v .+ w
     dest_sum = sum(dest)
     @test dest_sum ≈ sum(v_global .+ w_global) atol=TOL
 
-    dest2 = VectorMPI(zeros(T, 10))
+    dest2 = to_backend(VectorMPI(zeros(T, 10)))
     dest2 .= v .* T(2.0) .+ w .^ 2
     dest2_sum = sum(dest2)
     @test dest2_sum ≈ sum(v_global .* T(2.0) .+ w_global .^ 2) atol=TOL
 
-    dest3 = VectorMPI(zeros(T, 10))
+    dest3 = to_backend(VectorMPI(zeros(T, 10)))
     dest3 .= v .* T(3.0) .+ T(10.0)
     dest3_sum = sum(dest3)
     @test dest3_sum ≈ sum(v_global .* T(3.0) .+ T(10.0)) atol=TOL
 
     if !(T <: Complex)
-        v_int = VectorMPI(T.(collect(1:10)))
+        v_int = to_backend(VectorMPI(T.(collect(1:10))))
         v_sqrt = sqrt.(v_int)
         v_sqrt_sum = sum(v_sqrt)
         @test v_sqrt_sum ≈ sum(sqrt.(T.(collect(1:10)))) atol=TOL
@@ -317,7 +310,7 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     v_global_part = T.(collect(1.0:Float64(n_part)))
     w_global_part = T.(collect(101.0:Float64(100+n_part)))
 
-    v_part = VectorMPI(v_global_part)
+    v_part = to_backend(VectorMPI(v_global_part))
 
     function make_uneven_partition(n::Int, nranks::Int)
         partition = Vector{Int}(undef, nranks + 1)
@@ -342,7 +335,9 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
     w_custom_local_end = custom_partition[rank+2] - 1
     w_local_part = w_global_part[w_custom_local_start:w_custom_local_end]
     w_hash = LinearAlgebraMPI.compute_partition_hash(custom_partition)
-    w_part = VectorMPI{T}(w_hash, custom_partition, w_local_part)
+    # Create VectorMPI with custom partition (stays on CPU, to_backend not applied here
+    # since the VectorMPI constructor signature with hash requires specific type)
+    w_part = to_backend(VectorMPI{T}(w_hash, custom_partition, w_local_part))
 
     w_sum_part = sum(w_part)
     @test w_sum_part ≈ sum(w_global_part) atol=TOL
@@ -362,33 +357,33 @@ for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
 end  # for (T, to_backend, backend_name)
 
 
-# Complex-specific tests
+# Complex-specific tests (run on CPU only since they're just ComplexF64)
 println(io0(), "[test] Complex element-wise operations (ComplexF64)")
 
-T = ComplexF64
-TOL = TestUtils.tolerance(T)
-n = 20
+T_cpx = ComplexF64
+TOL_cpx = TestUtils.tolerance(T_cpx)
+n_cpx = 20
 
 A_complex = sparse([1, 2, 3, 4, 5, 1, 2, 3],
                    [1, 2, 3, 4, 5, 6, 7, 8],
-                   T[1+2im, 3-1im, 2+1im, -1+3im, 4-2im, 1-1im, 2+2im, 3+1im],
-                   n, n)
-Adist_complex = SparseMatrixMPI{T}(A_complex)
+                   T_cpx[1+2im, 3-1im, 2+1im, -1+3im, 4-2im, 1-1im, 2+2im, 3+1im],
+                   n_cpx, n_cpx)
+Adist_complex = SparseMatrixMPI{T_cpx}(A_complex)
 
 B_real = real(Adist_complex)
 br_sum = sum(B_real)
-@test br_sum ≈ sum(real.(A_complex)) atol=TOL
+@test br_sum ≈ sum(real.(A_complex)) atol=TOL_cpx
 
 B_imag = imag(Adist_complex)
 bi_sum = sum(B_imag)
-@test bi_sum ≈ sum(imag.(A_complex)) atol=TOL
+@test bi_sum ≈ sum(imag.(A_complex)) atol=TOL_cpx
 
-v_complex_global = vcat(T[1+2im, 3-1im, 2+1im, -1+3im], zeros(T, n - 4))
+v_complex_global = vcat(T_cpx[1+2im, 3-1im, 2+1im, -1+3im], zeros(T_cpx, n_cpx - 4))
 v_complex = VectorMPI(v_complex_global)
 vr_sum = sum(real(v_complex))
-@test vr_sum ≈ sum(real.(v_complex_global)) atol=TOL
+@test vr_sum ≈ sum(real.(v_complex_global)) atol=TOL_cpx
 vi_sum = sum(imag(v_complex))
-@test vi_sum ≈ sum(imag.(v_complex_global)) atol=TOL
+@test vi_sum ≈ sum(imag.(v_complex_global)) atol=TOL_cpx
 
 
 end  # QuietTestSet

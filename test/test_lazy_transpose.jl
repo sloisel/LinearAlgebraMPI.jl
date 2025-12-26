@@ -1,6 +1,6 @@
 # MPI test for lazy transpose operations
 # This file is executed under mpiexec by runtests.jl
-# Parameterized over scalar types (CPU only - some ops have GPU issues)
+# Parameterized over scalar types and backends (CPU and GPU)
 
 # Check Metal availability BEFORE loading MPI
 const METAL_AVAILABLE = try
@@ -28,7 +28,7 @@ comm = MPI.COMM_WORLD
 
 ts = @testset QuietTestSet "Lazy Transpose" begin
 
-for (T, to_backend, backend_name) in TestUtils.CPU_ONLY_CONFIGS
+for (T, to_backend, backend_name) in TestUtils.ALL_CONFIGS
     TOL = TestUtils.tolerance(T)
 
     println(io0(), "[test] transpose(A) * transpose(B) = transpose(B * A) ($T, $backend_name)")

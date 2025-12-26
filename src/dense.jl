@@ -204,6 +204,9 @@ function _gather_dense_rows(A::MatrixMPI{T}, global_rows::AbstractVector{Int}) w
 
     my_row_start = A.row_partition[rank+1]
 
+    # Ensure matrix data is on CPU for row extraction and MPI (GPU arrays not supported)
+    A_cpu = _ensure_cpu(A.A)
+
     # Step 1: Partition rows by owner
     rows_by_owner = _partition_rows_by_owner(global_rows, A.row_partition)
 
@@ -249,7 +252,7 @@ function _gather_dense_rows(A::MatrixMPI{T}, global_rows::AbstractVector{Int}) w
 
             for (i, global_row) in enumerate(requested_rows)
                 local_row = global_row - my_row_start + 1
-                data_to_send[i, :] = A.A[local_row, :]
+                data_to_send[i, :] = A_cpu[local_row, :]
             end
 
             row_data_send_bufs[r] = data_to_send
@@ -287,7 +290,7 @@ function _gather_dense_rows(A::MatrixMPI{T}, global_rows::AbstractVector{Int}) w
         for global_row in rows_by_owner[rank]
             local_row = global_row - my_row_start + 1
             result_pos = position_map[global_row]
-            result[result_pos, :] = A.A[local_row, :]
+            result[result_pos, :] = A_cpu[local_row, :]
         end
     end
 
@@ -583,8 +586,17 @@ function LinearAlgebra.mul!(y::VectorMPI{T,AV}, A::MatrixMPI{T,AM}, x::VectorMPI
         LinearAlgebra.mul!(y_local_cpu, A.A, plan.gathered_cpu)
         copyto!(y.v, y_local_cpu)
     else
-        # Matrix is on GPU - use GPU gathered buffer directly
-        LinearAlgebra.mul!(y.v, A.A, plan.gathered)
+        # Matrix is on GPU
+        if plan.gathered isa Vector
+            # Input vector was CPU - copy gathered to GPU for the multiply
+            gathered_gpu = copyto!(similar(A.A, length(plan.gathered_cpu)), plan.gathered_cpu)
+            y_local_gpu = similar(A.A, length(y.v))
+            LinearAlgebra.mul!(y_local_gpu, A.A, gathered_gpu)
+            copyto!(y.v, Array(y_local_gpu))  # Copy result back to CPU
+        else
+            # Input vector was GPU - use GPU gathered directly
+            LinearAlgebra.mul!(y.v, A.A, plan.gathered)
+        end
     end
     return y
 end
@@ -620,9 +632,16 @@ function Base.:*(A::MatrixMPI{T,AM}, x::VectorMPI{T,AV}) where {T,AM,AV}
         # Copy to GPU if input was GPU
         y_v = x.v isa Vector ? y_local_cpu : copyto!(similar(x.v, local_rows), y_local_cpu)
     else
-        # Matrix is on GPU - use GPU gathered buffer directly
+        # Matrix is on GPU
         y_v = similar(A.A, local_rows)
-        LinearAlgebra.mul!(y_v, A.A, plan.gathered)
+        if plan.gathered isa Vector
+            # Input vector was CPU - copy gathered to GPU for the multiply
+            gathered_gpu = copyto!(similar(A.A, length(plan.gathered_cpu)), plan.gathered_cpu)
+            LinearAlgebra.mul!(y_v, A.A, gathered_gpu)
+        else
+            # Input vector was GPU - use GPU gathered directly
+            LinearAlgebra.mul!(y_v, A.A, plan.gathered)
+        end
     end
 
     return VectorMPI{T,AV}(
@@ -1184,20 +1203,25 @@ function Base.:*(At::Transpose{T,<:MatrixMPI{T}}, x::VectorMPI{T,AV}) where {T,A
 
     execute_plan!(plan, x)
 
-    # Use CPU buffer for computation (matrix is on CPU)
-    gathered_cpu = plan.gathered_cpu
-
     # Local computation: transpose(A.A) * local_gathered
     # A.A has shape (local_nrows, ncols), gathered has shape (nrows,)
     # We need gathered[my_row_start:my_row_end] for the local rows
     my_row_start = A.row_partition[rank+1]
     my_row_end = A.row_partition[rank+2] - 1
-    local_gathered = @view gathered_cpu[my_row_start:my_row_end]
 
-    # transpose(A.A) * local_gathered gives a full vector of size ncols
-    # This is only the contribution from our local rows - need to sum across all ranks
-    ncols = A.col_partition[end] - 1
-    partial_result = transpose(A.A) * local_gathered
+    # Check if matrix is on GPU
+    if A.A isa Matrix
+        # Matrix is on CPU - use CPU buffer
+        local_gathered = @view plan.gathered_cpu[my_row_start:my_row_end]
+        partial_result = transpose(A.A) * local_gathered
+    else
+        # Matrix is on GPU - copy gathered portion to GPU
+        # Must convert SubArray to Vector first for GPU copyto!
+        local_gathered_cpu = Vector(plan.gathered_cpu[my_row_start:my_row_end])
+        local_gathered_gpu = copyto!(similar(A.A, length(local_gathered_cpu)), local_gathered_cpu)
+        partial_result_gpu = transpose(A.A) * local_gathered_gpu
+        partial_result = Array(partial_result_gpu)  # Need CPU for MPI.Allreduce
+    end
 
     # Allreduce to sum contributions from all ranks
     full_result = MPI.Allreduce(partial_result, MPI.SUM, comm)
@@ -1260,10 +1284,10 @@ function Base.:*(At::TransposedMatrixMPI{T}, B::MatrixMPI{T}) where T
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results
+    # Build local matrix from column results (columns[k].v may be GPU array)
     local_result = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = columns[k].v
+        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
     end
 
     return MatrixMPI_local(local_result)
