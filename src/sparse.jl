@@ -2529,12 +2529,12 @@ end
 # ============================================================================
 
 """
-    Base.:*(A::SparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
+    Base.:*(A::SparseMatrixMPI{T,Ti,AV}, B::MatrixMPI{T,AM}) where {T,Ti,AV,AM}
 
 Compute sparse matrix times dense matrix by column-by-column multiplication.
-Returns a MatrixMPI with the same row partition as A.
+Returns a MatrixMPI with the same row partition as A and same backend as B.
 """
-function Base.:*(A::SparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
+function Base.:*(A::SparseMatrixMPI{T,Ti,AV}, B::MatrixMPI{T,AM}) where {T,Ti,AV,AM}
     m = size(A, 1)
     n = size(B, 2)
 
@@ -2554,11 +2554,14 @@ function Base.:*(A::SparseMatrixMPI{T,Ti}, B::MatrixMPI{T}) where {T,Ti}
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results (columns[k].v may be GPU array)
-    local_result = Matrix{T}(undef, local_m, n)
+    # Build local matrix from column results on CPU
+    local_result_cpu = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
+        local_result_cpu[:, k] = Array(columns[k].v)
     end
+
+    # Convert back to original backend if needed
+    local_result = B.A isa Matrix ? local_result_cpu : copyto!(similar(B.A, local_m, n), local_result_cpu)
 
     return MatrixMPI_local(local_result)
 end
@@ -2727,7 +2730,7 @@ Compute the sum of elements in the distributed sparse matrix.
 
 Note: When dims=nothing, only stored (nonzero) values contribute to the sum.
 """
-function Base.sum(A::SparseMatrixMPI{T}; dims=nothing) where T
+function Base.sum(A::SparseMatrixMPI{T,Ti,AV}; dims=nothing) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -2742,28 +2745,43 @@ function Base.sum(A::SparseMatrixMPI{T}; dims=nothing) where T
         # Sum over rows: result is length-n vector (column sums)
         # A.colval contains LOCAL column indices (compressed)
         # Map local→global using A.col_indices
+        # Stage nzval to CPU to avoid GPU scalar indexing
+        nzval_cpu = Array(A.nzval)
         local_col_sums = zeros(T, n)
         col_indices = A.col_indices
         for (idx, local_col) in enumerate(A.colval)
             global_col = col_indices[local_col]
-            local_col_sums[global_col] += A.nzval[idx]
+            local_col_sums[global_col] += nzval_cpu[idx]
         end
         global_col_sums = MPI.Allreduce(local_col_sums, MPI.SUM, comm)
-        return VectorMPI(global_col_sums; comm=comm)
+        # Create uniform partition for the result vector
+        partition = uniform_partition(n, nranks)
+        local_range = partition[rank + 1]:(partition[rank + 2] - 1)
+        local_sums = global_col_sums[local_range]
+        # Convert to match input array type
+        result_v = similar(A.nzval, length(local_sums))
+        copyto!(result_v, local_sums)
+        hash = compute_partition_hash(partition)
+        return VectorMPI{T,typeof(result_v)}(hash, partition, result_v)
     elseif dims == 2
         # Sum over columns: result is length-m vector (row sums)
         local_nrows = A.nrows_local
         local_row_sums = zeros(T, local_nrows)
+        # Stage nzval to CPU to avoid GPU scalar indexing
+        nzval_cpu = Array(A.nzval)
 
         for local_col in 1:local_nrows
             for nz_idx in A.rowptr[local_col]:(A.rowptr[local_col+1]-1)
-                local_row_sums[local_col] += A.nzval[nz_idx]
+                local_row_sums[local_col] += nzval_cpu[nz_idx]
             end
         end
 
         # Result has A's row partition (partition is immutable, no need to copy)
         hash = compute_partition_hash(A.row_partition)
-        return VectorMPI{T}(hash, A.row_partition, local_row_sums)
+        # Convert to match input array type
+        result_v = similar(A.nzval, local_nrows)
+        copyto!(result_v, local_row_sums)
+        return VectorMPI{T,typeof(result_v)}(hash, A.row_partition, result_v)
     else
         throw(ArgumentError("dims must be nothing, 1, or 2"))
     end
@@ -2829,6 +2847,21 @@ function _find_nzval_at_global_col(A::SparseMatrixMPI{T}, local_row::Int, global
     return _get_csc(A)[local_col_idx, local_row]
 end
 
+# CPU version that takes pre-staged nzval to avoid GPU scalar indexing
+function _find_nzval_at_global_col_cpu(A::SparseMatrixMPI{T}, local_row::Int, global_col::Int, nzval_cpu::Vector{T}) where T
+    col_indices = A.col_indices
+
+    # Binary search to find local column index for global_col
+    local_col_idx = searchsortedfirst(col_indices, global_col)
+    if local_col_idx > length(col_indices) || col_indices[local_col_idx] != global_col
+        return nothing  # global_col not in our local columns
+    end
+
+    # Create a temporary CSC matrix with CPU nzval for indexing
+    csc = SparseMatrixCSC(A.ncols_compressed, A.nrows_local, A.rowptr, A.colval, nzval_cpu)
+    return csc[local_col_idx, local_row]
+end
+
 """
     tr(A::SparseMatrixMPI{T}) where T
 
@@ -2866,7 +2899,7 @@ end
 
 Return a copy of A with explicitly stored zeros removed.
 """
-function dropzeros(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
+function dropzeros(A::SparseMatrixMPI{T,Ti,AV}) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
 
     # Use SparseArrays.dropzeros on local AT
@@ -2882,9 +2915,12 @@ function dropzeros(A::SparseMatrixMPI{T,Ti}) where {T,Ti}
     nrows_local = new_AT.n
     ncols_compressed = length(new_col_indices)
 
-    # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-    return SparseMatrixMPI{T,Ti,Vector{T}}(structural_hash, copy(A.row_partition), copy(A.col_partition),
-        new_col_indices, new_AT.colptr, new_AT.rowval, new_AT.nzval,
+    # Convert nzval to match input array type (CPU or GPU)
+    result_nzval = similar(A.nzval, length(new_AT.nzval))
+    copyto!(result_nzval, new_AT.nzval)
+
+    return SparseMatrixMPI{T,Ti,typeof(result_nzval)}(structural_hash, copy(A.row_partition), copy(A.col_partition),
+        new_col_indices, new_AT.colptr, new_AT.rowval, result_nzval,
         nrows_local, ncols_compressed, nothing, nothing, new_AT.colptr, new_AT.rowval)
 end
 
@@ -2904,7 +2940,7 @@ The result partition is derived from A's row partition: diagonal element d
 is at row (row_offset + d), so the rank owning that row owns element d.
 This is a purely local operation with no MPI communication.
 """
-function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
+function diag(A::SparseMatrixMPI{T,Ti,AV}, k::Integer=0) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -2923,10 +2959,11 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
     end
 
     if diag_len <= 0
-        # Empty diagonal
+        # Empty diagonal - preserve array type
         partition = ones(Int, nranks + 1)
         hash = compute_partition_hash(partition)
-        return VectorMPI{T}(hash, partition, T[])
+        empty_v = similar(A.nzval, 0)
+        return VectorMPI{T,typeof(empty_v)}(hash, partition, empty_v)
     end
 
     # Compute result partition from A's row partition (no communication needed)
@@ -2947,19 +2984,25 @@ function diag(A::SparseMatrixMPI{T}, k::Integer=0) where T
     my_diag_len = max(0, my_diag_end - my_diag_start + 1)
 
     # Extract local diagonal elements (no communication!)
+    # Stage nzval to CPU to avoid GPU scalar indexing
     my_row_start = A.row_partition[rank+1]
-    local_diag = Vector{T}(undef, my_diag_len)
+    local_diag_cpu = Vector{T}(undef, my_diag_len)
+    nzval_cpu = Array(A.nzval)
 
     for i in 1:my_diag_len
         d = my_diag_start + i - 1
         local_row = (row_offset + d) - my_row_start + 1
         global_col = col_offset + d
-        val = _find_nzval_at_global_col(A, local_row, global_col)
-        local_diag[i] = val === nothing ? zero(T) : val
+        val = _find_nzval_at_global_col_cpu(A, local_row, global_col, nzval_cpu)
+        local_diag_cpu[i] = val === nothing ? zero(T) : val
     end
 
+    # Convert to match input array type
+    local_diag = similar(A.nzval, my_diag_len)
+    copyto!(local_diag, local_diag_cpu)
+
     hash = compute_partition_hash(result_partition)
-    return VectorMPI{T}(hash, result_partition, local_diag)
+    return VectorMPI{T,typeof(local_diag)}(hash, result_partition, local_diag)
 end
 
 """
@@ -2970,12 +3013,15 @@ Return the upper triangular part of A, starting from the k-th diagonal.
 - k>0: exclude k-1 diagonals below the k-th superdiagonal
 - k<0: include |k| subdiagonals
 """
-function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
+function triu(A::SparseMatrixMPI{T,Ti,AV}, k::Integer=0) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
     my_row_start = A.row_partition[rank+1]
     col_indices = A.col_indices
+
+    # Stage nzval to CPU to avoid GPU scalar indexing
+    nzval_cpu = Array(A.nzval)
 
     # Build new sparse structure keeping only upper triangular entries
     # Entry (i, j) is kept if j >= i + k, i.e., j - i >= k
@@ -3004,7 +3050,7 @@ function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
 
     total_nnz = new_colptr[end] - 1
     new_rowval = Vector{Int}(undef, total_nnz)
-    new_nzval = Vector{T}(undef, total_nnz)
+    new_nzval_cpu = Vector{T}(undef, total_nnz)
 
     # Second pass: fill entries (keep local indices in new_rowval)
     idx = 1
@@ -3015,7 +3061,7 @@ function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
             j = col_indices[local_j]  # convert to global column index
             if j >= global_row + k
                 new_rowval[idx] = local_j  # keep local index
-                new_nzval[idx] = A.nzval[nz_idx]
+                new_nzval_cpu[idx] = nzval_cpu[nz_idx]
                 idx += 1
             end
         end
@@ -3026,7 +3072,7 @@ function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
         new_col_indices = Int[]
         new_rowptr = new_colptr
         new_colval = Int[]
-        new_nzval_final = T[]
+        new_nzval_final_cpu = T[]
     else
         local_used = unique(sort(new_rowval))
         new_col_indices = col_indices[local_used]  # convert to global
@@ -3034,7 +3080,7 @@ function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
         compressed_rowval = [searchsortedfirst(local_used, r) for r in new_rowval]
         new_rowptr = new_colptr
         new_colval = compressed_rowval
-        new_nzval_final = new_nzval
+        new_nzval_final_cpu = new_nzval_cpu
     end
 
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_rowptr, new_colval, comm)
@@ -3042,8 +3088,11 @@ function triu(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
     nrows_local = A.nrows_local
     ncols_compressed = length(new_col_indices)
 
-    # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-    return SparseMatrixMPI{T,Ti,Vector{T}}(structural_hash, copy(A.row_partition), copy(A.col_partition),
+    # Convert nzval to match input array type
+    new_nzval_final = similar(A.nzval, length(new_nzval_final_cpu))
+    copyto!(new_nzval_final, new_nzval_final_cpu)
+
+    return SparseMatrixMPI{T,Ti,typeof(new_nzval_final)}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, new_rowptr, new_colval, new_nzval_final,
         nrows_local, ncols_compressed, nothing, nothing, new_rowptr, new_colval)
 end
@@ -3056,12 +3105,15 @@ Return the lower triangular part of A, starting from the k-th diagonal.
 - k>0: include k superdiagonals
 - k<0: exclude |k|-1 diagonals above the |k|-th subdiagonal
 """
-function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
+function tril(A::SparseMatrixMPI{T,Ti,AV}, k::Integer=0) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
 
     my_row_start = A.row_partition[rank+1]
     col_indices = A.col_indices
+
+    # Stage nzval to CPU to avoid GPU scalar indexing
+    nzval_cpu = Array(A.nzval)
 
     # Keep entry (i, j) if j <= i + k
 
@@ -3086,7 +3138,7 @@ function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
 
     total_nnz = new_colptr[end] - 1
     new_rowval = Vector{Int}(undef, total_nnz)
-    new_nzval = Vector{T}(undef, total_nnz)
+    new_nzval_cpu = Vector{T}(undef, total_nnz)
 
     idx = 1
     for local_col in 1:A.nrows_local
@@ -3096,7 +3148,7 @@ function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
             j = col_indices[local_j]  # convert to global column index
             if j <= global_row + k
                 new_rowval[idx] = local_j  # keep local index
-                new_nzval[idx] = A.nzval[nz_idx]
+                new_nzval_cpu[idx] = nzval_cpu[nz_idx]
                 idx += 1
             end
         end
@@ -3107,7 +3159,7 @@ function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
         new_col_indices = Int[]
         new_rowptr = new_colptr
         new_colval = Int[]
-        new_nzval_final = T[]
+        new_nzval_final_cpu = T[]
     else
         local_used = unique(sort(new_rowval))
         new_col_indices = col_indices[local_used]  # convert to global
@@ -3115,7 +3167,7 @@ function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
         compressed_rowval = [searchsortedfirst(local_used, r) for r in new_rowval]
         new_rowptr = new_colptr
         new_colval = compressed_rowval
-        new_nzval_final = new_nzval
+        new_nzval_final_cpu = new_nzval_cpu
     end
 
     structural_hash = compute_structural_hash(A.row_partition, new_col_indices, new_rowptr, new_colval, comm)
@@ -3123,8 +3175,11 @@ function tril(A::SparseMatrixMPI{T,Ti}, k::Integer=0) where {T,Ti}
     nrows_local = A.nrows_local
     ncols_compressed = length(new_col_indices)
 
-    # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-    return SparseMatrixMPI{T,Ti,Vector{T}}(structural_hash, copy(A.row_partition), copy(A.col_partition),
+    # Convert nzval to match input array type
+    new_nzval_final = similar(A.nzval, length(new_nzval_final_cpu))
+    copyto!(new_nzval_final, new_nzval_final_cpu)
+
+    return SparseMatrixMPI{T,Ti,typeof(new_nzval_final)}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, new_rowptr, new_colval, new_nzval_final,
         nrows_local, ncols_compressed, nothing, nothing, new_rowptr, new_colval)
 end
@@ -3390,8 +3445,10 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
 
-    # Determine element type
+    # Determine element type and capture array type from first vector
     T = eltype(first(kv)[2])
+    first_v = first(kv)[2]
+    AV = typeof(first_v.v)  # Capture array type (Vector or MtlVector)
     for (_, v) in kv
         T = promote_type(T, eltype(v))
     end
@@ -3409,10 +3466,14 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
 
     # Step 2: Repartition each vector to match the rows that need it
     # Uses plan caching and has fast path when partitions already match
-    repartitioned = Dict{Int, VectorMPI}()
+    # Stage to CPU to avoid GPU scalar indexing
+    repartitioned_cpu = Dict{Int, Vector{T}}()
+    repartitioned_partitions = Dict{Int, Vector{Int}}()
     for (k, v) in kv
         target = _diag_target_partition(row_partition, k, length(v))
-        repartitioned[k] = repartition(v, target)
+        v_repart = repartition(v, target)
+        repartitioned_cpu[k] = Array(v_repart.v)
+        repartitioned_partitions[k] = v_repart.partition
     end
 
     # Step 3: Build local triplets using vectorized operations
@@ -3422,9 +3483,10 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
 
     for (k, v) in kv
         vec_len = length(v)
-        v_repart = repartitioned[k]
-        my_v_start = v_repart.partition[rank+1]
-        my_v_end = v_repart.partition[rank+2] - 1
+        v_cpu = repartitioned_cpu[k]
+        partition = repartitioned_partitions[k]
+        my_v_start = partition[rank+1]
+        my_v_end = partition[rank+2] - 1
         local_v_len = my_v_end - my_v_start + 1
 
         # Compute which local rows have valid diagonal entries
@@ -3462,7 +3524,7 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
 
             append!(local_I, local_rows)
             append!(local_J, valid_cols)
-            append!(local_V, v_repart.v[v_indices])
+            append!(local_V, v_cpu[v_indices])
         end
     end
 
@@ -3471,7 +3533,20 @@ function spdiagm(kv::Pair{<:Integer,<:VectorMPI}...)
         SparseMatrixCSC(n, local_nrows, ones(Int, local_nrows + 1), Int[], T[]) :
         sparse(local_J, local_I, local_V, n, local_nrows)
 
-    return SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+    # Build CPU result first
+    result_cpu = SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+
+    # Convert nzval to match input array type if GPU
+    if AV !== Vector{T}
+        result_nzval = similar(first_v.v, length(result_cpu.nzval))
+        copyto!(result_nzval, result_cpu.nzval)
+        return SparseMatrixMPI{T,Int,typeof(result_nzval)}(
+            result_cpu.structural_hash, result_cpu.row_partition, result_cpu.col_partition,
+            result_cpu.col_indices, result_cpu.rowptr, result_cpu.colval, result_nzval,
+            result_cpu.nrows_local, result_cpu.ncols_compressed, nothing, nothing,
+            result_cpu.rowptr_target, result_cpu.colval_target)
+    end
+    return result_cpu
 end
 
 """
@@ -3501,8 +3576,10 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
 
-    # Determine element type
+    # Determine element type and capture array type from first vector
     T = eltype(first(kv)[2])
+    first_v = first(kv)[2]
+    AV = typeof(first_v.v)  # Capture array type (Vector or MtlVector)
     for (_, v) in kv
         T = promote_type(T, eltype(v))
     end
@@ -3515,10 +3592,14 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
     local_nrows = my_row_end - my_row_start + 1
 
     # Step 2: Repartition each vector to match the rows that need it
-    repartitioned = Dict{Int, VectorMPI}()
+    # Stage to CPU to avoid GPU scalar indexing
+    repartitioned_cpu = Dict{Int, Vector{T}}()
+    repartitioned_partitions = Dict{Int, Vector{Int}}()
     for (k, v) in kv
         target = _diag_target_partition(row_partition, k, length(v))
-        repartitioned[k] = repartition(v, target)
+        v_repart = repartition(v, target)
+        repartitioned_cpu[k] = Array(v_repart.v)
+        repartitioned_partitions[k] = v_repart.partition
     end
 
     # Step 3: Build local triplets
@@ -3528,8 +3609,9 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
 
     for (k, v) in kv
         vec_len = length(v)
-        v_repart = repartitioned[k]
-        my_v_start = v_repart.partition[rank+1]
+        v_cpu = repartitioned_cpu[k]
+        partition = repartitioned_partitions[k]
+        my_v_start = partition[rank+1]
 
         for local_row_idx in 1:local_nrows
             global_row = my_row_start + local_row_idx - 1
@@ -3546,7 +3628,7 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
                 local_v_idx = vec_idx - my_v_start + 1
                 push!(local_I, local_row_idx)
                 push!(local_J, col)
-                push!(local_V, v_repart.v[local_v_idx])
+                push!(local_V, v_cpu[local_v_idx])
             end
         end
     end
@@ -3556,7 +3638,20 @@ function spdiagm(m::Integer, n::Integer, kv::Pair{<:Integer,<:VectorMPI}...)
         SparseMatrixCSC(n, local_nrows, ones(Int, local_nrows + 1), Int[], T[]) :
         sparse(local_J, local_I, local_V, n, local_nrows)
 
-    return SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+    # Build CPU result first
+    result_cpu = SparseMatrixMPI_local(transpose(AT_local); comm=comm)
+
+    # Convert nzval to match input array type if GPU
+    if AV !== Vector{T}
+        result_nzval = similar(first_v.v, length(result_cpu.nzval))
+        copyto!(result_nzval, result_cpu.nzval)
+        return SparseMatrixMPI{T,Int,typeof(result_nzval)}(
+            result_cpu.structural_hash, result_cpu.row_partition, result_cpu.col_partition,
+            result_cpu.col_indices, result_cpu.rowptr, result_cpu.colval, result_nzval,
+            result_cpu.nrows_local, result_cpu.ncols_compressed, nothing, nothing,
+            result_cpu.rowptr_target, result_cpu.colval_target)
+    end
+    return result_cpu
 end
 
 """
@@ -3570,7 +3665,7 @@ v = VectorMPI([1.0, 2.0, 3.0])
 A = spdiagm(v)  # 3×3 diagonal matrix
 ```
 """
-function spdiagm(v::VectorMPI{T}) where T
+function spdiagm(v::VectorMPI{T,AV}) where {T,AV}
     # Ultra-fast path for main diagonal: reuse cached structure when possible
     n = length(v)
     comm = MPI.COMM_WORLD
@@ -3584,9 +3679,9 @@ function spdiagm(v::VectorMPI{T}) where T
     if haskey(_diag_structure_cache, vec_hash)
         # Reuse cached structure - use new explicit arrays constructor
         cache = _diag_structure_cache[vec_hash]
-        nzval = copy(v.v)
-        # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-        return SparseMatrixMPI{T,Int,Vector{T}}(cache.structural_hash, row_partition, col_partition,
+        nzval = copy(v.v)  # Preserves GPU/CPU type
+        # Match input array type
+        return SparseMatrixMPI{T,Int,typeof(nzval)}(cache.structural_hash, row_partition, col_partition,
                                        cache.col_indices, cache.colptr, cache.rowval, nzval,
                                        local_n, length(cache.col_indices), nothing, true, cache.colptr, cache.rowval)
     end
@@ -3598,7 +3693,7 @@ function spdiagm(v::VectorMPI{T}) where T
     my_start = v.partition[rank+1]
     rowptr = collect(1:(local_n+1))  # Each row has exactly 1 entry
     colval = collect(1:local_n)  # LOCAL column indices (compressed)
-    nzval = copy(v.v)
+    nzval = copy(v.v)  # Preserves GPU/CPU type
 
     # col_indices maps local column index -> global column index
     col_indices = collect(my_start:(my_start + local_n - 1))
@@ -3608,8 +3703,8 @@ function spdiagm(v::VectorMPI{T}) where T
     _diag_structure_cache[vec_hash] = DiagStructureCache(rowptr, colval, col_indices, diag_hash)
 
     # Diagonal matrices are always symmetric
-    # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-    return SparseMatrixMPI{T,Int,Vector{T}}(diag_hash, row_partition, col_partition, col_indices,
+    # Match input array type
+    return SparseMatrixMPI{T,Int,typeof(nzval)}(diag_hash, row_partition, col_partition, col_indices,
                                rowptr, colval, nzval, local_n, length(col_indices), nothing, true, rowptr, colval)
 end
 
@@ -3633,12 +3728,12 @@ end
 # ============================================================================
 
 """
-    Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    Base.:*(A::MatrixMPI{T,AM}, B::SparseMatrixMPI{T,Ti,AV}) where {T,AM,Ti,AV}
 
 Compute dense matrix times sparse matrix.
-Uses column-by-column approach with transpose(B)' * transpose(A').
+Uses column-by-column approach. Returns a MatrixMPI with the same backend as A.
 """
-function Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+function Base.:*(A::MatrixMPI{T,AM}, B::SparseMatrixMPI{T,Ti,AV}) where {T,AM,Ti,AV}
     m = size(A, 1)
     n = size(B, 2)
 
@@ -3662,21 +3757,25 @@ function Base.:*(A::MatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results (columns[k].v may be GPU array)
-    local_result = Matrix{T}(undef, local_m, n)
+    # Build local matrix from column results on CPU
+    local_result_cpu = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
+        local_result_cpu[:, k] = Array(columns[k].v)
     end
+
+    # Convert back to original backend if needed
+    local_result = A.A isa Matrix ? local_result_cpu : copyto!(similar(A.A, local_m, n), local_result_cpu)
 
     return MatrixMPI_local(local_result)
 end
 
 """
-    Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+    Base.:*(At::TransposedMatrixMPI{T,AM}, B::SparseMatrixMPI{T,Ti,AV}) where {T,AM,Ti,AV}
 
 Compute transpose(A) * B where A is dense and B is sparse.
+Returns a MatrixMPI with the same backend as A.
 """
-function Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,Ti}
+function Base.:*(At::TransposedMatrixMPI{T,AM}, B::SparseMatrixMPI{T,Ti,AV}) where {T,AM,Ti,AV}
     A = At.parent
     n = size(B, 2)
 
@@ -3694,11 +3793,14 @@ function Base.:*(At::TransposedMatrixMPI{T}, B::SparseMatrixMPI{T,Ti}) where {T,
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results (columns[k].v may be GPU array)
-    local_result = Matrix{T}(undef, local_m, n)
+    # Build local matrix from column results on CPU
+    local_result_cpu = Matrix{T}(undef, local_m, n)
     for k in 1:n
-        local_result[:, k] = Array(columns[k].v)  # Ensure CPU for MatrixMPI_local
+        local_result_cpu[:, k] = Array(columns[k].v)
     end
+
+    # Convert back to original backend if needed
+    local_result = A.A isa Matrix ? local_result_cpu : copyto!(similar(A.A, local_m, n), local_result_cpu)
 
     return MatrixMPI_local(local_result)
 end
