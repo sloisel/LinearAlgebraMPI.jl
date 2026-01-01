@@ -926,9 +926,9 @@ end
 _map_rows_cpu_kernel(f, args...) = _map_rows_gpu_kernel(f, args...)
 
 """
-    map_rows(f, A...)
+    map_rows_gpu(f, A...)
 
-Apply function `f` to corresponding rows of distributed vectors/matrices.
+Apply function `f` to corresponding rows of distributed vectors/matrices (GPU-native).
 
 Each argument in `A...` must be either a `VectorMPI` or `MatrixMPI`. All inputs
 are repartitioned to match the partition of the first argument before applying `f`.
@@ -936,6 +936,9 @@ are repartitioned to match the partition of the first argument before applying `
 This implementation uses GPU-friendly broadcasting: matrices are converted to
 Vector{SVector} via transpose+reinterpret, then f is broadcast over all arguments.
 This avoids GPU->CPU->GPU round-trips when the underlying arrays are on GPU.
+
+**Important**: The function `f` must be isbits-compatible (no captured non-isbits data)
+for GPU execution. Use [`map_rows`](@ref) for functions with arbitrary closures.
 
 For each row index i, `f` is called with:
 - For `VectorMPI`: the scalar element at index i
@@ -956,21 +959,23 @@ The result type depends on what `f` returns:
 # Element-wise product of two vectors
 u = VectorMPI([1.0, 2.0, 3.0])
 v = VectorMPI([4.0, 5.0, 6.0])
-w = map_rows((a, b) -> a * b, u, v)  # VectorMPI([4.0, 10.0, 18.0])
+w = map_rows_gpu((a, b) -> a * b, u, v)  # VectorMPI([4.0, 10.0, 18.0])
 
 # Row norms of a matrix
 A = MatrixMPI(randn(5, 3))
-norms = map_rows(r -> norm(r), A)  # VectorMPI of row norms
+norms = map_rows_gpu(r -> norm(r), A)  # VectorMPI of row norms
 
 # Return SVector to build a matrix
 A = MatrixMPI(randn(3, 2))
-result = map_rows(r -> SVector(sum(r), prod(r)), A)  # 3×2 MatrixMPI
+result = map_rows_gpu(r -> SVector(sum(r), prod(r)), A)  # 3×2 MatrixMPI
 
 # Mixed inputs: matrix rows combined with vector elements
 A = MatrixMPI(randn(4, 3))
 w = VectorMPI([1.0, 2.0, 3.0, 4.0])
-result = map_rows((row, wi) -> sum(row) * wi, A, w)  # VectorMPI
+result = map_rows_gpu((row, wi) -> sum(row) * wi, A, w)  # VectorMPI
 ```
+
+See also: [`map_rows`](@ref) for CPU fallback version (handles arbitrary closures)
 """
 function map_rows_gpu(f, A...)
     isempty(A) && error("map_rows_gpu requires at least one argument")

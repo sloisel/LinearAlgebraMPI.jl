@@ -45,6 +45,7 @@ SparseMatrixMPI_local
 
 ```@docs
 map_rows
+map_rows_gpu
 ```
 
 ## Linear System Solvers
