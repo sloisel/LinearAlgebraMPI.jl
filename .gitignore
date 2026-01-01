@@ -16,3 +16,4 @@ docs/Manifest.toml
 
 # Development/prototype code
 dev/
+.ipynb_checkpoints/
