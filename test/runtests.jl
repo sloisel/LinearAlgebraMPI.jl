@@ -64,11 +64,9 @@ end
     @testset "MPI Local Constructors" begin
         run_mpi_test(joinpath(@__DIR__, "test_local_constructors.jl"); nprocs=4, expect_success=true)
     end
-    # DISABLED: Scalar indexing removed to prevent MPI desync from AbstractArray fallbacks
-    # TODO: Update test_indexing.jl to only test slice/range operations
-    # @testset "MPI Indexing" begin
-    #     run_mpi_test(joinpath(@__DIR__, "test_indexing.jl"); nprocs=4, expect_success=true)
-    # end
+    @testset "MPI Indexing" begin
+        run_mpi_test(joinpath(@__DIR__, "test_indexing.jl"); nprocs=4, expect_success=true)
+    end
     @testset "MPI Factorization" begin
         # Factorization test may return non-zero due to MUMPS cleanup after MPI.Finalize()
         # Check output for actual test results instead of exit code
