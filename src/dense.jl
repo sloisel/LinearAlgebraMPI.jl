@@ -1751,8 +1751,8 @@ function execute_plan!(plan::DenseRepartitionPlan{T}, A::MatrixMPI{T,AM}) where 
 
     MPI.Waitall(plan.send_reqs)
 
-    # Copy result back to target array type (GPU if input was GPU)
-    result_A = A.A isa Matrix ? result_cpu : copyto!(similar(A.A, size(result_cpu)...), result_cpu)
+    # Copy result back to target array type using dispatch (no type checks)
+    result_A = _matrix_to_backend(result_cpu, A.A)
 
     return MatrixMPI{T,typeof(result_A)}(plan.result_structural_hash, plan.result_row_partition, plan.result_col_partition, result_A)
 end

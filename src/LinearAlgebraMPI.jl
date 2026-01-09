@@ -19,6 +19,7 @@ export io0   # Utility for rank-selective output
 export get_backend  # Get the KernelAbstractions backend for a distributed array
 
 # GPU conversion functions (extended by Metal/CUDA extensions)
+# Note: cu is NOT exported to avoid conflict with CUDA.cu - use LinearAlgebraMPI.cu() or CUDA.cu()
 export mtl, cpu
 
 # Factorization exports (generic interface, implementation details hidden)
@@ -169,6 +170,14 @@ Convert a distributed array from GPU to CPU storage.
 For already-CPU arrays, returns the input unchanged (no-op).
 """
 function cpu end
+
+"""
+    cu(v)
+
+Convert a distributed array to CUDA GPU storage.
+Requires: `using CUDA, NCCL, CUDSS_jll` before loading LinearAlgebraMPI.
+"""
+function cu end
 
 """
     clear_plan_cache!()
@@ -1066,21 +1075,40 @@ function map_rows(f, A...)
     # Apply function on CPU (handles arbitrary closures)
     result_cpu = map_rows_gpu(f, cpu_args...)
 
-    # Convert back to original backend if needed
-    # Check if first arg was GPU - if so, convert result to GPU
-    first_arg = A[1]
-    if _is_gpu_array(first_arg)
-        return mtl(result_cpu)
-    else
-        return result_cpu
-    end
+    # Convert back to original backend using dispatch (no GPU detection needed)
+    return _to_same_backend(result_cpu, A[1])
 end
 
-# Helper to detect GPU arrays
-_is_gpu_array(::VectorMPI{T,Vector{T}}) where T = false
-_is_gpu_array(::MatrixMPI{T,Matrix{T}}) where T = false
-_is_gpu_array(::VectorMPI) = true  # Non-CPU vector types (MtlVector, etc.)
-_is_gpu_array(::MatrixMPI) = true  # Non-CPU matrix types (MtlMatrix, etc.)
+# ============================================================================
+# Backend Conversion Helpers for Distributed Types
+# ============================================================================
+
+"""
+    _to_same_backend(cpu_result::VectorMPI, template::VectorMPI)
+    _to_same_backend(cpu_result::MatrixMPI, template::MatrixMPI)
+
+Convert a CPU-backed distributed array to the same backend as the template.
+For CPU templates, returns the input directly (no copy).
+For GPU templates, extensions add methods that call cu()/mtl() as appropriate.
+
+This enables polymorphic code that works across backends without explicit type checks.
+"""
+# CPU to CPU: return as-is
+_to_same_backend(cpu_result::VectorMPI{T,Vector{T}}, ::VectorMPI{S,Vector{S}}) where {T,S} = cpu_result
+_to_same_backend(cpu_result::MatrixMPI{T,Matrix{T}}, ::MatrixMPI{S,Matrix{S}}) where {T,S} = cpu_result
+
+# Already on same backend: return as-is (handles GPU to same GPU)
+_to_same_backend(result::VectorMPI{T,AV}, ::VectorMPI{S,AV}) where {T,S,AV} = result
+_to_same_backend(result::MatrixMPI{T,AM}, ::MatrixMPI{S,AM}) where {T,S,AM} = result
+
+# VectorMPI with MatrixMPI template (for vertex_indices from MatrixMPI)
+_to_same_backend(cpu_result::VectorMPI{T,Vector{T}}, ::MatrixMPI{S,Matrix{S}}) where {T,S} = cpu_result
+
+# GPU extensions add methods like:
+# _to_same_backend(cpu::VectorMPI{T,Vector{T}}, ::VectorMPI{S,<:MtlVector}) = mtl(cpu)
+# _to_same_backend(cpu::VectorMPI{T,Vector{T}}, ::VectorMPI{S,<:CuVector}) = cu(cpu)
+# _to_same_backend(cpu::VectorMPI{T,Vector{T}}, ::MatrixMPI{S,<:MtlMatrix}) = mtl(cpu)
+# _to_same_backend(cpu::VectorMPI{T,Vector{T}}, ::MatrixMPI{S,<:CuMatrix}) = cu(cpu)
 
 """
     vertex_indices(A::AbstractVectorMPI)
@@ -1115,12 +1143,8 @@ function vertex_indices(A::VectorMPI{T,AV}) where {T,AV}
     # VectorMPI_local computes partition from local sizes via MPI
     indices_cpu = VectorMPI_local(local_indices)
 
-    # Convert to same backend as A
-    if _is_gpu_array(A)
-        return mtl(indices_cpu)
-    else
-        return indices_cpu
-    end
+    # Convert to same backend as A using dispatch (works for CPU, Metal, CUDA)
+    return _to_same_backend(indices_cpu, A)
 end
 
 function vertex_indices(A::MatrixMPI{T,AM}) where {T,AM}
@@ -1135,12 +1159,8 @@ function vertex_indices(A::MatrixMPI{T,AM}) where {T,AM}
     # VectorMPI_local computes partition from local sizes via MPI
     indices_cpu = VectorMPI_local(local_indices)
 
-    # Convert to same backend as A
-    if _is_gpu_array(A)
-        return mtl(indices_cpu)
-    else
-        return indices_cpu
-    end
+    # Convert to same backend as A using dispatch (works for CPU, Metal, CUDA)
+    return _to_same_backend(indices_cpu, A)
 end
 
 

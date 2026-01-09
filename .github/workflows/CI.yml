@@ -33,6 +33,15 @@ jobs:
 
       - uses: julia-actions/cache@v2
 
+      - name: Configure MPI
+        run: |
+          julia --project=. -e '
+            using Pkg
+            Pkg.add("MPIPreferences")
+            using MPIPreferences
+            MPIPreferences.use_jll_binary("MPICH_jll")
+          '
+
       - name: Build package
         uses: julia-actions/julia-buildpkg@v1
 

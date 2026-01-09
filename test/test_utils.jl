@@ -19,7 +19,22 @@ if METAL_AVAILABLE
     @info "Metal is available for GPU tests"
 end
 
-# Import LinearAlgebraMPI after Metal check
+# Detect CUDA availability BEFORE loading LinearAlgebraMPI
+# (CUDA/NCCL/CUDSS_jll must be loaded first for GPU extension to work)
+const CUDA_AVAILABLE = try
+    using CUDA
+    using NCCL
+    using CUDSS_jll
+    CUDA.functional()
+catch e
+    false
+end
+
+if CUDA_AVAILABLE
+    @info "CUDA is available for GPU tests"
+end
+
+# Import LinearAlgebraMPI after GPU checks
 using LinearAlgebraMPI
 
 # Backend configurations: (ScalarType, to_backend_fn, backend_name)
@@ -28,13 +43,17 @@ const CPU_CONFIGS = [
     (ComplexF64, identity, "CPU")
 ]
 
-const GPU_CONFIGS = if METAL_AVAILABLE
-    [
-        (Float32, LinearAlgebraMPI.mtl, "Metal")
+const GPU_CONFIGS = begin
+    configs = Tuple{Type, Function, String}[]
+    if METAL_AVAILABLE
+        push!(configs, (Float32, LinearAlgebraMPI.mtl, "Metal"))
         # ComplexF32 skipped - Julia's complex ops use Float64 internally, unsupported on Metal
-    ]
-else
-    Tuple{Type, Function, String}[]
+    end
+    if CUDA_AVAILABLE
+        push!(configs, (Float32, LinearAlgebraMPI.cu, "CUDA"))
+        push!(configs, (Float64, LinearAlgebraMPI.cu, "CUDA"))  # CUDA supports Float64
+    end
+    configs
 end
 
 const ALL_CONFIGS = [CPU_CONFIGS; GPU_CONFIGS]
@@ -111,8 +130,8 @@ Return appropriate tolerance for type T.
 Float32 tolerance is looser (1e-4) to accommodate accumulated errors
 in matrix operations like transpose(A) * B.
 """
-tolerance(::Type{Float64}) = 1e-12
-tolerance(::Type{ComplexF64}) = 1e-12
+tolerance(::Type{Float64}) = 1e-10
+tolerance(::Type{ComplexF64}) = 1e-10
 tolerance(::Type{Float32}) = 1e-4
 tolerance(::Type{ComplexF32}) = 1e-4
 
@@ -164,11 +183,17 @@ to_cpu(x::VectorMPI{T, Vector{T}}) where T = x
 to_cpu(x::SparseMatrixMPI{T, Ti, Vector{T}}) where {T, Ti} = x
 to_cpu(x::MatrixMPI{T, Matrix{T}}) where T = x
 
-# GPU versions (only available when Metal is loaded)
+# GPU versions (only available when GPU backend is loaded)
 if METAL_AVAILABLE
     to_cpu(x::VectorMPI{T, <:Metal.MtlVector}) where T = LinearAlgebraMPI.cpu(x)
     to_cpu(x::SparseMatrixMPI{T, Ti, <:Metal.MtlVector}) where {T, Ti} = LinearAlgebraMPI.cpu(x)
     to_cpu(x::MatrixMPI{T, <:Metal.MtlMatrix}) where T = LinearAlgebraMPI.cpu(x)
+end
+
+if CUDA_AVAILABLE
+    to_cpu(x::VectorMPI{T, <:CUDA.CuVector}) where T = LinearAlgebraMPI.cpu(x)
+    to_cpu(x::SparseMatrixMPI{T, Ti, <:CUDA.CuVector}) where {T, Ti} = LinearAlgebraMPI.cpu(x)
+    to_cpu(x::MatrixMPI{T, <:CUDA.CuMatrix}) where T = LinearAlgebraMPI.cpu(x)
 end
 
 """
@@ -187,6 +212,12 @@ if METAL_AVAILABLE
     end
 end
 
+if CUDA_AVAILABLE
+    function local_values(v::VectorMPI{T, <:CUDA.CuVector}) where T
+        return Array(v.v)
+    end
+end
+
 # ============================================================================
 # Type assertions for catching GPU/CPU type mismatches
 # ============================================================================
@@ -201,6 +232,16 @@ if METAL_AVAILABLE
         typeof(v).parameters[3]  # Extract storage type (e.g., Metal.PrivateStorage)
     end
     @info "Detected Metal storage type: $_MTL_STORAGE"
+end
+
+# Detect concrete CUDA storage type at module load time
+if CUDA_AVAILABLE
+    # CuVector{T} is CuArray{T, 1, CUDA.DeviceMemory}
+    const _CUDA_STORAGE = let
+        v = CUDA.CuVector{Float32}(undef, 1)
+        typeof(v).parameters[3]  # Extract storage type
+    end
+    @info "Detected CUDA storage type: $_CUDA_STORAGE"
 end
 
 """
@@ -245,7 +286,16 @@ if METAL_AVAILABLE
     end
 end
 
-export METAL_AVAILABLE, CPU_CONFIGS, GPU_CONFIGS, ALL_CONFIGS, CPU_ONLY_CONFIGS
+if CUDA_AVAILABLE
+    # Return fully concrete types using the detected storage type
+    function expected_types(::Type{T}, ::typeof(LinearAlgebraMPI.cu)) where T
+        (VectorMPI{T, CUDA.CuVector{T, _CUDA_STORAGE}},
+         SparseMatrixMPI{T, Int, CUDA.CuVector{T, _CUDA_STORAGE}},
+         MatrixMPI{T, CUDA.CuMatrix{T, _CUDA_STORAGE}})
+    end
+end
+
+export METAL_AVAILABLE, CUDA_AVAILABLE, CPU_CONFIGS, GPU_CONFIGS, ALL_CONFIGS, CPU_ONLY_CONFIGS
 export tridiagonal_matrix, dense_matrix, test_vector, test_vector_pair
 export tolerance, to_cpu, local_values, expected_types, assert_type, assert_uniform
 

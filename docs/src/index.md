@@ -28,9 +28,8 @@ LinearAlgebraMPI.jl provides distributed matrix and vector types for parallel co
 
 ```julia
 using MPI
-MPI.Init()
-
 using LinearAlgebraMPI
+MPI.Init()
 using SparseArrays
 
 # Create distributed sparse matrix

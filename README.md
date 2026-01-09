@@ -20,7 +20,8 @@ Distributed sparse matrix and vector operations using MPI for Julia. This packag
 - **Matrix addition/subtraction** (`A + B`, `A - B`)
 - **Vector operations**: norms, reductions, arithmetic with automatic partition alignment
 - Support for both `Float64` and `ComplexF64` element types
-- **GPU acceleration** via Metal.jl (macOS) with automatic CPU staging for MPI
+- **GPU acceleration** via Metal.jl (macOS) or CUDA.jl (Linux/Windows) with automatic CPU staging for MPI
+- **Multi-GPU sparse direct solver** via cuDSS with NCCL communication (CUDA only)
 
 ## Installation
 
@@ -66,11 +67,11 @@ F = ldlt(A_sym_dist)  # LDLT factorization
 x_sol = solve(F, y)   # Solve A_sym * x_sol = y
 ```
 
-## GPU Support (Metal)
+## GPU Support
 
-LinearAlgebraMPI supports GPU acceleration on macOS via Metal.jl. GPU support is optional - Metal.jl is loaded as a weak dependency.
+LinearAlgebraMPI supports GPU acceleration via Metal.jl (macOS) or CUDA.jl (Linux/Windows). GPU support is optional - extensions are loaded as weak dependencies.
 
-### Converting between CPU and GPU
+### Metal (macOS)
 
 ```julia
 using Metal  # Load Metal BEFORE MPI for GPU detection
@@ -93,34 +94,69 @@ z_gpu = x_gpu + x_gpu  # Vector addition on GPU
 y_cpu = cpu(y_gpu)
 ```
 
-### Creating GPU vectors directly
+### CUDA (Linux/Windows)
 
 ```julia
-using Metal
+using CUDA  # Load CUDA BEFORE MPI
+using MPI
+MPI.Init()
+using LinearAlgebraMPI
 
-# Create GPU vector from local data
-local_data = MtlVector(Float32.(rand(100)))
-v_gpu = VectorMPI_local(local_data)
+# Convert to GPU
+x_cpu = VectorMPI(rand(1000))
+x_gpu = cu(x_cpu)  # Returns VectorMPI with CuVector storage
+
+# GPU operations work transparently
+y_gpu = A * x_gpu
+z_gpu = x_gpu + x_gpu
+
+# Convert back to CPU
+y_cpu = cpu(y_gpu)
 ```
+
+### cuDSS Multi-GPU Solver (CUDA only)
+
+For multi-GPU distributed sparse direct solves, use `CuDSSFactorizationMPI`:
+
+```julia
+using CUDA, MPI
+MPI.Init()
+using LinearAlgebraMPI
+
+# Each rank uses one GPU
+CUDA.device!(MPI.Comm_rank(MPI.COMM_WORLD) % length(CUDA.devices()))
+
+# Create distributed sparse matrix
+A = SparseMatrixMPI{Float64}(make_spd_matrix(1000))
+b = VectorMPI(rand(1000))
+
+# Multi-GPU factorization using cuDSS + NCCL
+F = cudss_ldlt(A)  # or cudss_lu(A)
+x = F \ b
+finalize!(F)  # Clean up cuDSS resources
+```
+
+**Requirements**: cuDSS 0.4+ with MGMN (Multi-GPU Multi-Node) support, NCCL for inter-GPU communication.
 
 ### How it works
 
-- **Vectors**: `VectorMPI{T,AV}` where `AV` is `Vector{T}` (CPU) or `MtlVector{T}` (GPU)
+- **Vectors**: `VectorMPI{T,AV}` where `AV` is `Vector{T}` (CPU), `MtlVector{T}` (Metal), or `CuVector{T}` (CUDA)
 - **Sparse matrices**: `SparseMatrixMPI{T,Ti,AV}` where `AV` determines storage for nonzero values
-- **Dense matrices**: `MatrixMPI{T,AM}` where `AM` is `Matrix{T}` (CPU) or `MtlMatrix{T}` (GPU)
-- **MPI communication**: Always uses CPU buffers (no Metal-aware MPI exists)
-- **Element type**: Metal requires `Float32` (no `Float64` support)
+- **Dense matrices**: `MatrixMPI{T,AM}` where `AM` is `Matrix{T}`, `MtlMatrix{T}`, or `CuMatrix{T}`
+- **MPI communication**: Always uses CPU buffers (staged automatically)
+- **Element types**: Metal requires `Float32`; CUDA supports `Float32` and `Float64`
 
 ### Supported GPU operations
 
-| Operation | GPU Support |
-|-----------|-------------|
-| `v + w`, `v - w` | Native GPU |
-| `α * v` (scalar) | Native GPU |
-| `A * x` (sparse) | CPU staging |
-| `A * x` (dense) | CPU staging |
-| `transpose(A) * x` | CPU staging |
-| Broadcasting (`abs.(v)`) | Native GPU |
+| Operation | Metal | CUDA |
+|-----------|-------|------|
+| `v + w`, `v - w` | Native | Native |
+| `α * v` (scalar) | Native | Native |
+| `A * x` (sparse) | CPU staging | CPU staging |
+| `A * x` (dense) | CPU staging | CPU staging |
+| `transpose(A) * x` | CPU staging | CPU staging |
+| Broadcasting (`abs.(v)`) | Native | Native |
+| `cudss_lu(A)`, `cudss_ldlt(A)` | N/A | Multi-GPU native |
 
 ## Running with MPI
 

@@ -169,6 +169,38 @@ function LinearAlgebraMPI._convert_vector_to_backend(v::LinearAlgebraMPI.VectorM
 end
 
 # ============================================================================
+# Backend Conversion for Distributed Types
+# ============================================================================
+
+"""
+    _to_same_backend(cpu::VectorMPI{T,Vector{T}}, ::VectorMPI{S,<:MtlVector}) where {T,S}
+
+Convert a CPU VectorMPI to Metal GPU backend to match the template.
+"""
+function LinearAlgebraMPI._to_same_backend(cpu::LinearAlgebraMPI.VectorMPI{T,Vector{T}}, ::LinearAlgebraMPI.VectorMPI{S,<:MtlVector}) where {T,S}
+    return LinearAlgebraMPI.mtl(cpu)
+end
+
+"""
+    _to_same_backend(cpu::MatrixMPI{T,Matrix{T}}, ::MatrixMPI{S,<:MtlMatrix}) where {T,S}
+
+Convert a CPU MatrixMPI to Metal GPU backend to match the template.
+"""
+function LinearAlgebraMPI._to_same_backend(cpu::LinearAlgebraMPI.MatrixMPI{T,Matrix{T}}, ::LinearAlgebraMPI.MatrixMPI{S,<:MtlMatrix}) where {T,S}
+    return LinearAlgebraMPI.mtl(cpu)
+end
+
+"""
+    _to_same_backend(cpu::VectorMPI{T,Vector{T}}, ::MatrixMPI{S,<:MtlMatrix}) where {T,S}
+
+Convert a CPU VectorMPI to Metal GPU backend using a MatrixMPI template.
+Used by vertex_indices when the input is a MatrixMPI.
+"""
+function LinearAlgebraMPI._to_same_backend(cpu::LinearAlgebraMPI.VectorMPI{T,Vector{T}}, ::LinearAlgebraMPI.MatrixMPI{S,<:MtlMatrix}) where {T,S}
+    return LinearAlgebraMPI.mtl(cpu)
+end
+
+# ============================================================================
 # Base.zeros Support
 # ============================================================================
 

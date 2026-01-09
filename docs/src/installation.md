@@ -46,9 +46,8 @@ mpiexec -n 2 julia --project test/runtests.jl
 ```julia
 # CORRECT
 using MPI
-MPI.Init()
-
 using LinearAlgebraMPI
+MPI.Init()
 # Now you can use the package
 ```
 
@@ -58,9 +57,8 @@ Create a script file (e.g., `my_program.jl`):
 
 ```julia
 using MPI
-MPI.Init()
-
 using LinearAlgebraMPI
+MPI.Init()
 using SparseArrays
 
 # Create distributed matrix

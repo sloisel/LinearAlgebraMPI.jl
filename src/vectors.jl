@@ -133,6 +133,11 @@ _create_output_like(::AV, result::AV) where {T,AV<:AbstractVector{T}} = result
 _ensure_cpu(v::Vector) = v
 _ensure_cpu(v::AbstractVector) = Array(v)
 
+# Helper to determine if GPU gather kernel should be used
+# CPU arrays use loop-based gather; GPU arrays use kernel-based gather
+_use_gpu_gather(::Vector) = false
+_use_gpu_gather(::AbstractVector) = true
+
 # Helper to copy only a range from vector to CPU (view for CPU, copy range for GPU)
 # Used by execute_plan! to avoid copying entire GPU arrays
 _copy_range_to_cpu(v::Vector, range::UnitRange) = view(v, range)
@@ -371,9 +376,8 @@ function execute_plan!(plan::VectorPlan{T,AV}, x::VectorMPI{T,AV}) where {T,AV}
 
     # Check if we can use GPU-optimized path (no MPI communication needed)
     no_mpi_needed = isempty(plan.send_rank_ids) && isempty(plan.recv_rank_ids)
-    is_gpu = !(x.v isa Vector)
 
-    if no_mpi_needed && is_gpu && !isempty(plan.local_src_indices)
+    if no_mpi_needed && _use_gpu_gather(x.v) && !isempty(plan.local_src_indices)
         # GPU path: Use gather kernel directly, no CPU round-trip
         # Cache GPU index arrays on first use
         if plan.cached_local_src_gpu === nothing
@@ -644,8 +648,8 @@ function execute_plan!(plan::VectorRepartitionPlan{T}, x::VectorMPI{T,AV}) where
 
     MPI.Waitall(plan.send_reqs)
 
-    # Copy result back to target array type (GPU if input was GPU)
-    result_v = x.v isa Vector ? result_cpu : copyto!(similar(x.v, length(result_cpu)), result_cpu)
+    # Copy result back to target array type using dispatch (no type checks)
+    result_v = _values_to_backend(result_cpu, x.v)
 
     return VectorMPI{T,typeof(result_v)}(plan.result_partition_hash, plan.result_partition, result_v)
 end

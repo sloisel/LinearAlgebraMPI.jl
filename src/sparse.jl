@@ -866,6 +866,17 @@ _values_to_backend(cpu_values::Vector, ::Vector) = cpu_values
 _values_to_backend(cpu_values::Vector{T}, template::AbstractVector) where T = copyto!(similar(template, T, length(cpu_values)), cpu_values)
 
 """
+    _matrix_to_backend(cpu_matrix::Matrix, template::Matrix)
+    _matrix_to_backend(cpu_matrix::Matrix, template::AbstractMatrix)
+
+Convert CPU matrix to the same backend as template.
+For CPU template, returns cpu_matrix directly (no copy).
+For GPU template, copies to a new GPU array of the same type.
+"""
+_matrix_to_backend(cpu_matrix::Matrix, ::Matrix) = cpu_matrix
+_matrix_to_backend(cpu_matrix::Matrix{T}, template::AbstractMatrix) where T = copyto!(similar(template, T, size(cpu_matrix)...), cpu_matrix)
+
+"""
     MatrixPlan(A::SparseMatrixMPI{T,Ti,AV}, B::SparseMatrixMPI{T,Ti,AV}) where {T,Ti,AV}
 
 Create a memoized communication plan for A * B.
@@ -2067,8 +2078,8 @@ function execute_plan!(plan::TransposePlan{T,Ti}, A::SparseMatrixMPI{T,Ti,AV}) w
     nrows_local = compressed_result_AT.n
     ncols_compressed = length(plan.col_indices)
 
-    # Copy result to GPU if input was GPU
-    result_nzval = A.nzval isa Vector ? compressed_result_AT.nzval : copyto!(similar(A.nzval, length(compressed_result_AT.nzval)), compressed_result_AT.nzval)
+    # Copy result to target backend using dispatch (no type checks)
+    result_nzval = _values_to_backend(compressed_result_AT.nzval, A.nzval)
 
     # Convert structure arrays to target backend
     rowptr_target = _to_target_backend(compressed_result_AT.colptr, AV)
@@ -2351,27 +2362,12 @@ function Base.:*(A::SparseMatrixMPI{T,Ti,AV}, x::VectorMPI{T,AVX}) where {T,Ti,A
     end
 
     # Execute the plan to gather vector elements
-    # For GPU without MPI, execute_plan! uses GPU gather kernel → plan.gathered
-    # For CPU or GPU with MPI, execute_plan! uses CPU path → plan.gathered_cpu
+    # After execute_plan!, plan.gathered always contains the data in x's backend (= A's backend)
     execute_plan!(plan, x)
 
-    # Determine gathered buffer to use for SpMV
-    # If x and A are on the same GPU backend and no MPI was needed,
-    # plan.gathered already has the data on GPU from execute_plan!
-    if A.nzval isa Vector
-        # CPU path: use CPU gathered buffer directly
-        gathered = plan.gathered_cpu
-    elseif !(x.v isa Vector) && typeof(plan.gathered) == typeof(A.nzval)
-        # GPU path with same backend: use plan.gathered directly (already populated)
-        gathered = plan.gathered
-    else
-        # GPU path where MPI was used: copy from CPU to GPU
-        if plan.cached_gathered_target === nothing
-            plan.cached_gathered_target = similar(A.nzval, length(plan.gathered_cpu))
-        end
-        gathered = plan.cached_gathered_target
-        copyto!(gathered, plan.gathered_cpu)
-    end
+    # Use plan.gathered directly - it's always in the correct backend
+    # (A and x have the same AV type parameter from function signature)
+    gathered = plan.gathered
     y_local = similar(A.nzval, local_rows)
 
     # Unified SpMV kernel using pre-computed target arrays (works on CPU or GPU)
@@ -2665,17 +2661,8 @@ function Base.:*(A::SparseMatrixMPI{T,Ti,AV}, B::MatrixMPI{T,AM}) where {T,Ti,AV
     result_partition = columns[1].partition
     local_m = result_partition[rank+2] - result_partition[rank+1]
 
-    # Build local matrix from column results (GPU-native if columns are GPU)
-    if columns[1].v isa Vector
-        # CPU path: build directly
-        local_result = Matrix{T}(undef, local_m, n)
-        for k in 1:n
-            local_result[:, k] = columns[k].v
-        end
-    else
-        # GPU path: hcat keeps data on GPU
-        local_result = reduce(hcat, [columns[k].v for k in 1:n])
-    end
+    # Build local matrix from column results (works uniformly for CPU and GPU)
+    local_result = reduce(hcat, [columns[k].v for k in 1:n])
 
     return MatrixMPI_local(local_result)
 end
@@ -3033,9 +3020,13 @@ function dropzeros(A::SparseMatrixMPI{T,Ti,AV}) where {T,Ti,AV}
     result_nzval = similar(A.nzval, length(new_AT.nzval))
     copyto!(result_nzval, new_AT.nzval)
 
+    # Convert structure arrays to target backend
+    rowptr_target = _to_target_backend(new_AT.colptr, AV)
+    colval_target = _to_target_backend(new_AT.rowval, AV)
+
     return SparseMatrixMPI{T,Ti,typeof(result_nzval)}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, new_AT.colptr, new_AT.rowval, result_nzval,
-        nrows_local, ncols_compressed, nothing, nothing, new_AT.colptr, new_AT.rowval)
+        nrows_local, ncols_compressed, nothing, nothing, rowptr_target, colval_target)
 end
 
 # ============================================================================
@@ -3206,9 +3197,13 @@ function triu(A::SparseMatrixMPI{T,Ti,AV}, k::Integer=0) where {T,Ti,AV}
     new_nzval_final = similar(A.nzval, length(new_nzval_final_cpu))
     copyto!(new_nzval_final, new_nzval_final_cpu)
 
+    # Convert structure arrays to target backend
+    rowptr_target = _to_target_backend(new_rowptr, AV)
+    colval_target = _to_target_backend(new_colval, AV)
+
     return SparseMatrixMPI{T,Ti,typeof(new_nzval_final)}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, new_rowptr, new_colval, new_nzval_final,
-        nrows_local, ncols_compressed, nothing, nothing, new_rowptr, new_colval)
+        nrows_local, ncols_compressed, nothing, nothing, rowptr_target, colval_target)
 end
 
 """
@@ -3293,9 +3288,13 @@ function tril(A::SparseMatrixMPI{T,Ti,AV}, k::Integer=0) where {T,Ti,AV}
     new_nzval_final = similar(A.nzval, length(new_nzval_final_cpu))
     copyto!(new_nzval_final, new_nzval_final_cpu)
 
+    # Convert structure arrays to target backend
+    rowptr_target = _to_target_backend(new_rowptr, AV)
+    colval_target = _to_target_backend(new_colval, AV)
+
     return SparseMatrixMPI{T,Ti,typeof(new_nzval_final)}(structural_hash, copy(A.row_partition), copy(A.col_partition),
         new_col_indices, new_rowptr, new_colval, new_nzval_final,
-        nrows_local, ncols_compressed, nothing, nothing, new_rowptr, new_colval)
+        nrows_local, ncols_compressed, nothing, nothing, rowptr_target, colval_target)
 end
 
 # ============================================================================
@@ -3877,8 +3876,8 @@ function Base.:*(A::MatrixMPI{T,AM}, B::SparseMatrixMPI{T,Ti,AV}) where {T,AM,Ti
         local_result_cpu[:, k] = Array(columns[k].v)
     end
 
-    # Convert back to original backend if needed
-    local_result = A.A isa Matrix ? local_result_cpu : copyto!(similar(A.A, local_m, n), local_result_cpu)
+    # Convert back to original backend using dispatch (no type checks)
+    local_result = _matrix_to_backend(local_result_cpu, A.A)
 
     return MatrixMPI_local(local_result)
 end
@@ -3913,8 +3912,8 @@ function Base.:*(At::TransposedMatrixMPI{T,AM}, B::SparseMatrixMPI{T,Ti,AV}) whe
         local_result_cpu[:, k] = Array(columns[k].v)
     end
 
-    # Convert back to original backend if needed
-    local_result = A.A isa Matrix ? local_result_cpu : copyto!(similar(A.A, local_m, n), local_result_cpu)
+    # Convert back to original backend using dispatch (no type checks)
+    local_result = _matrix_to_backend(local_result_cpu, A.A)
 
     return MatrixMPI_local(local_result)
 end
@@ -4674,7 +4673,7 @@ end
 Execute a sparse repartition plan to redistribute rows from A to a new partition.
 Returns a new SparseMatrixMPI with the target row partition.
 """
-function execute_plan!(plan::SparseRepartitionPlan{T,Ti}, A::SparseMatrixMPI{T,Ti}) where {T,Ti}
+function execute_plan!(plan::SparseRepartitionPlan{T,Ti}, A::SparseMatrixMPI{T,Ti,AV}) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     src_start = A.row_partition[rank+1]
@@ -4736,23 +4735,31 @@ function execute_plan!(plan::SparseRepartitionPlan{T,Ti}, A::SparseMatrixMPI{T,T
     nrows_local = plan.result_AT.n
     ncols_compressed = length(plan.result_col_indices)
 
-    # Copy structure arrays and use them for both CPU and target (since this is CPU-only)
+    # Copy structure arrays (always CPU for MPI communication)
     new_rowptr = copy(plan.result_AT.colptr)
     new_colval = copy(plan.result_AT.rowval)
-    return SparseMatrixMPI{T,Ti,Vector{T}}(
+
+    # Convert values to target backend (no-op for CPU, copy for GPU)
+    result_nzval_backend = _values_to_backend(result_nzval, A.nzval)
+
+    # Create target arrays for the appropriate backend
+    rowptr_target = _to_target_backend(new_rowptr, AV)
+    colval_target = _to_target_backend(new_colval, AV)
+
+    return SparseMatrixMPI{T,Ti,AV}(
         plan.result_structural_hash,
         plan.result_row_partition,
         plan.result_col_partition,
         plan.result_col_indices,
         new_rowptr,
         new_colval,
-        result_nzval,
+        result_nzval_backend,
         nrows_local,
         ncols_compressed,
         nothing,  # cached_transpose
         nothing,  # cached_symmetric
-        new_rowptr,  # rowptr_target (same as rowptr for CPU)
-        new_colval   # colval_target (same as colval for CPU)
+        rowptr_target,
+        colval_target
     )
 end
 

@@ -681,7 +681,7 @@ A = SparseMatrixMPI{Float64}(sprand(10, 10, 0.3))
 B = A[3:7, 2:8]  # Returns SparseMatrixMPI submatrix
 ```
 """
-function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rng::UnitRange{Int}) where {T,Ti}
+function Base.getindex(A::SparseMatrixMPI{T,Ti,AV}, row_rng::UnitRange{Int}, col_rng::UnitRange{Int}) where {T,Ti,AV}
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
@@ -705,10 +705,13 @@ function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rn
         # SparseMatrixCSC(ncols, nrows, colptr, rowval, nzval) - transposed storage
         empty_AT = SparseMatrixCSC(new_ncols, my_local_rows, ones(Int, my_local_rows + 1), Int[], T[])
         hash = compute_structural_hash(new_row_partition, Int[], empty_AT, comm)
-        # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-        return SparseMatrixMPI{T,Ti,Vector{T}}(hash, new_row_partition, new_col_partition, Int[],
-                                   empty_AT.colptr, empty_AT.rowval, empty_AT.nzval,
-                                   my_local_rows, 0, nothing, nothing, empty_AT.colptr, empty_AT.rowval)
+        # Convert to target backend
+        empty_nzval = _values_to_backend(empty_AT.nzval, A.nzval)
+        rowptr_target = _to_target_backend(empty_AT.colptr, AV)
+        colval_target = _to_target_backend(empty_AT.rowval, AV)
+        return SparseMatrixMPI{T,Ti,AV}(hash, new_row_partition, new_col_partition, Int[],
+                                   empty_AT.colptr, empty_AT.rowval, empty_nzval,
+                                   my_local_rows, 0, nothing, nothing, rowptr_target, colval_target)
     end
 
     # Compute new row partition (local computation, no communication)
@@ -817,11 +820,14 @@ function Base.getindex(A::SparseMatrixMPI{T,Ti}, row_rng::UnitRange{Int}, col_rn
     # Compute hash (requires Allgather for consistency)
     hash = compute_structural_hash(new_row_partition, final_col_indices, new_AT.colptr, new_AT.rowval, comm)
 
-    # Use explicit CSR arrays for the new struct format
-    # For CPU, rowptr_target and colval_target are the same as rowptr and colval
-    return SparseMatrixMPI{T,Ti,Vector{T}}(hash, new_row_partition, new_col_partition, final_col_indices,
-                               new_AT.colptr, new_AT.rowval, new_AT.nzval, local_nrows,
-                               length(final_col_indices), nothing, nothing, new_AT.colptr, new_AT.rowval)
+    # Convert to target backend (no-op for CPU, copy for GPU)
+    result_nzval = _values_to_backend(new_AT.nzval, A.nzval)
+    rowptr_target = _to_target_backend(new_AT.colptr, AV)
+    colval_target = _to_target_backend(new_AT.rowval, AV)
+
+    return SparseMatrixMPI{T,Ti,AV}(hash, new_row_partition, new_col_partition, final_col_indices,
+                               new_AT.colptr, new_AT.rowval, result_nzval, local_nrows,
+                               length(final_col_indices), nothing, nothing, rowptr_target, colval_target)
 end
 
 # Convenience: A[row_rng, :] - all columns

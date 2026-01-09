@@ -9,6 +9,7 @@ Plots/
 
 # Julia
 Manifest.toml
+LocalPreferences.toml
 
 # Documentation build
 docs/build/
