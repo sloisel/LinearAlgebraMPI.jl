@@ -1,9 +1,11 @@
 <!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Examples · LinearAlgebraMPI.jl</title><meta name="title" content="Examples · LinearAlgebraMPI.jl"/><meta property="og:title" content="Examples · LinearAlgebraMPI.jl"/><meta property="twitter:title" content="Examples · LinearAlgebraMPI.jl"/><meta name="description" content="Documentation for LinearAlgebraMPI.jl."/><meta property="og:description" content="Documentation for LinearAlgebraMPI.jl."/><meta property="twitter:description" content="Documentation for LinearAlgebraMPI.jl."/><meta property="og:url" content="https://sloisel.github.io/LinearAlgebraMPI.jl/examples/"/><meta property="twitter:url" content="https://sloisel.github.io/LinearAlgebraMPI.jl/examples/"/><link rel="canonical" href="https://sloisel.github.io/LinearAlgebraMPI.jl/examples/"/><script data-outdated-warner src="../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL=".."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../assets/documenter.js"></script><script src="../search_index.js"></script><script src="../siteinfo.js"></script><script src="../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../">LinearAlgebraMPI.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../">Home</a></li><li><a class="tocitem" href="../installation/">Installation</a></li><li><a class="tocitem" href="../guide/">User Guide</a></li><li class="is-active"><a class="tocitem" href>Examples</a><ul class="internal"><li><a class="tocitem" href="#Matrix-Multiplication"><span>Matrix Multiplication</span></a></li><li><a class="tocitem" href="#Complex-Matrices"><span>Complex Matrices</span></a></li><li><a class="tocitem" href="#Addition-and-Subtraction"><span>Addition and Subtraction</span></a></li><li><a class="tocitem" href="#Transpose-Operations"><span>Transpose Operations</span></a></li><li><a class="tocitem" href="#Scalar-Multiplication"><span>Scalar Multiplication</span></a></li><li><a class="tocitem" href="#Computing-Norms"><span>Computing Norms</span></a></li><li><a class="tocitem" href="#Iterative-Methods-Example"><span>Iterative Methods Example</span></a></li><li><a class="tocitem" href="#Solving-Linear-Systems"><span>Solving Linear Systems</span></a></li><li><a class="tocitem" href="#Plan-Caching-and-Management"><span>Plan Caching and Management</span></a></li><li><a class="tocitem" href="#Dense-Matrix-Operations-with-mapslices"><span>Dense Matrix Operations with mapslices</span></a></li></ul></li><li><a class="tocitem" href="../api/">API Reference</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Examples</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Examples</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/sloisel/LinearAlgebraMPI.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/sloisel/LinearAlgebraMPI.jl/blob/main/docs/src/examples.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Examples"><a class="docs-heading-anchor" href="#Examples">Examples</a><a id="Examples-1"></a><a class="docs-heading-anchor-permalink" href="#Examples" title="Permalink"></a></h1><p>This page provides detailed examples of using LinearAlgebraMPI.jl for various distributed sparse matrix operations.</p><h2 id="Matrix-Multiplication"><a class="docs-heading-anchor" href="#Matrix-Multiplication">Matrix Multiplication</a><a id="Matrix-Multiplication-1"></a><a class="docs-heading-anchor-permalink" href="#Matrix-Multiplication" title="Permalink"></a></h2><h3 id="Square-Matrices"><a class="docs-heading-anchor" href="#Square-Matrices">Square Matrices</a><a id="Square-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#Square-Matrices" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Examples · HPCLinearAlgebra.jl</title><meta name="title" content="Examples · HPCLinearAlgebra.jl"/><meta property="og:title" content="Examples · HPCLinearAlgebra.jl"/><meta property="twitter:title" content="Examples · HPCLinearAlgebra.jl"/><meta name="description" content="Documentation for HPCLinearAlgebra.jl."/><meta property="og:description" content="Documentation for HPCLinearAlgebra.jl."/><meta property="twitter:description" content="Documentation for HPCLinearAlgebra.jl."/><meta property="og:url" content="https://sloisel.github.io/HPCLinearAlgebra.jl/examples/"/><meta property="twitter:url" content="https://sloisel.github.io/HPCLinearAlgebra.jl/examples/"/><link rel="canonical" href="https://sloisel.github.io/HPCLinearAlgebra.jl/examples/"/><script data-outdated-warner src="../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL=".."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../assets/documenter.js"></script><script src="../search_index.js"></script><script src="../siteinfo.js"></script><script src="../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../">HPCLinearAlgebra.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../">Home</a></li><li><a class="tocitem" href="../installation/">Installation</a></li><li><a class="tocitem" href="../guide/">User Guide</a></li><li class="is-active"><a class="tocitem" href>Examples</a><ul class="internal"><li><a class="tocitem" href="#Matrix-Multiplication"><span>Matrix Multiplication</span></a></li><li><a class="tocitem" href="#Complex-Matrices"><span>Complex Matrices</span></a></li><li><a class="tocitem" href="#Addition-and-Subtraction"><span>Addition and Subtraction</span></a></li><li><a class="tocitem" href="#Transpose-Operations"><span>Transpose Operations</span></a></li><li><a class="tocitem" href="#Scalar-Multiplication"><span>Scalar Multiplication</span></a></li><li><a class="tocitem" href="#Computing-Norms"><span>Computing Norms</span></a></li><li><a class="tocitem" href="#Iterative-Methods-Example"><span>Iterative Methods Example</span></a></li><li><a class="tocitem" href="#Solving-Linear-Systems"><span>Solving Linear Systems</span></a></li><li><a class="tocitem" href="#Plan-Caching-and-Management"><span>Plan Caching and Management</span></a></li><li><a class="tocitem" href="#Dense-Matrix-Operations-with-mapslices"><span>Dense Matrix Operations with mapslices</span></a></li></ul></li><li><a class="tocitem" href="../api/">API Reference</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Examples</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Examples</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/sloisel/HPCLinearAlgebra.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/sloisel/HPCLinearAlgebra.jl/blob/main/docs/src/examples.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Examples"><a class="docs-heading-anchor" href="#Examples">Examples</a><a id="Examples-1"></a><a class="docs-heading-anchor-permalink" href="#Examples" title="Permalink"></a></h1><p>This page provides detailed examples of using HPCLinearAlgebra.jl for various distributed sparse matrix operations.</p><h2 id="Matrix-Multiplication"><a class="docs-heading-anchor" href="#Matrix-Multiplication">Matrix Multiplication</a><a id="Matrix-Multiplication-1"></a><a class="docs-heading-anchor-permalink" href="#Matrix-Multiplication" title="Permalink"></a></h2><h3 id="Square-Matrices"><a class="docs-heading-anchor" href="#Square-Matrices">Square Matrices</a><a id="Square-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#Square-Matrices" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Create a tridiagonal matrix (same on all ranks)
 n = 100
@@ -17,23 +19,25 @@ V2 = [1.5*ones(n); 0.25*ones(n-1); 0.25*ones(n-1)]
 B = sparse(I, J, V2, n, n)
 
 # Distribute matrices
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
+Adist = HPCSparseMatrix(A, backend)
+Bdist = HPCSparseMatrix(B, backend)
 
 # Multiply
 Cdist = Adist * Bdist
 
 # Verify against reference
 C_ref = A * B
-C_ref_dist = SparseMatrixMPI{Float64}(C_ref)
+C_ref_dist = HPCSparseMatrix(C_ref, backend)
 err = norm(Cdist - C_ref_dist, Inf)
 
 println(io0(), &quot;Multiplication error: $err&quot;)
 </code></pre><h3 id="Non-Square-Matrices"><a class="docs-heading-anchor" href="#Non-Square-Matrices">Non-Square Matrices</a><a id="Non-Square-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#Non-Square-Matrices" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # A is 6x8, B is 8x10, result is 6x10
 m, k, n = 6, 8, 10
@@ -48,8 +52,8 @@ J_B = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 V_B = Float64.(1:length(I_B))
 B = sparse(I_B, J_B, V_B, k, n)
 
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
+Adist = HPCSparseMatrix(A, backend)
+Bdist = HPCSparseMatrix(B, backend)
 
 Cdist = Adist * Bdist
 
@@ -57,10 +61,12 @@ Cdist = Adist * Bdist
 
 println(io0(), &quot;Result size: $(size(Cdist))&quot;)
 </code></pre><h2 id="Complex-Matrices"><a class="docs-heading-anchor" href="#Complex-Matrices">Complex Matrices</a><a id="Complex-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#Complex-Matrices" title="Permalink"></a></h2><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 n = 8
 I = [1:n; 1:n-1; 2:n]
@@ -75,8 +81,8 @@ V_B = ComplexF64.([1.5*ones(n); 0.25*ones(n-1); 0.25*ones(n-1)]) .+
       im .* ComplexF64.([-0.1*ones(n); 0.1*ones(n-1); 0.1*ones(n-1)])
 B = sparse(I, J, V_B, n, n)
 
-Adist = SparseMatrixMPI{ComplexF64}(A)
-Bdist = SparseMatrixMPI{ComplexF64}(B)
+Adist = HPCSparseMatrix(A, backend)
+Bdist = HPCSparseMatrix(B, backend)
 
 # Multiplication
 Cdist = Adist * Bdist
@@ -92,10 +98,12 @@ result = Aadj * Bdist
 
 println(io0(), &quot;Complex matrix operations completed&quot;)
 </code></pre><h2 id="Addition-and-Subtraction"><a class="docs-heading-anchor" href="#Addition-and-Subtraction">Addition and Subtraction</a><a id="Addition-and-Subtraction-1"></a><a class="docs-heading-anchor-permalink" href="#Addition-and-Subtraction" title="Permalink"></a></h2><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 n = 8
 
@@ -112,8 +120,8 @@ J_B = [1, 1, 2, 3, 4, 5, 6, 7, 8]
 V_B = Float64.(9:-1:1)
 B = sparse(I_B, J_B, V_B, n, n)
 
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
+Adist = HPCSparseMatrix(A, backend)
+Bdist = HPCSparseMatrix(B, backend)
 
 # Addition - handles different sparsity patterns
 Cdist = Adist + Bdist
@@ -122,15 +130,17 @@ Cdist = Adist + Bdist
 Ddist = Adist - Bdist
 
 # Verify
-C_ref_dist = SparseMatrixMPI{Float64}(A + B)
+C_ref_dist = HPCSparseMatrix(A + B, backend)
 err = norm(Cdist - C_ref_dist, Inf)
 
 println(io0(), &quot;Addition error: $err&quot;)
 </code></pre><h2 id="Transpose-Operations"><a class="docs-heading-anchor" href="#Transpose-Operations">Transpose Operations</a><a id="Transpose-Operations-1"></a><a class="docs-heading-anchor-permalink" href="#Transpose-Operations" title="Permalink"></a></h2><h3 id="Lazy-Transpose"><a class="docs-heading-anchor" href="#Lazy-Transpose">Lazy Transpose</a><a id="Lazy-Transpose-1"></a><a class="docs-heading-anchor-permalink" href="#Lazy-Transpose" title="Permalink"></a></h3><p>The <code>transpose</code> function creates a lazy wrapper without transposing the data. This is efficient because the actual transpose is only computed when needed:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 m, n = 8, 6
 I_C = [1, 2, 3, 4, 5, 6, 7, 8, 1, 3]
@@ -143,8 +153,8 @@ J_D = [1, 2, 3, 4, 5, 6, 7, 8]
 V_D = Float64.(1:length(I_D))
 D = sparse(I_D, J_D, V_D, n, m)
 
-Cdist = SparseMatrixMPI{Float64}(C)
-Ddist = SparseMatrixMPI{Float64}(D)
+Cdist = HPCSparseMatrix(C, backend)
+Ddist = HPCSparseMatrix(D, backend)
 
 # transpose(C) * transpose(D) = transpose(D * C)
 # This is computed efficiently without explicitly transposing
@@ -152,10 +162,12 @@ result = transpose(Cdist) * transpose(Ddist)
 
 println(io0(), &quot;Lazy transpose multiplication completed&quot;)
 </code></pre><h3 id="Transpose-in-Multiplication"><a class="docs-heading-anchor" href="#Transpose-in-Multiplication">Transpose in Multiplication</a><a id="Transpose-in-Multiplication-1"></a><a class="docs-heading-anchor-permalink" href="#Transpose-in-Multiplication" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # A is 8x6, so A&#39; is 6x8
 # B is 8x10, so A&#39; * B is 6x10
@@ -171,23 +183,25 @@ J_B = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2]
 V_B = Float64.(1:length(I_B))
 B = sparse(I_B, J_B, V_B, m, p)
 
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
+Adist = HPCSparseMatrix(A, backend)
+Bdist = HPCSparseMatrix(B, backend)
 
 # transpose(A) * B - A is automatically materialized as transpose
 result_dist = transpose(Adist) * Bdist
 
 # Verify
 ref = sparse(A&#39;) * B
-ref_dist = SparseMatrixMPI{Float64}(ref)
+ref_dist = HPCSparseMatrix(ref, backend)
 err = norm(result_dist - ref_dist, Inf)
 
 println(io0(), &quot;transpose(A) * B error: $err&quot;)
 </code></pre><h2 id="Scalar-Multiplication"><a class="docs-heading-anchor" href="#Scalar-Multiplication">Scalar Multiplication</a><a id="Scalar-Multiplication-1"></a><a class="docs-heading-anchor-permalink" href="#Scalar-Multiplication" title="Permalink"></a></h2><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 m, n = 6, 8
 I = [1, 2, 3, 4, 5, 6, 1, 3]
@@ -195,7 +209,7 @@ J = [1, 2, 3, 4, 5, 6, 7, 8]
 V = Float64.(1:length(I))
 A = sparse(I, J, V, m, n)
 
-Adist = SparseMatrixMPI{Float64}(A)
+Adist = HPCSparseMatrix(A, backend)
 
 # Scalar times matrix
 a = 2.5
@@ -207,16 +221,18 @@ At = transpose(Adist)
 result3 = a * At  # Returns transpose(a * A)
 
 # Verify
-ref_dist = SparseMatrixMPI{Float64}(a * A)
+ref_dist = HPCSparseMatrix(a * A, backend)
 err1 = norm(result1 - ref_dist, Inf)
 err2 = norm(result2 - ref_dist, Inf)
 
 println(io0(), &quot;Scalar multiplication errors: $err1, $err2&quot;)
 </code></pre><h2 id="Computing-Norms"><a class="docs-heading-anchor" href="#Computing-Norms">Computing Norms</a><a id="Computing-Norms-1"></a><a class="docs-heading-anchor-permalink" href="#Computing-Norms" title="Permalink"></a></h2><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 m, n = 6, 8
 I = [1, 2, 3, 4, 5, 6, 1, 3, 2, 4]
@@ -224,7 +240,7 @@ J = [1, 2, 3, 4, 5, 6, 7, 8, 1, 3]
 V = Float64.(1:length(I))
 A = sparse(I, J, V, m, n)
 
-Adist = SparseMatrixMPI{Float64}(A)
+Adist = HPCSparseMatrix(A, backend)
 
 # Element-wise norms (treating matrix as vector)
 frob_norm = norm(Adist)        # Frobenius (2-norm)
@@ -242,11 +258,13 @@ println(io0(), &quot;Inf-norm: $inf_norm&quot;)
 println(io0(), &quot;3-norm: $p_norm&quot;)
 println(io0(), &quot;Operator 1-norm: $op_1&quot;)
 println(io0(), &quot;Operator Inf-norm: $op_inf&quot;)
-</code></pre><h2 id="Iterative-Methods-Example"><a class="docs-heading-anchor" href="#Iterative-Methods-Example">Iterative Methods Example</a><a id="Iterative-Methods-Example-1"></a><a class="docs-heading-anchor-permalink" href="#Iterative-Methods-Example" title="Permalink"></a></h2><p>Here&#39;s an example of using LinearAlgebraMPI.jl for power iteration to find the dominant eigenvalue:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
+</code></pre><h2 id="Iterative-Methods-Example"><a class="docs-heading-anchor" href="#Iterative-Methods-Example">Iterative Methods Example</a><a id="Iterative-Methods-Example-1"></a><a class="docs-heading-anchor-permalink" href="#Iterative-Methods-Example" title="Permalink"></a></h2><p>Here&#39;s an example of using HPCLinearAlgebra.jl for power iteration to find the dominant eigenvalue:</p><pre><code class="language-julia hljs">using MPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Create a symmetric positive definite matrix
 n = 100
@@ -255,10 +273,10 @@ J = [1:n; 2:n; 1:n-1]
 V = [4.0*ones(n); -ones(n-1); -ones(n-1)]
 A = sparse(I, J, V, n, n)
 
-Adist = SparseMatrixMPI{Float64}(A)
+Adist = HPCSparseMatrix(A, backend)
 
 # For power iteration, we need matrix-vector products
-# Currently LinearAlgebraMPI focuses on matrix-matrix products
+# Currently HPCLinearAlgebra focuses on matrix-matrix products
 # This example shows how to use A*A for related computations
 
 # Compute A^2
@@ -269,11 +287,13 @@ norm_A2 = norm(A2dist)
 
 println(io0(), &quot;||A^2||_F = $norm_A2&quot;)
 # For SPD matrices, this relates to the eigenvalues
-</code></pre><h2 id="Solving-Linear-Systems"><a class="docs-heading-anchor" href="#Solving-Linear-Systems">Solving Linear Systems</a><a id="Solving-Linear-Systems-1"></a><a class="docs-heading-anchor-permalink" href="#Solving-Linear-Systems" title="Permalink"></a></h2><p>LinearAlgebraMPI provides distributed sparse direct solvers using the multifrontal method.</p><h3 id="LDLT-Factorization-(Symmetric-Matrices)"><a class="docs-heading-anchor" href="#LDLT-Factorization-(Symmetric-Matrices)">LDLT Factorization (Symmetric Matrices)</a><a id="LDLT-Factorization-(Symmetric-Matrices)-1"></a><a class="docs-heading-anchor-permalink" href="#LDLT-Factorization-(Symmetric-Matrices)" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
+</code></pre><h2 id="Solving-Linear-Systems"><a class="docs-heading-anchor" href="#Solving-Linear-Systems">Solving Linear Systems</a><a id="Solving-Linear-Systems-1"></a><a class="docs-heading-anchor-permalink" href="#Solving-Linear-Systems" title="Permalink"></a></h2><p>HPCLinearAlgebra provides distributed sparse direct solvers using the multifrontal method.</p><h3 id="LDLT-Factorization-(Symmetric-Matrices)"><a class="docs-heading-anchor" href="#LDLT-Factorization-(Symmetric-Matrices)">LDLT Factorization (Symmetric Matrices)</a><a id="LDLT-Factorization-(Symmetric-Matrices)-1"></a><a class="docs-heading-anchor-permalink" href="#LDLT-Factorization-(Symmetric-Matrices)" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Create a symmetric positive definite tridiagonal matrix
 n = 100
@@ -283,13 +303,13 @@ V = [4.0*ones(n); -ones(n-1); -ones(n-1)]
 A = sparse(I, J, V, n, n)
 
 # Distribute the matrix
-Adist = SparseMatrixMPI{Float64}(A)
+Adist = HPCSparseMatrix(A, backend)
 
 # Compute LDLT factorization
 F = ldlt(Adist)
 
 # Create right-hand side
-b = VectorMPI(ones(n))
+b = HPCVector(ones(n), backend)
 
 # Solve Ax = b
 x = solve(F, b)
@@ -303,10 +323,12 @@ residual = norm(A * x_full - ones(n), Inf)
 
 println(io0(), &quot;LDLT solve residual: $residual&quot;)
 </code></pre><h3 id="LU-Factorization-(General-Matrices)"><a class="docs-heading-anchor" href="#LU-Factorization-(General-Matrices)">LU Factorization (General Matrices)</a><a id="LU-Factorization-(General-Matrices)-1"></a><a class="docs-heading-anchor-permalink" href="#LU-Factorization-(General-Matrices)" title="Permalink"></a></h3><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Create a general (non-symmetric) tridiagonal matrix
 n = 100
@@ -316,11 +338,11 @@ V = [2.0*ones(n); -0.5*ones(n-1); -0.8*ones(n-1)]  # Non-symmetric
 A = sparse(I, J, V, n, n)
 
 # Distribute and factorize
-Adist = SparseMatrixMPI{Float64}(A)
+Adist = HPCSparseMatrix(A, backend)
 F = lu(Adist)
 
 # Solve
-b = VectorMPI(ones(n))
+b = HPCVector(ones(n), backend)
 x = solve(F, b)
 
 # Verify
@@ -329,10 +351,12 @@ residual = norm(A * x_full - ones(n), Inf)
 
 println(io0(), &quot;LU solve residual: $residual&quot;)
 </code></pre><h3 id="Symmetric-Indefinite-Matrices"><a class="docs-heading-anchor" href="#Symmetric-Indefinite-Matrices">Symmetric Indefinite Matrices</a><a id="Symmetric-Indefinite-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#Symmetric-Indefinite-Matrices" title="Permalink"></a></h3><p>LDLT uses Bunch-Kaufman pivoting to handle symmetric indefinite matrices:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Symmetric indefinite matrix (alternating signs on diagonal)
 n = 50
@@ -342,10 +366,10 @@ diag_vals = [(-1.0)^i * 2.0 for i in 1:n]  # Alternating signs
 V = [diag_vals; -ones(n-1); -ones(n-1)]
 A = sparse(I, J, V, n, n)
 
-Adist = SparseMatrixMPI{Float64}(A)
+Adist = HPCSparseMatrix(A, backend)
 F = ldlt(Adist)
 
-b = VectorMPI(collect(1.0:n))
+b = HPCVector(collect(1.0:n), backend)
 x = solve(F, b)
 
 x_full = Vector(x)
@@ -353,10 +377,12 @@ residual = norm(A * x_full - collect(1.0:n), Inf)
 
 println(io0(), &quot;Indefinite LDLT residual: $residual&quot;)
 </code></pre><h3 id="Reusing-Symbolic-Factorization"><a class="docs-heading-anchor" href="#Reusing-Symbolic-Factorization">Reusing Symbolic Factorization</a><a id="Reusing-Symbolic-Factorization-1"></a><a class="docs-heading-anchor-permalink" href="#Reusing-Symbolic-Factorization" title="Permalink"></a></h3><p>For sequences of matrices with the same sparsity pattern, the symbolic factorization is cached and reused:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 n = 100
 I = [1:n; 1:n-1; 2:n]
@@ -365,7 +391,7 @@ J = [1:n; 2:n; 1:n-1]
 # First matrix
 V1 = [4.0*ones(n); -ones(n-1); -ones(n-1)]
 A1 = sparse(I, J, V1, n, n)
-A1dist = SparseMatrixMPI{Float64}(A1)
+A1dist = HPCSparseMatrix(A1, backend)
 
 # First factorization - computes symbolic phase
 F1 = ldlt(A1dist; reuse_symbolic=true)
@@ -373,13 +399,13 @@ F1 = ldlt(A1dist; reuse_symbolic=true)
 # Second matrix - same structure, different values
 V2 = [8.0*ones(n); -2.0*ones(n-1); -2.0*ones(n-1)]
 A2 = sparse(I, J, V2, n, n)
-A2dist = SparseMatrixMPI{Float64}(A2)
+A2dist = HPCSparseMatrix(A2, backend)
 
 # Second factorization - reuses cached symbolic phase (faster)
 F2 = ldlt(A2dist; reuse_symbolic=true)
 
 # Both factorizations work
-b = VectorMPI(ones(n))
+b = HPCVector(ones(n), backend)
 x1 = solve(F1, b)
 x2 = solve(F2, b)
 
@@ -388,16 +414,18 @@ x2_full = Vector(x2)
 println(io0(), &quot;F1 residual: &quot;, norm(A1 * x1_full - ones(n), Inf))
 println(io0(), &quot;F2 residual: &quot;, norm(A2 * x2_full - ones(n), Inf))
 </code></pre><h2 id="Plan-Caching-and-Management"><a class="docs-heading-anchor" href="#Plan-Caching-and-Management">Plan Caching and Management</a><a id="Plan-Caching-and-Management-1"></a><a class="docs-heading-anchor-permalink" href="#Plan-Caching-and-Management" title="Permalink"></a></h2><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using SparseArrays
+
+backend = BACKEND_CPU_MPI
 
 n = 100
 A = spdiagm(0 =&gt; 2.0*ones(n), 1 =&gt; -ones(n-1), -1 =&gt; -ones(n-1))
 B = spdiagm(0 =&gt; 1.5*ones(n), 1 =&gt; 0.5*ones(n-1), -1 =&gt; 0.5*ones(n-1))
 
-Adist = SparseMatrixMPI{Float64}(A)
-Bdist = SparseMatrixMPI{Float64}(B)
+Adist = HPCSparseMatrix(A, backend)
+Bdist = HPCSparseMatrix(B, backend)
 
 # First multiplication - creates and caches the plan
 C1 = Adist * Bdist
@@ -417,16 +445,18 @@ clear_plan_cache!()  # Clears all caches including factorization
 
 println(io0(), &quot;Cached multiplication completed&quot;)
 </code></pre><h2 id="Dense-Matrix-Operations-with-mapslices"><a class="docs-heading-anchor" href="#Dense-Matrix-Operations-with-mapslices">Dense Matrix Operations with mapslices</a><a id="Dense-Matrix-Operations-with-mapslices-1"></a><a class="docs-heading-anchor-permalink" href="#Dense-Matrix-Operations-with-mapslices" title="Permalink"></a></h2><p>The <code>mapslices</code> function applies a function to each row or column of a distributed dense matrix. This is useful for computing row-wise or column-wise statistics.</p><h3 id="Row-wise-Operations-(dims2)"><a class="docs-heading-anchor" href="#Row-wise-Operations-(dims2)">Row-wise Operations (dims=2)</a><a id="Row-wise-Operations-(dims2)-1"></a><a class="docs-heading-anchor-permalink" href="#Row-wise-Operations-(dims2)" title="Permalink"></a></h3><p>Row-wise operations are local - no MPI communication is needed since rows are already distributed:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Create a deterministic dense matrix (same on all ranks)
 m, n = 100, 10
 A_global = Float64.([i + 0.1*j for i in 1:m, j in 1:n])
 
 # Distribute
-Adist = MatrixMPI(A_global)
+Adist = HPCMatrix(A_global, backend)
 
 # Compute row statistics: for each row, compute [norm, max, sum]
 # This transforms 100×10 matrix to 100×3 matrix
@@ -434,15 +464,17 @@ row_stats = mapslices(x -&gt; [norm(x), maximum(x), sum(x)], Adist; dims=2)
 
 println(io0(), &quot;Row statistics shape: $(size(row_stats))&quot;)  # (100, 3)
 </code></pre><h3 id="Column-wise-Operations-(dims1)"><a class="docs-heading-anchor" href="#Column-wise-Operations-(dims1)">Column-wise Operations (dims=1)</a><a id="Column-wise-Operations-(dims1)-1"></a><a class="docs-heading-anchor-permalink" href="#Column-wise-Operations-(dims1)" title="Permalink"></a></h3><p>Column-wise operations require MPI communication to gather each full column:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Create a deterministic dense matrix
 m, n = 100, 10
 A_global = Float64.([i + 0.1*j for i in 1:m, j in 1:n])
 
-Adist = MatrixMPI(A_global)
+Adist = HPCMatrix(A_global, backend)
 
 # Compute column statistics: for each column, compute [norm, max]
 # This transforms 100×10 matrix to 2×10 matrix
@@ -450,9 +482,11 @@ col_stats = mapslices(x -&gt; [norm(x), maximum(x)], Adist; dims=1)
 
 println(io0(), &quot;Column statistics shape: $(size(col_stats))&quot;)  # (2, 10)
 </code></pre><h3 id="Use-Case:-Replacing-vcat(f.(eachrow(A))...)"><a class="docs-heading-anchor" href="#Use-Case:-Replacing-vcat(f.(eachrow(A))...)">Use Case: Replacing vcat(f.(eachrow(A))...)</a><a id="Use-Case:-Replacing-vcat(f.(eachrow(A))...)-1"></a><a class="docs-heading-anchor-permalink" href="#Use-Case:-Replacing-vcat(f.(eachrow(A))...)" title="Permalink"></a></h3><p>The standard Julia pattern <code>vcat(f.(eachrow(A))...)</code> doesn&#39;t work with distributed matrices because the type information is lost after broadcasting. Use <code>mapslices</code> instead:</p><pre><code class="language-julia hljs">using MPI
-using LinearAlgebraMPI
 MPI.Init()
+using HPCLinearAlgebra
 using LinearAlgebra
+
+backend = BACKEND_CPU_MPI
 
 # Standard Julia pattern (for comparison):
 # A = randn(5, 2)
@@ -461,7 +495,7 @@ using LinearAlgebra
 
 # MPI-compatible equivalent:
 A_global = Float64.([i + 0.1*j for i in 1:100, j in 1:10])
-Adist = MatrixMPI(A_global)
+Adist = HPCMatrix(A_global, backend)
 
 # Use mapslices with dims=2 to apply function to each row
 # The function returns a vector, which becomes a row in the result
@@ -469,4 +503,4 @@ g(x) = [norm(x), maximum(x)]
 Bdist = mapslices(g, Adist; dims=2)
 
 println(io0(), &quot;Result: $(size(Bdist))&quot;)  # (100, 2)
-</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../guide/">« User Guide</a><a class="docs-footer-nextpage" href="../api/">API Reference »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Friday 9 January 2026 00:18">Friday 9 January 2026</span>. Using Julia version 1.10.10.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../guide/">« User Guide</a><a class="docs-footer-nextpage" href="../api/">API Reference »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Saturday 10 January 2026 19:52">Saturday 10 January 2026</span>. Using Julia version 1.10.10.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
